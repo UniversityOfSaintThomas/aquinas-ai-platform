@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   # Deploy on pushes to the SPA or its deploy plumbing.
   push:
-    branches: [develop, main]
+    branches: [develop, production]
     paths:
       - 'frontend/**'
       - 'scripts/frontend/**'
@@ -53,7 +53,7 @@ jobs:
     name: Deploy to S3 + CloudFront
     needs: [build, test-frontend]
     runs-on: ubuntu-24.04
-    environment: ${{ (github.ref == 'refs/heads/main' && 'production') || 'development' }}
+    environment: ${{ (github.ref == 'refs/heads/production' && 'production') || 'development' }}
 
     permissions:
       id-token: write

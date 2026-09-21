@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   # Deploy on pushes to backend code or its build plumbing.
   push:
-    branches: [develop, main]
+    branches: [develop, production]
     paths:
       - 'backend/**'
       - 'scripts/build/**'
@@ -60,7 +60,7 @@ jobs:
     name: Build app-api image
     needs: test-backend
     runs-on: ubuntu-24.04
-    environment: ${{ (github.ref == 'refs/heads/main' && 'production') || 'development' }}
+    environment: ${{ (github.ref == 'refs/heads/production' && 'production') || 'development' }}
 
     permissions:
       id-token: write
@@ -97,7 +97,7 @@ jobs:
     # natively here rather than emulating arm64 on amd64 via QEMU
     # (matches the pre-refactor inference-api.yml on main).
     runs-on: ubuntu-24.04-arm
-    environment: ${{ (github.ref == 'refs/heads/main' && 'production') || 'development' }}
+    environment: ${{ (github.ref == 'refs/heads/production' && 'production') || 'development' }}
 
     permissions:
       id-token: write
@@ -135,7 +135,7 @@ jobs:
     # arm64 Lambda rejected at init with Runtime.InvalidEntrypoint.
     # Matches the pre-refactor rag-ingestion.yml on main.
     runs-on: ubuntu-24.04-arm
-    environment: ${{ (github.ref == 'refs/heads/main' && 'production') || 'development' }}
+    environment: ${{ (github.ref == 'refs/heads/production' && 'production') || 'development' }}
 
     permissions:
       id-token: write
@@ -171,7 +171,7 @@ jobs:
     # Native ARM64 runner — both kb-sync Lambdas are arm64 (see the
     # kb-sync CDK construct), matching the rag-ingestion pattern.
     runs-on: ubuntu-24.04-arm
-    environment: ${{ (github.ref == 'refs/heads/main' && 'production') || 'development' }}
+    environment: ${{ (github.ref == 'refs/heads/production' && 'production') || 'development' }}
 
     permissions:
       id-token: write
@@ -208,7 +208,7 @@ jobs:
     # single job points both at the freshly-built tag.
     needs: [build-kb-sync, test-backend]
     runs-on: ubuntu-24.04
-    environment: ${{ (github.ref == 'refs/heads/main' && 'production') || 'development' }}
+    environment: ${{ (github.ref == 'refs/heads/production' && 'production') || 'development' }}
 
     permissions:
       id-token: write
@@ -243,7 +243,7 @@ jobs:
     # Native ARM64 runner — all five kb-migration Lambdas are arm64 (see the
     # managed-kb CDK construct), matching the kb-sync pattern.
     runs-on: ubuntu-24.04-arm
-    environment: ${{ (github.ref == 'refs/heads/main' && 'production') || 'development' }}
+    environment: ${{ (github.ref == 'refs/heads/production' && 'production') || 'development' }}
 
     permissions:
       id-token: write
@@ -287,7 +287,7 @@ jobs:
     # and the first real tick picks up everything that accumulated.
     needs: [build-kb-migration, test-backend]
     runs-on: ubuntu-24.04
-    environment: ${{ (github.ref == 'refs/heads/main' && 'production') || 'development' }}
+    environment: ${{ (github.ref == 'refs/heads/production' && 'production') || 'development' }}
 
     permissions:
       id-token: write
@@ -328,7 +328,7 @@ jobs:
     # Native ARM64 runner — both scheduled-runs Lambdas are arm64 (see the
     # scheduled-runs CDK construct), matching the kb-sync pattern.
     runs-on: ubuntu-24.04-arm
-    environment: ${{ (github.ref == 'refs/heads/main' && 'production') || 'development' }}
+    environment: ${{ (github.ref == 'refs/heads/production' && 'production') || 'development' }}
 
     permissions:
       id-token: write
@@ -365,7 +365,7 @@ jobs:
     # (CDK-owned), so a single job points both at the freshly-built tag.
     needs: [build-scheduled-runs, test-backend]
     runs-on: ubuntu-24.04
-    environment: ${{ (github.ref == 'refs/heads/main' && 'production') || 'development' }}
+    environment: ${{ (github.ref == 'refs/heads/production' && 'production') || 'development' }}
 
     permissions:
       id-token: write
@@ -403,7 +403,7 @@ jobs:
     # has changed since last deploy.
     needs: test-backend
     runs-on: ubuntu-24.04
-    environment: ${{ (github.ref == 'refs/heads/main' && 'production') || 'development' }}
+    environment: ${{ (github.ref == 'refs/heads/production' && 'production') || 'development' }}
 
     permissions:
       id-token: write
@@ -443,7 +443,7 @@ jobs:
     # a DockerImage Lambda whose code lives in ECR.
     needs: [build-rag-ingestion, test-backend]
     runs-on: ubuntu-24.04
-    environment: ${{ (github.ref == 'refs/heads/main' && 'production') || 'development' }}
+    environment: ${{ (github.ref == 'refs/heads/production' && 'production') || 'development' }}
 
     permissions:
       id-token: write
@@ -483,7 +483,7 @@ jobs:
     # deploy-rag-ingestion-code but for a Runtime instead of a Lambda.
     needs: [build-inference-api, test-backend]
     runs-on: ubuntu-24.04
-    environment: ${{ (github.ref == 'refs/heads/main' && 'production') || 'development' }}
+    environment: ${{ (github.ref == 'refs/heads/production' && 'production') || 'development' }}
 
     permissions:
       id-token: write
@@ -524,7 +524,7 @@ jobs:
     # `aws ecs wait services-stable`.
     needs: [build-app-api, test-backend]
     runs-on: ubuntu-24.04
-    environment: ${{ (github.ref == 'refs/heads/main' && 'production') || 'development' }}
+    environment: ${{ (github.ref == 'refs/heads/production' && 'production') || 'development' }}
 
     permissions:
       id-token: write
