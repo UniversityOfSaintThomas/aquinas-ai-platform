@@ -369,8 +369,17 @@ function handler(event) {
     // record by hand. The custom domain + cert stay attached to the
     // distribution either way, so it serves `config.domainName` over TLS.
     if (config.domainName && config.manageDnsRecords) {
+      // FORK CHANGE: look the zone up by the hosted zone domain, falling back
+      // to the record's own domain. `config.domainName` may be a subdomain of
+      // the zone (e.g. dev-ga-app.ust-ai-pilot.stthomas.edu inside the
+      // ust-ai-pilot.stthomas.edu zone), in which case looking up by
+      // domainName matches no zone and synth fails with
+      // "Found zones: [] ... but wanted exactly 1". The artifacts, MCP sandbox,
+      // and ALB DNS constructs already use infrastructureHostedZoneDomain. The
+      // ?? fallback preserves the previous behaviour when no hosted zone domain
+      // is configured, which the transport-security tests rely on.
       const hostedZone = route53.HostedZone.fromLookup(this, 'HostedZone', {
-        domainName: config.domainName,
+        domainName: config.infrastructureHostedZoneDomain ?? config.domainName,
       });
 
       new route53.ARecord(this, 'FrontendARecord', {
