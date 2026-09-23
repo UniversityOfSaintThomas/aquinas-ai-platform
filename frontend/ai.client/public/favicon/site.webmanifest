@@ -1,6 +1,6 @@
 {
-  "name": "Boise State Logo",
-  "short_name": "Boise State ",
+  "name": "Aquinas AI",
+  "short_name": "Aquinas AI",
   "icons": [
     {
       "src": "/favicon/android-chrome-192x192.png",
@@ -15,7 +15,7 @@
       "purpose": "any"
     }
   ],
-  "theme_color": "#0033a0",
+  "theme_color": "#510c76",
   "background_color": "#ffffff",
   "display": "standalone",
   "scope": "/",
