@@ -1,5 +1,5 @@
 import * as cdk from 'aws-cdk-lib';
-import { loadConfig, AppConfig,
+import { loadConfig, buildCorsOrigins, AppConfig,
   OBSERVABILITY_DEFAULT_AGENTCORE_ACTIVE_SESSION_THRESHOLD,
   OBSERVABILITY_DEFAULT_AGENTCORE_ERROR_THRESHOLD,
   OBSERVABILITY_DEFAULT_ALB_TARGET_5XX_THRESHOLD,
@@ -102,6 +102,7 @@ const OBSERVABILITY_ENV_KEYS = [
   'CDK_OBSERVABILITY_PROMPT_CACHE_SESSION_WASTED_USD_THRESHOLD',
   'CDK_OBSERVABILITY_BEDROCK_TPM_QUOTA_PERCENT',
   'CDK_OBSERVABILITY_BEDROCK_TPM_QUOTAS',
+  'CDK_OBSERVABILITY_RUNTIME_LOG_RETENTION_SWEEP_ENABLED',
 ] as const;
 
 function clearObservabilityEnv(): void {
@@ -193,6 +194,65 @@ describe('RAG Ingestion Configuration', () => {
   // ============================================================
   // Environment Variable Loading Tests
   // ============================================================
+
+  describe('Browser URL blocklist (spec D6)', () => {
+    // This list is a security control: it is what stops a human in a browser
+    // takeover navigating to a system the agent must not act inside. It is
+    // supplied entirely from outside the repo (the stack ships fork-neutral),
+    // so the cases below pin the three behaviours that matter — empty by
+    // default, an override populates it, and an unset GitHub Actions variable
+    // (which arrives as '') is NOT mistaken for a deliberate empty list.
+    const BLOCKLIST_KEY = 'CDK_BROWSER_URL_BLOCKLIST';
+
+    afterEach(() => {
+      delete process.env[BLOCKLIST_KEY];
+    });
+
+    test('is empty when unset — no institution-specific hosts are baked in', () => {
+      delete process.env[BLOCKLIST_KEY];
+
+      // The old build seeded `instructure.com` here. That is BSU's LMS policy,
+      // not a property of this stack, and a fork inherited it with no
+      // breadcrumb. It now lives in the per-environment variable.
+      expect(loadConfig(app).browser.urlBlocklist).toEqual([]);
+    });
+
+    test('an override populates it and is trimmed', () => {
+      process.env[BLOCKLIST_KEY] = 'one.example.com, two.example.com';
+
+      expect(loadConfig(app).browser.urlBlocklist).toEqual([
+        'one.example.com',
+        'two.example.com',
+      ]);
+    });
+
+    test('an empty variable falls through to context, not to an empty list', () => {
+      // An unset GitHub Actions variable is forwarded as ''. If that were read
+      // as an explicit "block nothing" it would silently override a configured
+      // context default — a forgotten variable would disable the control and
+      // look identical in the log to a deliberate opt-out.
+      app.node.setContext('browser', {
+        urlBlocklist: ['from.context.example.com'],
+      });
+      process.env[BLOCKLIST_KEY] = '';
+
+      expect(loadConfig(app).browser.urlBlocklist).toEqual([
+        'from.context.example.com',
+      ]);
+    });
+
+    test('a variable of only separators and spaces is treated as unset', () => {
+      app.node.setContext('browser', {
+        urlBlocklist: ['from.context.example.com'],
+      });
+      process.env[BLOCKLIST_KEY] = ' , , ';
+
+      expect(loadConfig(app).browser.urlBlocklist).toEqual([
+        'from.context.example.com',
+      ]);
+    });
+  });
+
 
   describe('Environment Variable Loading', () => {
     test('loads CORS origins from CDK_RAG_CORS_ORIGINS environment variable', () => {
@@ -426,6 +486,31 @@ describe('RAG Ingestion Configuration', () => {
   // (same ternary as kbSync; empty workflow var must not disable)
   // ============================================================
 
+  describe('Feedback eval sampling flag (opt-in)', () => {
+    test('defaults to DISABLED when CDK_FEEDBACK_EVAL_SAMPLING_ENABLED is unset', () => {
+      delete process.env.CDK_FEEDBACK_EVAL_SAMPLING_ENABLED;
+      expect(loadConfig(app).feedbackEvalSampling.enabled).toBe(false);
+    });
+
+    test('an empty string (unset workflow variable) stays disabled', () => {
+      process.env.CDK_FEEDBACK_EVAL_SAMPLING_ENABLED = '';
+      expect(loadConfig(app).feedbackEvalSampling.enabled).toBe(false);
+    });
+
+    test('only the literal "true" enables it', () => {
+      process.env.CDK_FEEDBACK_EVAL_SAMPLING_ENABLED = 'true';
+      expect(loadConfig(app).feedbackEvalSampling.enabled).toBe(true);
+      process.env.CDK_FEEDBACK_EVAL_SAMPLING_ENABLED = 'yes';
+      expect(loadConfig(app).feedbackEvalSampling.enabled).toBe(false);
+    });
+
+    test('cdk.json context feedbackEvalSampling.enabled=true enables when env is unset', () => {
+      delete process.env.CDK_FEEDBACK_EVAL_SAMPLING_ENABLED;
+      app.node.setContext('feedbackEvalSampling', { enabled: true });
+      expect(loadConfig(app).feedbackEvalSampling.enabled).toBe(true);
+    });
+  });
+
   describe('Scheduled Runs feature flag', () => {
     test('defaults to enabled when CDK_SCHEDULED_RUNS_ENABLED is unset', () => {
       delete process.env.CDK_SCHEDULED_RUNS_ENABLED;
@@ -542,6 +627,79 @@ describe('RAG Ingestion Configuration', () => {
   });
 
   // ============================================================
+  // Shared Projects feature flag — opt-in while in development
+  // (unset / empty GitHub Actions variable means off)
+  // ============================================================
+
+  describe('Shared Projects feature flag', () => {
+    test('defaults to disabled when CDK_PROJECTS_ENABLED is unset', () => {
+      delete process.env.CDK_PROJECTS_ENABLED;
+
+      expect(loadConfig(app).projects.enabled).toBe(false);
+    });
+
+    test('treats empty string (unset GitHub Actions variable) as disabled', () => {
+      process.env.CDK_PROJECTS_ENABLED = '';
+
+      expect(loadConfig(app).projects.enabled).toBe(false);
+    });
+
+    test('CDK_PROJECTS_ENABLED="true" turns it on', () => {
+      process.env.CDK_PROJECTS_ENABLED = 'true';
+
+      expect(loadConfig(app).projects.enabled).toBe(true);
+    });
+
+    test('anything but "true" leaves it off', () => {
+      process.env.CDK_PROJECTS_ENABLED = 'yes';
+
+      expect(loadConfig(app).projects.enabled).toBe(false);
+    });
+
+    test('cdk.json context projects.enabled=true enables when env is unset', () => {
+      delete process.env.CDK_PROJECTS_ENABLED;
+      app.node.setContext('projects', { enabled: true });
+
+      expect(loadConfig(app).projects.enabled).toBe(true);
+    });
+  });
+
+  // ============================================================
+  // SPA CloudFront access logs — default ON with a kill switch
+  // (empty GitHub Actions variable must not disable)
+  // ============================================================
+
+  describe('SPA access logs flag', () => {
+    test('defaults to enabled when CDK_FRONTEND_ACCESS_LOGS_ENABLED is unset', () => {
+      delete process.env.CDK_FRONTEND_ACCESS_LOGS_ENABLED;
+
+      expect(loadConfig(app).frontend.accessLogsEnabled).toBe(true);
+    });
+
+    test('treats empty string (unset GitHub Actions variable) as enabled', () => {
+      process.env.CDK_FRONTEND_ACCESS_LOGS_ENABLED = '';
+
+      expect(loadConfig(app).frontend.accessLogsEnabled).toBe(true);
+    });
+
+    test('CDK_FRONTEND_ACCESS_LOGS_ENABLED="false" is the kill switch', () => {
+      process.env.CDK_FRONTEND_ACCESS_LOGS_ENABLED = 'false';
+
+      expect(loadConfig(app).frontend.accessLogsEnabled).toBe(false);
+    });
+
+    test('cdk.json context frontend.accessLogsEnabled=false disables when env is unset', () => {
+      delete process.env.CDK_FRONTEND_ACCESS_LOGS_ENABLED;
+      app.node.setContext('frontend', {
+        cloudFrontPriceClass: 'PriceClass_100',
+        accessLogsEnabled: false,
+      });
+
+      expect(loadConfig(app).frontend.accessLogsEnabled).toBe(false);
+    });
+  });
+
+  // ============================================================
   // Agents API (Agent Designer) feature flag — default ON with a kill switch
   // (complete feature; ships enabled for forkers, empty var must not disable)
   // ============================================================
@@ -576,6 +734,45 @@ describe('RAG Ingestion Configuration', () => {
       app.node.setContext('agents', { enabled: false });
 
       expect(loadConfig(app).agents.enabled).toBe(false);
+    });
+  });
+
+  // ============================================================
+  // Composer dictation — default ON with a kill switch; languages default en-US
+  // ============================================================
+
+  describe('Dictation config', () => {
+    // Per-key deletion, not the suite's `process.env` snapshot restore — see
+    // the RAG_ENV_KEYS note at the top of this file.
+    afterEach(() => {
+      delete process.env.CDK_DICTATION_ENABLED;
+      delete process.env.CDK_DICTATION_LANGUAGES;
+    });
+
+    test('defaults to enabled, English only', () => {
+      delete process.env.CDK_DICTATION_ENABLED;
+      delete process.env.CDK_DICTATION_LANGUAGES;
+
+      expect(loadConfig(app).dictation).toEqual({ enabled: true, languages: 'en-US' });
+    });
+
+    test('empty strings (unset GitHub Actions variables) keep the defaults', () => {
+      process.env.CDK_DICTATION_ENABLED = '';
+      process.env.CDK_DICTATION_LANGUAGES = '';
+
+      expect(loadConfig(app).dictation).toEqual({ enabled: true, languages: 'en-US' });
+    });
+
+    test('CDK_DICTATION_ENABLED="false" is the kill switch', () => {
+      process.env.CDK_DICTATION_ENABLED = 'false';
+
+      expect(loadConfig(app).dictation.enabled).toBe(false);
+    });
+
+    test('CDK_DICTATION_LANGUAGES passes the list through', () => {
+      process.env.CDK_DICTATION_LANGUAGES = 'en-US,es-US';
+
+      expect(loadConfig(app).dictation.languages).toBe('en-US,es-US');
     });
   });
 
@@ -1191,6 +1388,109 @@ describe('RAG Ingestion Configuration', () => {
   });
 
   // ============================================================
+  // Uploads-bucket CORS guard
+  // ============================================================
+
+  describe('Top-level CORS origins guard', () => {
+    /**
+     * Without an origin the uploads bucket is created with no CORS rule and
+     * every browser upload fails at S3. This used to be a console.warn; a
+     * production-mirror environment shipped the bug that way
+     * (docs/specs/load-test-assessment-2026-09.md §1 fix 4).
+     */
+    beforeEach(() => {
+      // The shared beforeEach seeds domainName; remove it so the top-level
+      // origin list is genuinely empty.
+      app = new cdk.App();
+      app.node.setContext('projectPrefix', 'test-project');
+      app.node.setContext('awsRegion', 'us-east-1');
+      app.node.setContext('awsAccount', '123456789012');
+      app.node.setContext('vpcCidr', '10.0.0.0/16');
+      app.node.setContext('frontend', { cloudFrontPriceClass: 'PriceClass_100' });
+      app.node.setContext('appApi', { cpu: 256, memory: 512, desiredCount: 1, maxCapacity: 2 });
+      app.node.setContext('inferenceApi', {});
+      app.node.setContext('fineTuning', {});
+      app.node.setContext('artifacts', { retentionDays: 90, extraFrameAncestors: [] });
+      app.node.setContext('mcpSandbox', { extraFrameAncestors: [] });
+      app.node.setContext('ragIngestion', {
+        additionalCorsOrigins: '',
+        lambdaMemorySize: 10240,
+        lambdaTimeout: 900,
+        embeddingModel: 'amazon.titan-embed-text-v2',
+        vectorDimension: 1024,
+        vectorDistanceMetric: 'cosine',
+      });
+      delete process.env.CDK_DOMAIN_NAME;
+      delete process.env.CDK_CORS_ORIGINS;
+      delete process.env.CDK_ALLOW_NO_CORS_ORIGINS;
+    });
+
+    afterEach(() => {
+      delete process.env.CDK_ALLOW_NO_CORS_ORIGINS;
+      delete process.env.CDK_CORS_ORIGINS;
+      delete process.env.CDK_DOMAIN_NAME;
+    });
+
+    test('fails synth when neither a domain nor CORS origins is configured', () => {
+      expect(() => loadConfig(app)).toThrow(/uploads bucket would be created without a CORS rule/);
+    });
+
+    test('passes when CDK_DOMAIN_NAME supplies the origin', () => {
+      process.env.CDK_DOMAIN_NAME = 'ai.example.edu';
+
+      const config = loadConfig(app);
+
+      expect(config.corsOrigins).toBe('https://ai.example.edu');
+    });
+
+    test('passes when CDK_CORS_ORIGINS supplies an origin without a domain', () => {
+      process.env.CDK_CORS_ORIGINS = 'http://localhost:4200';
+
+      expect(loadConfig(app).corsOrigins).toBe('http://localhost:4200');
+    });
+
+    test('CDK_ALLOW_NO_CORS_ORIGINS=true is the explicit opt-out', () => {
+      process.env.CDK_ALLOW_NO_CORS_ORIGINS = 'true';
+
+      expect(loadConfig(app).corsOrigins).toBe('');
+    });
+
+    test('a non-true opt-out value does not disable the guard', () => {
+      process.env.CDK_ALLOW_NO_CORS_ORIGINS = 'false';
+
+      expect(() => loadConfig(app)).toThrow(/CDK_ALLOW_NO_CORS_ORIGINS=true/);
+    });
+
+    /**
+     * The guard must gate on the same value the uploads bucket consumes:
+     * FileUploadConstruct attaches CORS only when buildCorsOrigins(config)
+     * is non-empty, and that filters out blank entries. A raw string that is
+     * truthy but filters to nothing (a trailing comma from a templated list,
+     * a YAML value that quotes to a single space, an unset CI variable) would
+     * otherwise pass the guard and still ship a bucket with no CORS rule --
+     * the exact bug the guard exists to prevent.
+     */
+    test.each([
+      ['a lone separator', ','],
+      ['whitespace only', ' '],
+      ['separators only', ',,'],
+      ['padded separators', '  ,  '],
+    ])('fails synth when CDK_CORS_ORIGINS is %s and filters to no origins', (_label, value) => {
+      process.env.CDK_CORS_ORIGINS = value;
+
+      expect(() => loadConfig(app)).toThrow(/uploads bucket would be created without a CORS rule/);
+    });
+
+    test('a blank entry alongside a real origin still passes and yields the real origin', () => {
+      process.env.CDK_CORS_ORIGINS = ' , https://ok.edu';
+
+      const config = loadConfig(app);
+
+      expect(buildCorsOrigins(config)).toEqual(['https://ok.edu']);
+    });
+  });
+
+  // ============================================================
   // Precedence Tests
   // ============================================================
 
@@ -1560,6 +1860,7 @@ describe('Observability Configuration', () => {
     a.node.setContext('awsRegion', 'us-east-1');
     a.node.setContext('awsAccount', '123456789012');
     a.node.setContext('vpcCidr', '10.0.0.0/16');
+    a.node.setContext('corsOrigins', 'http://localhost:4200');
     a.node.setContext('frontend', { cloudFrontPriceClass: 'PriceClass_100' });
     a.node.setContext('appApi', {
       cpu: 256, memory: 512, desiredCount: 1, maxCapacity: 4,
@@ -1616,6 +1917,18 @@ describe('Observability Configuration', () => {
 
     test('alarm topic defaults to ON', () => {
       expect(loadConfig(app).observability.alarmTopicEnabled).toBe(true);
+    });
+
+    // Privacy, not just cost: runtime log groups carry conversation text.
+    test('runtime log retention sweep defaults to ON, even for a forwarded empty var', () => {
+      expect(loadConfig(app).observability.runtimeLogRetentionSweepEnabled).toBe(true);
+      process.env.CDK_OBSERVABILITY_RUNTIME_LOG_RETENTION_SWEEP_ENABLED = '';
+      expect(loadConfig(app).observability.runtimeLogRetentionSweepEnabled).toBe(true);
+    });
+
+    test('runtime log retention sweep turns off on an explicit false', () => {
+      process.env.CDK_OBSERVABILITY_RUNTIME_LOG_RETENTION_SWEEP_ENABLED = 'false';
+      expect(loadConfig(app).observability.runtimeLogRetentionSweepEnabled).toBe(false);
     });
 
     test('latency floors are streaming-aware, well above a normal agent turn', () => {
@@ -1786,6 +2099,7 @@ describe('Observability Configuration', () => {
       app.node.setContext('observability.xraySamplingReservoir', '21');
       app.node.setContext('observability.xrayInsightsNotifications', 'true');
       app.node.setContext('observability.agentCoreApplicationLogsEnabled', 'true');
+      app.node.setContext('observability.runtimeLogRetentionSweepEnabled', 'false');
       app.node.setContext('observability.promptCacheAvoidableMissThreshold', '22');
       app.node.setContext('observability.promptCacheWastedUsdThreshold', '2.5');
       app.node.setContext('observability.promptCacheSessionWastedUsdThreshold', '23');
@@ -1807,6 +2121,7 @@ describe('Observability Configuration', () => {
         xraySamplingReservoir: 21,
         xrayInsightsNotifications: true,
         agentCoreApplicationLogsEnabled: true,
+        runtimeLogRetentionSweepEnabled: false,
         promptCacheAvoidableMissThreshold: 22,
         promptCacheWastedUsdThreshold: 2.5,
         promptCacheSessionWastedUsdThreshold: 23,

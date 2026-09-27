@@ -1,6 +1,6 @@
 ---
 name: kaizen-research
-description: Weekly Friday early-morning external + internal scan for emerging functionality, agentic trends, tools, and feature/UX improvements in the AgentCore Public Stack repo. Tracks AWS Bedrock + AgentCore announcements, Strands Agents releases, FastMCP (used by externally hosted MCP servers), the aws-samples/sample-strands-agent-with-agentcore reference repo, the MCP ecosystem (including MCP Apps + extensions), frontier model announcements, agent-harness patterns (including opencode (anomalyco/opencode) as an open-source coding-agent harness reference scanned through tooling, cost-effectiveness, and context-engineering lenses — releases-first, light touch), agentic UI/UX patterns (MCP Apps, Vercel AI SDK, assistant-ui, NN/g AI research, Linear/Cursor/Anthropic product blogs), and LibreChat as a parallel open-source agentic-platform reference (releases-first, light touch). Audits internal signals (recent commits, open PRs, CI failures, version-pin lag, dormant skills). Outputs a dated research doc + queues ideas in `docs/kaizen/review-queue.md` for that same morning's `kaizen-review-prep` (runs ~2 hours later) to rank into decisions. Opens a PR into `develop`. **Out of scope**: security advisories / Dependabot / CodeQL — those have dedicated tooling and don't need a weekly kaizen lens. Triggers: "kaizen research", "weekly research scan", "external scan", "what should we look at this week".
+description: Weekly Friday early-morning external + internal scan for emerging functionality, agentic trends, tools, and feature/UX improvements in the AgentCore Public Stack repo. Tracks AWS Bedrock + AgentCore announcements, Strands Agents releases, FastMCP (used by externally hosted MCP servers), the aws-samples/sample-strands-agent-with-agentcore reference repo, the MCP ecosystem (including MCP Apps + extensions), frontier model announcements, agent-harness patterns (including opencode (anomalyco/opencode) as an open-source coding-agent harness reference scanned through tooling, cost-effectiveness, and context-engineering lenses — releases-first, light touch), agentic UI/UX patterns (MCP Apps, Vercel AI SDK, assistant-ui, NN/g AI research, Linear/Cursor/Anthropic product blogs), and LibreChat as a parallel open-source agentic-platform reference (releases-first, light touch). Audits internal signals (recent commits, open PRs, CI failures, version-pin lag, dormant skills). Outputs a dated research doc + queues ideas in `docs/kaizen/review-queue.md` for that same morning's `kaizen-review-prep` (runs ~4 hours later) to rank into decisions. Opens a PR into `develop`. **Out of scope**: security advisories / Dependabot / CodeQL — those have dedicated tooling and don't need a weekly kaizen lens. Triggers: "kaizen research", "weekly research scan", "external scan", "what should we look at this week".
 ---
 
 # Kaizen Research
@@ -18,7 +18,7 @@ Friday early morning. The "what's the rest of the world learning that we should 
 
 ## When to run
 
-Friday early morning (~6am MT). `kaizen-review-prep` runs ~2 hours later (~8am MT) so both docs are waiting when Phil sits down Friday morning. Phil reviews, picks 1–3 to ship over the coming week, and POCs additional items over the weekend. Last weekend's POC findings surface in *this* run's review-prep as Carried Over items (lifted from comments on the previous week's research PR).
+Friday early morning (~6am MT). `kaizen-review-prep` runs ~4 hours later (~10am MT), a gap sized to this scan's own runtime (2h18m on 2026-09-11) rather than to the 2 hours the two skills used to claim — on 2026-09-18 the prep ran 18 minutes after this scan started and produced a review with no research doc. Both docs are waiting when Phil sits down Friday late morning; he reviews, picks 1–3 to ship over the coming week, and the *outcomes* of those picks are what review-prep reads the following Friday.
 
 ## Sources
 
@@ -63,14 +63,43 @@ Friday early morning (~6am MT). `kaizen-review-prep` runs ~2 hours later (~8am M
 
    | Ours | Retired by |
    |---|---|
-   | `usage_normalization.py` — maps `cache_write_tokens`, which Strands drops | [harness-sdk#4193](https://github.com/strands-agents/harness-sdk/pull/4193) (ours) merging + releasing |
-   | `usage_normalization.py` — disjointness shim for OpenAI's inclusive `input_tokens` | [harness-sdk#3546](https://github.com/strands-agents/harness-sdk/issues/3546) landing a `Usage` convention contract |
+   | `usage_normalization.py` — maps `cache_write_tokens`, which Strands drops | [harness-sdk#4193](https://github.com/strands-agents/harness-sdk/pull/4193) (ours) — **merged 2026-09-25, after `python/v1.57.1`**; retires on the first release that contains it |
+   | `usage_normalization.py` — disjointness shim for OpenAI's inclusive `input_tokens` | **Not retired by upstream — see the #4618 warning below.** [#3546](https://github.com/strands-agents/harness-sdk/issues/3546) closes once [#4617](https://github.com/strands-agents/harness-sdk/pull/4617) merges; its successor [#4618](https://github.com/strands-agents/harness-sdk/issues/4618) picks the *other* convention |
    | `build_prompt_cache_key()` in `bedrock_responses.py` | `strands/models/_openai_cache.py::apply_cache_config` — **already on upstream main**, maps `CacheConfig.cache_key` → `prompt_cache_key`. Adopt on the next pin bump. |
    | `apply_explicit_prompt_cache()` (breakpoints) | No upstream equivalent yet — `apply_cache_config` emits no `prompt_cache_breakpoint`. Ours is OFF by default (measured 57% worse); don't re-enable without re-running the probe. |
    | `cache_ttl_seconds_for()` in `observability/prompt_cache.py` | A model-derived TTL upstream. Note `apply_cache_config` maps ttl to `prompt_cache_retention` (`in_memory`/`24h`), *not* GPT-5.6's `prompt_cache_options.ttl: "30m"` — so these are not yet the same concept. |
    | `bedrock_cache_points_supported()` + the hand-placed system cachePoint | **NOTHING upstream can retire this — settled by measurement 2026-09-11, do not re-propose.** `format_request` copies `system_prompt_content` verbatim and `_apply_system_cache_ttl` never removes a point, so the block reaches Bedrock, which answers `AccessDeniedException` on a model that can't cache. The rejection is Bedrock's, not the SDK's. Only its `tools_ttl` half is redundant (upstream applies the same test at `bedrock.py:579`). |
 
+   ⚠️ **harness-sdk#4618 (tracked from 2026-09-25) inverts our convention. It is a
+   pin-bump hazard, not a subtraction.** #4618 proposes one canonical `Usage`
+   convention, semconv **subset**: `inputTokens` *includes* cache reads and
+   writes, and `totalTokens == inputTokens + outputTokens`. It enforces this at
+   the provider boundary, so the **Bedrock and Anthropic adapters would fold
+   cache tokens into `inputTokens`**. Everything we own assumes the opposite,
+   the disjoint Converse convention: `CostCalculator.calculate_message_cost`,
+   the context-size sum in `stream_coordinator.py`, `observability/prompt_cache.py`
+   and `prefix_tokens.py`, and the `C#` metadata rows. The day a pin containing
+   it lands, every cached Bedrock token is billed twice (input rate *plus* the
+   cache rate), and a cache write is billed at the input rate plus the 1.25×
+   premium. On our default path that is most of the prompt. Nothing errors,
+   and the only symptom is cost and quota inflating on cache hits.
+   `normalize_usage()` would have to learn to subtract for Bedrock too. Its
+   docstring's "leaves Bedrock usage untouched" would then be the bug. Direct
+   boto3 Converse callers (e.g. `app_api/chat/converse_routes.py`) keep the
+   disjoint shape, so two conventions would coexist inside our own code. The
+   proposal also adds a reasoning-token field (a *subset* of `outputTokens`,
+   so it is a breakdown, never an extra charge). Status at filing: open,
+   "warrants a short design doc before implementation", no PR yet.
+
    Each run, answer:
+   - **#4618:** did a design doc, a PR, or a release note land? Does any adapter
+     in the pinned version (or the candidate bump) now fold cache tokens into
+     `inputTokens`? Check Bedrock specifically:
+     `strands/models/bedrock.py` usage handling, and whether `_total_prompt_tokens`
+     still exists (its deletion is the tell that the flip shipped). If it
+     shipped, **the bump PR must carry the matching `normalize_usage` change**,
+     plus a live check that one cached Bedrock call prices identically before
+     and after. Queue it as a blocking gate on the bump, not an idea.
    - Does the pinned Strands version now ship `_openai_cache.py` / a `CacheConfig`
      that covers a provider we hand-roll? If so, propose the swap and say which of
      our modules shrinks.
@@ -89,8 +118,8 @@ Friday early morning (~6am MT). `kaizen-review-prep` runs ~2 hours later (~8am M
      cachePoint. A row where Bedrock caches but `_cache_strategy` is `None` is a
      coverage finding (ii) — file it. Use `--offline-only` for a free check of the
      SDK half alone after a pin bump.
-   - Movement on #3546 / #4193, or a new `Usage` convention. Both change what our
-     cost math may assume.
+   - Movement on #3546 / #4617 / #4618, and whether #4193 has reached a release.
+     All of them change what our cost math may assume.
 
    ⚠️ Never adopt an upstream caching default on inspection alone. This stack has
    already shipped one caching change whose premise was wrong and cost ~57% more
@@ -436,8 +465,7 @@ gh pr create --base develop --head "$BRANCH" \
 
 ## Review
 - Read the research doc.
-- Comment on the PR with reactions and any weekend POC findings — these become first-class signal for *next* Friday's `kaizen-review-prep`.
-- POC promising ideas over the weekend.
+- Ship, decline or defer individual ideas in their own PRs — a merged PR is the signal `kaizen-review-prep` reads next Friday. Deep analysis belongs in a `docs/kaizen/review-queue.md` entry on the PR branch that produced it, where the next review will find it.
 
 ## Decision
 Ship the doc to `develop`. Ranking into decisions happens in the kaizen-review-prep PR opened later this morning. Action on individual ideas happens in separate PRs the following week.

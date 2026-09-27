@@ -10,7 +10,8 @@ These endpoints are at the root level to comply with AWS Bedrock AgentCore Runti
 import asyncio
 import json
 import logging
-from typing import AsyncGenerator, Optional, Union
+from collections import OrderedDict
+from typing import TYPE_CHECKING, AsyncGenerator, Optional, Tuple, Union
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -26,12 +27,21 @@ from apis.shared.errors import (
 )
 from apis.inference_api.runtime_health import ping_payload
 from apis.shared.feature_flags import (
+    agent_preparing_phase_enabled,
     agents_enabled,
+    attachment_turn_guard_enabled,
+    memory_spaces_enabled,
     mid_turn_steering_enabled,
     skills_enabled,
 )
+from apis.shared.files.document_read import is_document_class
 from apis.shared.files.file_resolver import get_file_resolver
-from apis.shared.models.managed_models import list_managed_models
+from apis.shared.files.models import (
+    INLINE_ATTACHMENTS_MAX_TOTAL_BYTES,
+    MAX_FILES_PER_MESSAGE,
+)
+from apis.shared.models.managed_models import get_default_managed_model, list_managed_models
+from apis.shared.models.retirement import resolve_effective_model, retired_model_message
 from apis.shared.quota import (
     QuotaExceededEvent,
     build_no_quota_configured_event,
@@ -46,11 +56,17 @@ from apis.shared.rbac.service import get_app_role_service
 from apis.shared.skills.bundle import slugify_skill_name
 from apis.inference_api.chat.agent_binding_resolver import (
     AgentBindingBlockedError,
+    AgentNoticeEvent,
     resolve_agent_invocation,
 )
 from apis.shared.sessions.metadata import (
     ensure_session_metadata_exists,
-    session_owned_by_other_user,
+    load_session_meta,
+)
+from apis.shared.tools.always_on import (
+    resolve_always_on_tool_ids,
+    resolve_system_tool_ids,
+    union_enabled_tools,
 )
 from apis.shared.tools.injected import (
     ARTIFACT_TOOL_IDS,
@@ -61,6 +77,7 @@ from apis.shared.tools.injected import (
     WORKSPACE_TOOL_IDS,
     injected_tools_are_key_described,
 )
+from apis.shared.user_settings.models import MAX_PERSONAL_INSTRUCTIONS_CHARS
 from apis.shared.user_settings.repository import UserSettingsRepository
 
 from .app_context_dispatch import (
@@ -74,6 +91,7 @@ from .app_tool_dispatch import AppToolCallError, dispatch_app_tool_call
 from .agent_binding_policy import binds_conversation
 from .models import FileContent, InvocationRequest
 from .service import generate_conversation_title, get_agent
+from .turn_timing import TurnPrelude
 from .system_prompt_resolver import (
     append_active_prompt,
     resolve_active_prompt_text,
@@ -81,6 +99,10 @@ from .system_prompt_resolver import (
 )
 
 from apis.shared.security.log_sanitize import scrub_log
+
+if TYPE_CHECKING:
+    from apis.inference_api.chat.project_memory import ProjectMemoryTurn
+    from apis.shared.projects.models import Project
 
 logger = logging.getLogger(__name__)
 
@@ -271,13 +293,125 @@ async def _find_managed_model(model_id: str | None):
     return None
 
 
-async def _resolve_user_default_model(user_id: str | None) -> tuple[str | None, str | None]:
+def compose_agent_system_prompt(base_prompt: str, instructions: str, *, project_harness: bool) -> str:
+    """The agent's system text: platform base prompt, then the agent's instructions.
+
+    A project's harness gets its own heading (shared-projects §4.5); every other agent keeps
+    ``Assistant-Specific Instructions`` byte for byte, so no existing agent's cached prefix
+    moves. Deliberately takes nothing about the invoking user: this text is the head of the
+    cacheable system block, and two members of one project must render it identically or
+    each member pays a cache write for the same project (the prompt-cache contract).
+    """
+    return f"{base_prompt}\n\n## {_instructions_heading(project_harness)}\n\n{instructions}"
+
+
+def _instructions_heading(project_harness: bool) -> str:
+    return "Project Instructions" if project_harness else "Assistant-Specific Instructions"
+
+
+def compose_personal_instructions(system_prompt: str, personal: str, *, over: Optional[str]) -> str:
+    """Append the user's personal instructions, last in the instructions block.
+
+    ``over`` names the section above that wins a conflict: the agent's or the project's
+    instructions (shared-projects §4.5). The precedence sentence is written only when
+    there is something to rank, and nothing at all is written for a user with no
+    personal instructions, so their prompt, and its cached prefix, is unchanged.
+    """
+    precedence = f" Where they conflict with the {over} above, follow the {over}." if over else ""
+    return (
+        f"{system_prompt}\n\n## Personal Instructions\n\n"
+        f"The user's standing preferences for how you work with them.{precedence}\n\n{personal}"
+    )
+
+
+def personal_plain_prompt(system_prompt: Optional[str], personal: Optional[str]) -> Optional[str]:
+    """A turn without an agent: the request's (or the default) prompt plus personal instructions."""
+    if not personal:
+        return system_prompt
+    from agents.main_agent.core.system_prompt_builder import SystemPromptBuilder
+
+    base = system_prompt or SystemPromptBuilder().build(include_date=True)
+    return compose_personal_instructions(base, personal, over=None)
+
+
+async def _load_user_settings(user_id: Optional[str]) -> dict:
+    """The user's saved settings, or ``{}``. Best-effort: never blocks a turn."""
+    if not user_id:
+        return {}
+    try:
+        repo = UserSettingsRepository()
+        if not repo.enabled:
+            return {}
+        return await repo.get_settings(user_id)
+    except Exception:
+        logger.warning("Failed to load user settings", exc_info=True)
+        return {}
+
+
+def _personal_instructions(settings: dict) -> Optional[str]:
+    text = (settings.get("personalInstructions") or "").strip()
+    return text[:MAX_PERSONAL_INSTRUCTIONS_CHARS] or None
+
+
+async def _plain_turn_prompt(input_data, user_id: Optional[str]) -> Optional[str]:
+    """The system prompt a no-model App dispatch must pass to reuse the turn's cached agent.
+
+    The agent cache keys on the system prompt, so a dispatch that left out the personal
+    instructions a plain turn adds would build a second agent, and an App's pushed model
+    context (stashed on the agent's state) would never reach the next turn.
+    """
+    if input_data.rag_assistant_id:
+        return input_data.system_prompt
+    return personal_plain_prompt(
+        input_data.system_prompt, _personal_instructions(await _load_user_settings(user_id))
+    )
+
+
+PROJECTS_DISABLED_MESSAGE = (
+    "Projects are turned off here, so this project task can't continue. "
+    "Your conversation history is still here, and nothing in the project was deleted."
+)
+
+
+async def _project_turn_gate(project_id: Optional[str]) -> Tuple[Optional[str], Optional["Project"]]:
+    """``(refusal, project)`` for a project harness turn; the refusal is None if it may run.
+
+    Membership was already checked by the agent access check (it delegates to the
+    project). What that check deliberately allows is *reading* an archived project, so a
+    new turn is refused here: an archived project is read-only (shared-projects §3.1).
+    The project META read here is the turn's only one; memory takes ``sharedSpaceId``
+    from it (2.4b).
+    """
+    from apis.shared.projects.repository import ProjectRepository
+
+    if not project_id:
+        return "This project agent isn't attached to a project. Ask the project owner for help.", None
+    project = await asyncio.to_thread(ProjectRepository().get_project, project_id)
+    if project is None:
+        return "This project no longer exists.", None
+    if project.status != "active":
+        return (
+            f'The project "{project.name}" is archived, so it can\'t start new conversations. '
+            "Ask the project owner to restore it."
+        ), project
+    return None, project
+
+
+async def _project_turn_refusal(project_id: Optional[str]) -> Optional[str]:
+    """Why a project harness may not start a turn right now, or None if it may."""
+    refusal, _ = await _project_turn_gate(project_id)
+    return refusal
+
+
+async def _resolve_user_default_model(
+    user_id: str | None, settings: Optional[dict] = None
+) -> tuple[str | None, str | None]:
     """Look up the user's persisted defaultModelId and resolve its provider.
 
     Returns ``(model_id, provider)``. When the request does not specify
     ``model_id``, callers fall back to the user's saved preference; if that
     is also unset (or the saved id no longer exists in managed models), the
-    callers in turn fall back to the agent factory's hardcoded default.
+    callers in turn fall back to :func:`_resolve_system_default_model`.
 
     The lookup is best-effort: any failure (no table, DynamoDB error, or
     deleted model) returns ``(None, None)`` so the chat turn proceeds on
@@ -285,21 +419,89 @@ async def _resolve_user_default_model(user_id: str | None) -> tuple[str | None, 
     """
     if not user_id:
         return None, None
-    try:
-        repo = UserSettingsRepository()
-        if not repo.enabled:
-            return None, None
-        settings = await repo.get_settings(user_id)
-        saved_id = settings.get("defaultModelId")
-    except Exception:
-        logger.warning("Failed to load user settings for default model lookup", exc_info=True)
-        return None, None
+    if settings is None:
+        settings = await _load_user_settings(user_id)
+    saved_id = settings.get("defaultModelId")
     if not saved_id:
         return None, None
 
+    # A saved default on a retired model follows its successor; one with no
+    # successor is treated as unset, so the turn falls back like any other
+    # default the user can no longer use.
+    effective = await resolve_effective_model(saved_id)
+    if effective is not None:
+        if effective.denied:
+            return None, None
+        if effective.redirected:
+            return effective.model_id, effective.provider
+
+    # A saved id with no catalog row has no pricing: running it would leave the
+    # turn unmetered and free against quota (a wildcard grant passes the RBAC
+    # re-check for any id). Treat it as unset, as the SPA already does.
     managed = await _find_managed_model(saved_id)
-    provider = managed.provider if managed else None
-    return saved_id, provider
+    if managed is None:
+        return None, None
+    return saved_id, managed.provider
+
+
+async def _resolve_fallback_model(
+    user_id: str | None,
+    current_user: User,
+    provider: str | None,
+    settings: Optional[dict] = None,
+) -> tuple[str | None, str | None]:
+    """The model for a turn whose request (and Agent) named none: user default, then catalog default.
+
+    Returns ``(model_id, provider)``. ``provider`` is the request's: it still
+    wins over a saved default's (unchanged behaviour), and yields to the
+    catalog default's, which it never described. ``(None, provider)``
+    means neither default resolved and the agent factory's ``Defaults.MODEL_ID``
+    takes over. Shared by the turn and the MCP App dispatch paths: the agent
+    cache keys on the model id, so a dispatch that resolved differently would
+    miss the turn's cached agent (and an App's pushed context with it).
+    """
+    user_default_id, user_default_provider = await _resolve_user_default_model(user_id, settings=settings)
+    if user_default_id:
+        # Re-check model access against the resolved id. The earlier guard only
+        # ran on `input_data.model_id`, so a stale saved default the user no
+        # longer has rights to would otherwise sneak past RBAC here.
+        if await get_app_role_service().can_access_model(current_user, user_default_id):
+            logger.info("Applied user default model from settings")
+            return user_default_id, provider or user_default_provider
+        logger.info("User default model exists but RBAC denies access; falling back to system default")
+
+    system_default_id, system_default_provider = await _resolve_system_default_model()
+    if system_default_id:
+        logger.info("Applied catalog default model")
+        return system_default_id, system_default_provider or provider
+    logger.warning(
+        "Model catalog has no enabled default; falling back to the hard-coded "
+        "Defaults.MODEL_ID, which may have no pricing row"
+    )
+    return None, provider
+
+
+async def _resolve_system_default_model() -> tuple[str | None, str | None]:
+    """The model a turn runs on when neither the request, an Agent, nor the user names one.
+
+    Returns ``(model_id, provider)`` of the catalog's ``isDefault`` row — the same
+    model the SPA pre-selects for a new chat, so the admin "Default" toggle and the
+    server fallback are one answer, not two. ``(None, None)`` when the catalog has
+    no enabled default (or can't be read), and the agent factory's hard-coded
+    ``Defaults.MODEL_ID`` takes over.
+
+    Deliberately not RBAC-gated, like the hard-coded fallback it replaces: the
+    SPA sends ``model_id: null`` only when the user can see *no* enabled model,
+    and gating here would send exactly those turns back to an id with no
+    catalog row — unpriced, unmetered and free against quota (model-retirement
+    spec §6). The provider travels with the id because the request's provider,
+    if any, described no model, and a default on another transport (Mantle,
+    bedrock-responses) misroutes without its own.
+    """
+    model = await get_default_managed_model()
+    if model is None:
+        return None, None
+    return model.model_id, model.provider
 
 
 def _merge_inference_params(
@@ -532,6 +734,66 @@ def _build_spreadsheet_tools(
 
 
 # ============================================================
+# Platform Self-Service Account Tool Injection
+# ============================================================
+
+def _build_account_tools(effective_enabled_tools: list | None, current_user: User) -> list:
+    """Create the platform self-service account tools, admin-governed at runtime.
+
+    These are ``system`` tools — platform plumbing, not a user picker toggle —
+    but they ARE admin-governable without a redeploy. The switch is the tool's
+    catalog row: ``resolve_system_tool_ids`` (called by
+    ``_apply_admin_always_on_tools`` upstream) returns a system tool's id only
+    when its row is ``system`` **and** ``status == active`` **and** the caller's
+    roles grant it. That resolved set is exactly what lands in
+    ``effective_enabled_tools`` here, so:
+
+    - an admin flipping a row to ``disabled`` in the Tools panel drops it from
+      the set on the next turn (≤ the freshness TTL, no deploy);
+    - a role that is not granted the tool never sees it;
+    - and a user cannot turn it on/off in their own picker (it is unioned in
+      regardless of their preferences, like any always-on tool).
+
+    So we inject a closure **only** for an id present in ``effective_enabled_tools``.
+    The closure captures identity (never a model argument); the catalog row is
+    the on/off authority.
+
+    Still gated by ``platform_self_service_enabled()`` (default OFF) as the
+    per-environment master switch — when off, nothing is injected and the
+    agent-cache eligibility is unchanged. See
+    ``.kiro/specs/platform-self-service/``.
+    """
+    from apis.shared.feature_flags import platform_self_service_enabled
+
+    if not platform_self_service_enabled():
+        return []
+
+    enabled = set(effective_enabled_tools or ())
+    if not enabled:
+        return []
+
+    from agents.local_tools.account_tools import (
+        make_get_my_quota_tool,
+        make_get_my_settings_tool,
+        make_set_default_model_tool,
+        make_whoami_tool,
+    )
+
+    # id -> factory. Only ids the catalog resolved into the effective set (row
+    # present, system, active, RBAC-granted) get built.
+    factories = {
+        "whoami": make_whoami_tool,
+        "get_my_quota": make_get_my_quota_tool,
+        "get_my_settings": make_get_my_settings_tool,
+        "set_default_model": make_set_default_model_tool,
+    }
+    tools = [factory(current_user) for tid, factory in factories.items() if tid in enabled]
+    if tools:
+        logger.info("Injected %d platform self-service account tool(s)", len(tools))
+    return tools
+
+
+# ============================================================
 # Artifact Authoring Tool Injection
 # ============================================================
 
@@ -752,8 +1014,315 @@ def _build_memory_tools(agent_memory, user_id: str, user_email: str) -> list:
 
 
 # ============================================================
+# Document Read Tool Injection (docs/specs/document-context-offload.md §4B)
+# ============================================================
+
+#: Sessions known to carry a readable document. The gate is one DynamoDB
+#: query per turn otherwise; a positive answer is memoized because it is
+#: monotonic in practice (an upload stays unless the user deletes it, and a
+#: stale tool on a session whose files were deleted just returns "not found").
+#: Negative answers are never memoized — the next turn may be the upload.
+_DOCUMENT_SESSIONS: "OrderedDict[str, bool]" = OrderedDict()
+_DOCUMENT_SESSIONS_MAX = 10_000
+
+
+def _remember_document_session(session_id: str) -> None:
+    _DOCUMENT_SESSIONS[session_id] = True
+    _DOCUMENT_SESSIONS.move_to_end(session_id)
+    while len(_DOCUMENT_SESSIONS) > _DOCUMENT_SESSIONS_MAX:
+        _DOCUMENT_SESSIONS.popitem(last=False)
+
+
+async def _session_has_documents(
+    session_id: str,
+    user_id: str,
+    turn_has_document: bool = False,
+) -> bool:
+    """Whether ``document_read`` should exist on this turn.
+
+    True when this turn attached a file the tool can actually read (the
+    caller has already classified it, so no query is needed), when the
+    session was seen carrying a document earlier in this process, or when
+    the session's upload rows include at least one readable document (PDF,
+    Word, text, markdown, HTML — not spreadsheets, decks or images, which
+    have other paths). Fail-closed on error: a turn without the tool is
+    today's behavior, never a broken turn.
+
+    ``turn_has_document`` must be *classified*, not merely "this turn
+    attached something". It used to be the raw ``file_upload_ids`` list, and
+    the difference is the whole bug: an image, a spreadsheet or a deck is an
+    upload id but not a document, so an image-only turn injected a tool whose
+    listing is empty by construction — and, worse, memoized the session as a
+    document session, so every later turn in that process carried it too.
+    Measured in prod over 2026-09-20T22:00..2026-09-21T17:15: 13 of the 29
+    sessions with attachments held no readable document, they accounted for
+    **100%** of the window's avoidable ``toolConfigHash`` rotations, and
+    because the memo is per-process while the DynamoDB query is not, the tool
+    (and therefore the cacheable prefix) flapped A→B→A→B as microVMs
+    recycled. Each flip re-writes the whole prefix at 1.25x input.
+    """
+    if turn_has_document:
+        _remember_document_session(session_id)
+        return True
+    if _DOCUMENT_SESSIONS.get(session_id):
+        return True
+    try:
+        from apis.shared.files.document_read import session_has_documents
+
+        present = await session_has_documents(user_id, session_id)
+    except Exception:  # noqa: BLE001 - the gate must never fail a turn
+        logger.warning("document_read gate lookup failed; tool not injected this turn", exc_info=True)
+        return False
+    if present:
+        _remember_document_session(session_id)
+    return present
+
+
+async def _document_tools_gate(
+    session_id: str,
+    user_id: str,
+    turn_has_document: bool = False,
+) -> bool:
+    """The single answer to "does this turn carry ``document_read``" — the
+    builder and the resume path's cache key both read it, so the two can
+    never disagree (a disagreement orphans a paused agent).
+
+    The resume path calls this with ``turn_has_document=False`` and relies on
+    the answer being reproducible from session state alone. That only holds
+    once the short-circuit is classified: an image-only turn used to answer
+    True on the way in (raw upload ids) and False on resume (the query sees
+    no readable document), so the resumed agent missed the slot the paused
+    turn was cached under.
+    """
+    from apis.shared.feature_flags import document_read_enabled
+
+    if not document_read_enabled():
+        return False
+    if not session_id or not user_id:
+        return False
+    return await _session_has_documents(session_id, user_id, turn_has_document)
+
+
+def _resolved_files_include_a_document(resolved_files: list | None) -> bool:
+    """Whether this turn's resolved uploads include one ``document_read`` can read.
+
+    The turn-level half of the injection gate. Classification, not presence:
+    images, spreadsheets and presentations all arrive as upload ids and none
+    of them is a document — spreadsheets route through the analysis tools and
+    decks through the PowerPoint tools, and ``document_read``'s own listing
+    filters them out, so injecting it for those turns buys nothing and
+    rotates ``toolConfigHash``.
+
+    Mirrors what ``_session_has_tabular`` already does for the Spreadsheet
+    Analysis auto-enable, which takes ``turn_has_tabular=bool(diverted_tabular)``
+    — a classified signal — rather than "the request carried files".
+    """
+    return any(
+        is_document_class(getattr(rf, "content_type", "") or "", getattr(rf, "filename", "") or "")
+        for rf in (resolved_files or ())
+    )
+
+
+async def _build_document_tools(
+    session_id: str,
+    user_id: str,
+    turn_has_document: bool = False,
+) -> list:
+    """Context-bound ``document_read`` for a session that has a readable attachment.
+
+    **Not gated on ``enabled_tools``** — the governing capability is the user's
+    own attachment, exactly as the Memory-Space tools are governed by an
+    Agent's binding. Its id stays out of ``INJECTED_TOOL_IDS``. Kill switch:
+    ``DOCUMENT_READ_ENABLED=false``. The gate's answer also feeds the agent
+    cache key (``has_document_tools``), so an agent cached before the first
+    upload is never served without the tool afterwards.
+
+    ``turn_has_document`` is this turn's *classified* answer — see
+    ``_session_has_documents``. Passing "did this turn attach anything"
+    injects the tool for image, spreadsheet and deck attachments, which it
+    cannot read.
+    """
+    if not await _document_tools_gate(session_id, user_id, turn_has_document):
+        return []
+
+    from agents.builtin_tools.document_read_tool import make_document_read_tool
+
+    tools = [make_document_read_tool(session_id, user_id)]
+    logger.info("Created document_read tool (session has a readable document)")
+    return tools
+
+
+# ============================================================
 # Attachment Partitioning (#206)
 # ============================================================
+
+# ============================================================
+# Spreadsheet Analysis auto-enable on attachment
+# (docs/specs/load-test-assessment-2026-09.md P2-E)
+# ============================================================
+
+#: Sessions known to hold a spreadsheet attachment. Same contract as
+#: ``_DOCUMENT_SESSIONS``: one query per turn otherwise, positive answers
+#: memoized because an upload stays unless the user deletes it, negative
+#: answers never memoized because the next turn may be the upload.
+_TABULAR_SESSIONS: "OrderedDict[str, bool]" = OrderedDict()
+_TABULAR_SESSIONS_MAX = 10_000
+
+
+def _remember_tabular_session(session_id: str) -> None:
+    _TABULAR_SESSIONS[session_id] = True
+    _TABULAR_SESSIONS.move_to_end(session_id)
+    while len(_TABULAR_SESSIONS) > _TABULAR_SESSIONS_MAX:
+        _TABULAR_SESSIONS.popitem(last=False)
+
+
+async def _session_has_tabular(
+    session_id: str,
+    user_id: str,
+    turn_has_tabular: bool = False,
+) -> bool:
+    """Whether this session's turns need the Spreadsheet Analysis tools.
+
+    True when this turn attaches a CSV/XLSX (already partitioned, no query),
+    when the session was seen holding one earlier in this process, or when
+    the session's READY uploads include one. Sticky by design: the answer
+    feeds ``enabled_tools`` and therefore the agent-cache key, so it must
+    not flip between the attach turn and the follow-up. Fail-closed on
+    error: a turn without the tools is today's behavior, never a broken turn.
+    """
+    if turn_has_tabular:
+        _remember_tabular_session(session_id)
+        return True
+    if _TABULAR_SESSIONS.get(session_id):
+        return True
+    if not session_id or not user_id:
+        return False
+    try:
+        from apis.shared.files.document_read import session_has_tabular_files
+
+        present = await session_has_tabular_files(user_id, session_id)
+    except Exception:  # noqa: BLE001 - the gate must never fail a turn
+        logger.warning("spreadsheet auto-enable lookup failed; tools not injected this turn", exc_info=True)
+        return False
+    if present:
+        _remember_tabular_session(session_id)
+    return present
+
+
+def _with_auto_enabled_tools(enabled_tools: list | None, auto_ids: list[str]) -> list | None:
+    """``enabled_tools`` plus ``auto_ids`` not already present.
+
+    Thin alias over ``apis.shared.tools.always_on.union_enabled_tools``, which
+    is where the semantics now live so the voice entry point can share them
+    rather than keep a second copy. Kept as a module-local name because every
+    call site and test in this module refers to it.
+    """
+    return union_enabled_tools(enabled_tools, auto_ids)
+
+
+async def _auto_enabled_attachment_tool_ids(
+    current_user: User,
+    session_id: str,
+    user_id: str,
+    turn_has_tabular: bool = False,
+) -> list[str]:
+    """The Spreadsheet Analysis ids this turn should carry regardless of the
+    picker, in a fixed order: every id in ``SPREADSHEET_TOOL_IDS`` the
+    caller's RBAC grant admits, when the session holds a spreadsheet.
+
+    Enables, never grants: ``can_access_tool`` is the same predicate the
+    picker and Agent bindings answer to (role grant ∪ public tools). A user
+    whose roles do not carry the tool gets today's behavior — the attachment
+    note tells them the tool is not available to their account.
+    """
+    from apis.shared.feature_flags import attachment_tool_autoenable_enabled
+
+    if not attachment_tool_autoenable_enabled():
+        return []
+    if not await _session_has_tabular(session_id, user_id, turn_has_tabular):
+        return []
+    role_service = get_app_role_service()
+    allowed: list[str] = []
+    for tool_id in sorted(SPREADSHEET_TOOL_IDS):
+        try:
+            if await role_service.can_access_tool(current_user, tool_id):
+                allowed.append(tool_id)
+        except Exception:  # noqa: BLE001 - an RBAC lookup failure must not fail the turn
+            logger.warning("RBAC check for %s failed; not auto-enabling", tool_id, exc_info=True)
+    if allowed:
+        logger.info(
+            "Auto-enabled %s for a session with a spreadsheet attachment (session=%s)",
+            allowed, scrub_log(session_id),
+        )
+    return allowed
+
+
+async def _apply_attachment_tool_autoenable(
+    enabled_tools: list | None,
+    current_user: User,
+    session_id: str,
+    user_id: str,
+    turn_has_tabular: bool = False,
+) -> list | None:
+    """``enabled_tools`` for this turn with the attachment auto-enable applied.
+
+    The single seam every ``get_agent`` caller on the invocation path goes
+    through, so the main turn and the MCP App dispatch paths compute the same
+    effective list — and therefore the same agent-cache slot — for a session
+    holding a spreadsheet.
+    """
+    auto_ids = await _auto_enabled_attachment_tool_ids(
+        current_user, session_id, user_id, turn_has_tabular=turn_has_tabular
+    )
+    return _with_auto_enabled_tools(enabled_tools, auto_ids)
+
+
+async def _apply_admin_always_on_tools(
+    enabled_tools: list | None,
+    current_user: User,
+    agent_bound_tools: bool = False,
+) -> list | None:
+    """``enabled_tools`` for this turn with the admin-pinned tools unioned in.
+
+    Sits at the same seam as ``_apply_attachment_tool_autoenable`` and for the
+    same reason: every ``get_agent`` caller on the invocation path goes through
+    it, so the main turn and the MCP App dispatch compute the same effective
+    list and therefore the same agent-cache slot.
+
+    ``agent_bound_tools`` is whether an Agent's ``tool`` bindings are driving
+    this turn. **When they are, nothing is pinned.** An Agent that binds tools
+    owns its toolset the way ``modelConfig`` owns the model, and unioning into
+    it would override the author's explicit scoping.
+
+    ⚠️ The exemption is "the Agent binds its own toolset", NOT "the turn ran an
+    Agent". ``_resolve_tools`` returns ``None`` — so ``agent_bound_tools`` is
+    False — for an Agent with no ``tool`` bindings, and such a turn falls
+    through to the user's picker and **does** get the pinned set. That is
+    deliberate: a template-derived Agent starts with empty ``bindings``
+    (``agent_templates/seed.py``), and exempting it would make always-on
+    opt-out-by-construction — anyone could shed a pinned tool with a trivial
+    unbound Agent. See docs/specs/admin-always-on-tools.md §7 D4.
+
+    This is a deliberate divergence from the attachment auto-enable above,
+    which applies to the effective list and so does reach Agent-bound turns:
+    that one serves the *user's* intent (they attached the file), this one
+    serves the *admin's* — and the Agent author is exercising admin intent too.
+
+    **System tools are the exception to the exception.** A ``system`` tool
+    (platform-shipped plumbing such as ``whoami``/``get_my_quota``) is part of
+    the app, not the user's picker and not the admin's per-deployment pin, so it
+    is unioned in on EVERY turn — including Agent-bound ones. An Agent author
+    scopes the *user-facing* toolset; they do not get to remove the platform's
+    own self-service capabilities. See .kiro/specs/platform-self-service/design.md.
+    """
+    # Ungated by ADMIN_ALWAYS_ON_TOOLS_ENABLED and unaffected by agent binding:
+    # system capabilities are always available to a granted user.
+    system_ids = await resolve_system_tool_ids(current_user)
+    if agent_bound_tools:
+        return _with_auto_enabled_tools(enabled_tools, system_ids)
+    always_on_ids = await resolve_always_on_tool_ids(current_user)
+    return _with_auto_enabled_tools(enabled_tools, always_on_ids + system_ids)
+
 
 def _estimate_decoded_size(file: "FileContent") -> int:
     """Estimate decoded byte size of a base64-encoded FileContent payload.
@@ -821,6 +1390,110 @@ def _partition_attachments(
     return inline, tabular, presentations, oversized
 
 
+def _apply_message_file_cap(
+    direct_files: list,
+    upload_ids: list,
+    max_files: int,
+) -> tuple[list, list, list, int]:
+    """Hold a message to ``max_files`` attachments across both request paths.
+
+    Returns ``(direct_files, upload_ids, dropped_names, dropped_total)``.
+    Direct ``files`` come first (they are already in the request body), then
+    ``file_upload_ids`` fill whatever budget remains. Attachment order is
+    kept, so the first N the user attached are the N that survive.
+
+    The cap is applied to the upload IDs *before* they are resolved: the old
+    resolver default truncated silently after the fact, and letting every ID
+    through just to name the losers would fan out one S3 read per ID a client
+    chose to send. IDs beyond the budget are therefore counted, not named —
+    ``dropped_names`` holds the direct files (names known) and
+    ``dropped_total`` counts both. ``max_files <= 0`` disables the cap.
+    """
+    if max_files <= 0:
+        return direct_files, upload_ids, [], 0
+
+    kept_direct = direct_files[:max_files]
+    dropped_names = [f.filename for f in direct_files[max_files:]]
+    id_budget = max(0, max_files - len(kept_direct))
+    kept_ids = upload_ids[:id_budget]
+    dropped_total = len(dropped_names) + (len(upload_ids) - len(kept_ids))
+    return kept_direct, kept_ids, dropped_names, dropped_total
+
+
+def _apply_inline_byte_budget(
+    inline: list,
+    max_total_bytes: int,
+) -> tuple[list, list, int]:
+    """Hold the inline set (documents *and* images) to one message's byte
+    budget. Returns ``(kept, over_budget, requested_bytes)``.
+
+    Why this exists: the turn's inline attachments are persisted as one
+    AgentCore Memory event, and past ~7.5 MB of raw bytes that write fails
+    with ``SessionException`` — a hole in history, not a degraded turn. See
+    ``INLINE_ATTACHMENTS_MAX_TOTAL_BYTES`` for the derivation.
+
+    Policy — first-fit in attachment order: walk the files as the user
+    attached them, keep each one that still fits, and move any that would
+    push the running total over the budget to ``over_budget``. Earlier
+    attachments win, and a later, smaller file that still fits rides along
+    rather than being punished for a large neighbour. Order within both
+    lists is the attachment order, so the marker text and the guidance note
+    are deterministic (they land in the cacheable prefix on later turns).
+
+    Images count toward the budget: they are part of the same message and
+    the same event, even though the per-file document gate skips them.
+    ``max_total_bytes <= 0`` disables the budget.
+    """
+    requested = sum(_estimate_decoded_size(f) for f in inline)
+    if max_total_bytes <= 0:
+        return list(inline), [], requested
+
+    kept: list = []
+    over: list = []
+    running = 0
+    for file in inline:
+        size = _estimate_decoded_size(file)
+        if running + size > max_total_bytes:
+            over.append(file)
+            continue
+        running += size
+        kept.append(file)
+    return kept, over, requested
+
+
+def _emit_attachment_over_quota_metric(
+    requested_bytes: int,
+    cap_bytes: int,
+    inline_count: int,
+    dropped_count: int,
+) -> None:
+    """One content-free EMF record in ``AgentCoreStack/Compaction`` when a
+    turn's inline attachments had to be trimmed to the byte budget. Never
+    raises. ``AttachmentTurnOverQuota`` carries the requested bytes so the
+    rate *and* the size distribution of over-quota turns are measurable
+    (spec §4E put the rate at ~1.3–1.4% of attachment turns from a proxy;
+    this is the direct count).
+    """
+    try:
+        from apis.shared.observability.emf import emit_emf_metrics
+        from apis.shared.observability.prompt_cache import prompt_cache_observability_enabled
+
+        if not prompt_cache_observability_enabled():
+            return
+        emit_emf_metrics(
+            "AgentCoreStack/Compaction",
+            metrics={"AttachmentTurnOverQuota": requested_bytes},
+            properties={
+                "capBytes": cap_bytes,
+                "inlineFileCount": inline_count,
+                "droppedFileCount": dropped_count,
+            },
+            units={"AttachmentTurnOverQuota": "Bytes"},
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("AttachmentTurnOverQuota EMF skipped: %s", e)
+
+
 def _attachment_marker_names(all_files: list, oversized_inline: list) -> list:
     """Filenames for the ``[Attached files: …]`` marker on the user message.
 
@@ -852,10 +1525,21 @@ def _build_attachment_guidance(
     diverted_presentations: list,
     oversized_inline: list,
     enabled_tools: list | None,
+    over_budget: list | None = None,
+    dropped_over_count_names: list[str] | None = None,
+    dropped_over_count_total: int = 0,
+    max_files: int = 0,
 ) -> str:
     """Return a short markdown addendum describing how attachments will be
     handled, to append to the user's message so the agent (and the user)
     both understand why a file isn't inline.
+
+    ``oversized_inline`` is the per-file case (the file itself is too big;
+    the fix is a smaller file). ``over_budget`` is the aggregate case (each
+    file is fine, together they exceed one message's budget; the fix is a
+    follow-up message). They get separate sentences because the remedy
+    differs. ``dropped_over_count_*`` describe files beyond the per-message
+    count cap: names where known (direct ``files``), a count otherwise.
     """
     parts: list[str] = []
 
@@ -872,11 +1556,15 @@ def _build_attachment_guidance(
                 f"to run aggregations or lookups._"
             )
         else:
+            # Reached only when the auto-enable did not apply: the caller's
+            # roles do not carry the tool, or the kill switch is set. Say so
+            # without sending them to a toggle that may not be there.
             parts.append(
-                f"_Attached spreadsheet(s) {names} can't be read inline at "
-                f"this size. To analyze them, enable **Spreadsheet Analysis** "
-                f"in the Tools section of the settings panel (gear icon next "
-                f"to the message input), then re-send your message._"
+                f"_Attached spreadsheet(s) {names} can't be read inline. "
+                f"Analyzing them needs the **Spreadsheet Analysis** tool, which "
+                f"isn't available in this conversation — if it is listed under "
+                f"Customize → Tools in the sidebar, enable it and re-send your "
+                f"message; if it isn't, your account doesn't have access to it._"
             )
 
     if diverted_presentations:
@@ -895,9 +1583,9 @@ def _build_attachment_guidance(
         else:
             parts.append(
                 f"_Attached presentation(s) {names} can't be read inline. To "
-                f"work with them, enable **PowerPoint Presentations** in the "
-                f"Tools section of the settings panel (gear icon next to the "
-                f"message input), then re-send your message._"
+                f"work with them, enable **PowerPoint Presentations** under "
+                f"Customize → Tools in the sidebar, then re-send your "
+                f"message._"
             )
 
     if oversized_inline:
@@ -907,6 +1595,32 @@ def _build_attachment_guidance(
             f"and were skipped. Try a smaller file, or convert to CSV/XLSX "
             f"and use the Spreadsheet Analysis tool._"
         )
+
+    if over_budget:
+        names = ", ".join(f"`{f.filename}`" for f in over_budget)
+        parts.append(
+            f"_Attached file(s) {names} were skipped because this message's "
+            f"attachments together exceed the combined size limit for a "
+            f"single message. Send them in a follow-up message._"
+        )
+
+    if dropped_over_count_total > 0:
+        limit = f"{max_files} file" + ("s" if max_files != 1 else "")
+        if dropped_over_count_names:
+            names = ", ".join(f"`{n}`" for n in dropped_over_count_names)
+            unnamed = dropped_over_count_total - len(dropped_over_count_names)
+            tail = f" and {unnamed} more" if unnamed > 0 else ""
+            parts.append(
+                f"_Only the first {limit} per message are attached; "
+                f"{names}{tail} were not. Send them in a follow-up message._"
+            )
+        else:
+            noun = "file was" if dropped_over_count_total == 1 else "files were"
+            parts.append(
+                f"_Only the first {limit} per message are attached; "
+                f"{dropped_over_count_total} more {noun} not. "
+                f"Send them in a follow-up message._"
+            )
 
     return "\n\n".join(parts)
 
@@ -1290,6 +2004,17 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
     user_id = current_user.user_id
     auth_token = current_user.raw_token
 
+    # Where the pre-stream time goes. Everything between here and the
+    # `StreamingResponse` return happens with NO channel open to the client —
+    # measured at 3.75s on a warm turn — so this is the only way to see which
+    # stage owns it. Pure timing: nothing reaches the model.
+    # See `turn_timing.py` and docs/specs/agent-state-feedback.md.
+    prelude = TurnPrelude()
+    # Whether this turn's agent is built inside the stream (PR-3). Recorded on
+    # the `turn_prelude` line so the two shapes stay distinguishable in the
+    # logs once the flag has been on for a while.
+    deferred_build = False
+
     # Refuse a turn against a session id another user already owns.
     #
     # Session ids travel in shareable URLs (`/s/{sessionId}`). Opening someone
@@ -1304,12 +2029,29 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
     # stops the id from being forked at all. 404 rather than 403 so the
     # response says nothing about whether the session exists, matching what
     # `GET /sessions/{id}/metadata` already returns for the same case.
-    if await session_owned_by_other_user(input_data.session_id, user_id):
+    #
+    # ONE read of the session's META row, shared by everything in the preamble
+    # that used to fetch it again (PR-2, docs/specs/turn-latency-preamble.md).
+    # Measured on dev: eight separate reads of this item cost ~445ms of a
+    # ~455ms stage, because a GSI query from an AgentCore Runtime container is
+    # ~53ms rather than the ~12ms an in-region figure would suggest.
+    #
+    # Deliberately explicit rather than a per-request memo inside
+    # `_get_session_by_gsi`: CLAUDE.md's "never cache session state" rule has
+    # been paid for twice (#741, #751), and a snapshot callers opt into cannot
+    # leak into one that needs a fresh read.
+    session_meta = await load_session_meta(input_data.session_id, user_id)
+    if session_meta.owned_by_other:
         logger.warning(
             "Rejected invocation for session %s — owned by a different user",
             _sanitize_log(input_data.session_id),
         )
         raise HTTPException(status_code=404, detail="Session not found")
+    # First of the preamble's five sub-stages (docs/specs/turn-latency-preamble.md).
+    # The coarse `preamble` number survives as `groups.preamble` in the emitted
+    # line, so the four-turn baseline in the agent-state-feedback spec stays
+    # comparable across this split.
+    prelude.mark("preamble.ownership")
     # Resume requests reuse the cached agent and its paused interrupt state;
     # they bypass quota, file resolution, and RAG augmentation because those
     # already ran on the original turn that got paused.
@@ -1344,6 +2086,10 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             await _resolve_accessible_skill_ids(current_user),
             input_data.enabled_skills,
         )
+    # Near-zero on a turn that selects no skills — the opt-in default (D6)
+    # short-circuits before touching RBAC or the skill table. A non-trivial
+    # number here means the RBAC cache missed or the owner-index query is slow.
+    prelude.mark("preamble.skills")
     # A "Continue" after a max_tokens truncation. Like resume, it bypasses
     # quota / RAG / file resolution and does NOT clear the turn state; unlike
     # resume there is no interrupt to validate — the agent is rebuilt from the
@@ -1359,6 +2105,21 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
     )
     logger.info("Message received")
 
+    # Model retirement (docs/specs/model-retirement.md §7). Resolved before anything
+    # builds an agent from ``input_data.model_id``, so the App tool-call / context /
+    # continuation paths land in the same agent-cache slot as the turn itself. A
+    # redirect swaps the provider as well: the request's described the retired
+    # model, and a successor on another transport misroutes with it. A denial is
+    # streamed at the access check below, once there is a turn to answer.
+    retired_model_denial: Optional[str] = None
+    requested_model = await resolve_effective_model(input_data.model_id)
+    if requested_model is not None:
+        if requested_model.denied:
+            retired_model_denial = retired_model_message(requested_model.retired)
+        elif requested_model.redirected:
+            input_data.model_id = requested_model.model_id
+            input_data.provider = requested_model.provider
+
     # App-initiated tools/call (MCP Apps PR #5). Like resume/continuation it
     # bypasses quota / RAG / file resolution / title — there is no model
     # turn. We rebuild the conversation agent (so the MCP client session +
@@ -1372,8 +2133,13 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
         atc = input_data.app_tool_call
         try:
             request_inference_params = dict(input_data.inference_params or {})
+            dispatch_model_id, dispatch_provider = input_data.model_id, input_data.provider
+            if not dispatch_model_id:
+                dispatch_model_id, dispatch_provider = await _resolve_fallback_model(
+                    user_id, current_user, dispatch_provider
+                )
             caching_enabled, inference_params, mantle_api_mode, mantle_region, registry_provider = await _resolve_model_settings(
-                model_id=input_data.model_id,
+                model_id=dispatch_model_id,
                 explicit_caching_enabled=input_data.caching_enabled,
                 request_inference_params=request_inference_params,
             )
@@ -1381,11 +2147,21 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 session_id=input_data.session_id,
                 user_id=user_id,
                 auth_token=auth_token,
-                enabled_tools=input_data.enabled_tools,
-                model_id=input_data.model_id,
-                system_prompt=input_data.system_prompt,
+                # Same auto-enable seam as the main turn, so a spreadsheet
+                # session's dispatch reads the slot the real turns fill — and
+                # the same always-on union, or the dispatch would compute a
+                # different effective list and miss into its own agent-cache
+                # slot on every App call.
+                enabled_tools=await _apply_admin_always_on_tools(
+                    await _apply_attachment_tool_autoenable(
+                        input_data.enabled_tools, current_user, input_data.session_id, user_id
+                    ),
+                    current_user,
+                ),
+                model_id=dispatch_model_id,
+                system_prompt=await _plain_turn_prompt(input_data, user_id),
                 caching_enabled=caching_enabled,
-                provider=input_data.provider or registry_provider,
+                provider=dispatch_provider or registry_provider,
                 inference_params=inference_params,
                 mantle_api_mode=mantle_api_mode,
                 mantle_region=mantle_region,
@@ -1395,6 +2171,7 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 # This path builds no injected tools, but shares a cache slot
                 # with the real turns that do. Read the slot; never seed it.
                 cache_write=False,
+                assistant_id=input_data.rag_assistant_id,
             )
             payload = await dispatch_app_tool_call(
                 agent,
@@ -1428,8 +2205,13 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
         acu = input_data.app_context_update
         try:
             request_inference_params = dict(input_data.inference_params or {})
+            dispatch_model_id, dispatch_provider = input_data.model_id, input_data.provider
+            if not dispatch_model_id:
+                dispatch_model_id, dispatch_provider = await _resolve_fallback_model(
+                    user_id, current_user, dispatch_provider
+                )
             caching_enabled, inference_params, mantle_api_mode, mantle_region, registry_provider = await _resolve_model_settings(
-                model_id=input_data.model_id,
+                model_id=dispatch_model_id,
                 explicit_caching_enabled=input_data.caching_enabled,
                 request_inference_params=request_inference_params,
             )
@@ -1437,11 +2219,21 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 session_id=input_data.session_id,
                 user_id=user_id,
                 auth_token=auth_token,
-                enabled_tools=input_data.enabled_tools,
-                model_id=input_data.model_id,
-                system_prompt=input_data.system_prompt,
+                # Same auto-enable seam as the main turn, so a spreadsheet
+                # session's dispatch reads the slot the real turns fill — and
+                # the same always-on union, or the dispatch would compute a
+                # different effective list and miss into its own agent-cache
+                # slot on every App call.
+                enabled_tools=await _apply_admin_always_on_tools(
+                    await _apply_attachment_tool_autoenable(
+                        input_data.enabled_tools, current_user, input_data.session_id, user_id
+                    ),
+                    current_user,
+                ),
+                model_id=dispatch_model_id,
+                system_prompt=await _plain_turn_prompt(input_data, user_id),
                 caching_enabled=caching_enabled,
-                provider=input_data.provider or registry_provider,
+                provider=dispatch_provider or registry_provider,
                 inference_params=inference_params,
                 mantle_api_mode=mantle_api_mode,
                 mantle_region=mantle_region,
@@ -1450,6 +2242,7 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 accessible_skill_ids=effective_skill_ids,
                 # Same partial-toolset hazard as app_tool_call above.
                 cache_write=False,
+                assistant_id=input_data.rag_assistant_id,
             )
             payload = dispatch_app_context_update(
                 agent,
@@ -1491,7 +2284,9 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
     if not is_resume and not is_continuation:
         try:
             from apis.shared.sessions.metadata import pop_pending_attachments
-            recovered_upload_ids = await pop_pending_attachments(input_data.session_id, user_id)
+            recovered_upload_ids = await pop_pending_attachments(
+                input_data.session_id, user_id, snapshot=session_meta
+            )
         except Exception as e:
             logger.error("Failed to recover pending attachments: %s", e, exc_info=True)
 
@@ -1532,19 +2327,51 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
     #     budget; we skip them inline and surface a note instead of
     #     letting Bedrock reject the turn.
     all_files = list(input_data.files) if input_data.files else []
+    upload_ids_to_resolve = list(input_data.file_upload_ids or [])
 
-    if input_data.file_upload_ids:
+    # Per-message file count (spec §4E / PR-6). Applied here, before the
+    # S3 fetch, so a sixth file is reported to the user instead of silently
+    # truncated by the resolver — and so a client cannot fan out unbounded
+    # S3 reads. With the guard off, the resolver's own backstop (5) applies
+    # exactly as it did before.
+    turn_guard_on = attachment_turn_guard_enabled()
+    dropped_over_count_names: list[str] = []
+    dropped_over_count_total = 0
+    if turn_guard_on:
+        (
+            all_files,
+            upload_ids_to_resolve,
+            dropped_over_count_names,
+            dropped_over_count_total,
+        ) = _apply_message_file_cap(all_files, upload_ids_to_resolve, MAX_FILES_PER_MESSAGE)
+        if dropped_over_count_total:
+            logger.warning(
+                "Dropped %d attachment(s) over the %d-per-message cap",
+                dropped_over_count_total,
+                MAX_FILES_PER_MESSAGE,
+            )
+
+    # Whether THIS turn attached something `document_read` can actually read.
+    # Classified here, from the resolved uploads, rather than inferred from
+    # `file_upload_ids` being non-empty: an image, a spreadsheet and a deck
+    # are all upload ids and none of them is a document. Feeds the injection
+    # gate and therefore `toolConfig` — see `_session_has_documents`.
+    turn_has_document = False
+    if upload_ids_to_resolve:
         try:
             file_resolver = get_file_resolver()
             resolved_files = await file_resolver.resolve_files(
                 user_id=user_id,
-                upload_ids=input_data.file_upload_ids,
-                max_files=5,  # Bedrock document limit
+                upload_ids=upload_ids_to_resolve,
+                # Already capped above when the guard is on; the resolver's
+                # own backstop is the pre-guard behaviour.
+                max_files=None if turn_guard_on else 5,
             )
             for rf in resolved_files:
                 all_files.append(
                     FileContent(filename=rf.filename, content_type=rf.content_type, bytes=rf.bytes)
                 )
+            turn_has_document = _resolved_files_include_a_document(resolved_files)
             logger.info(f"Resolved {len(resolved_files)} files from upload IDs")
         except Exception:
             logger.warning("Failed to resolve file upload IDs", exc_info=True)
@@ -1602,7 +2429,42 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             f"{[(f.filename, _estimate_decoded_size(f)) for f in oversized_inline]}"
         )
 
-    attachment_marker_names = _attachment_marker_names(all_files, oversized_inline)
+    # Aggregate budget for the turn (spec §4E / PR-6): the inline set is one
+    # persisted message, and a message over ~7.5 MB raw fails the AgentCore
+    # Memory write with SessionException. Trim first-fit in attachment order;
+    # the trimmed files join the oversized note path, never the exception.
+    over_budget_inline: list = []
+    if turn_guard_on and files_to_send:
+        files_to_send, over_budget_inline, requested_inline_bytes = _apply_inline_byte_budget(
+            files_to_send, INLINE_ATTACHMENTS_MAX_TOTAL_BYTES
+        )
+        if over_budget_inline:
+            logger.warning(
+                "Attachment turn over quota: requested_bytes=%d cap_bytes=%d "
+                "inline_files=%d dropped_files=%d",
+                requested_inline_bytes,
+                INLINE_ATTACHMENTS_MAX_TOTAL_BYTES,
+                len(files_to_send) + len(over_budget_inline),
+                len(over_budget_inline),
+            )
+            _emit_attachment_over_quota_metric(
+                requested_bytes=requested_inline_bytes,
+                cap_bytes=INLINE_ATTACHMENTS_MAX_TOTAL_BYTES,
+                inline_count=len(files_to_send) + len(over_budget_inline),
+                dropped_count=len(over_budget_inline),
+            )
+
+    # Both classes were dropped from the turn entirely; the marker must not
+    # promise a card for either.
+    attachment_marker_names = _attachment_marker_names(
+        all_files, oversized_inline + over_budget_inline
+    )
+
+    # Covers the unconsumed-attachment recovery read, the S3 fetch behind
+    # `resolve_files`, and the inline/tabular/oversized partitioning. Expected
+    # to be ~0 on a turn with no attachments; if it is not, the hypothesis in
+    # docs/specs/turn-latency-preamble.md is wrong about where the time is.
+    prelude.mark("preamble.files")
 
     # Pre-create session metadata so OAuth interrupts and other state can
     # attach to the session row from turn one. Best-effort; on failure the
@@ -1615,13 +2477,15 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
     # already moved past.
     is_new_session = False
     if not is_resume and not is_continuation:
-        is_new_session = await ensure_session_metadata_exists(input_data.session_id, user_id)
+        is_new_session = await ensure_session_metadata_exists(
+            input_data.session_id, user_id, snapshot=session_meta
+        )
         try:
             from apis.shared.sessions.metadata import (
                 clear_paused_turn,
                 clear_pending_interrupts,
             )
-            await clear_paused_turn(input_data.session_id, user_id)
+            await clear_paused_turn(input_data.session_id, user_id, snapshot=session_meta)
             # The snapshot's breadcrumbs go with it. They are the other half of
             # the same record, and a breadcrumb that outlives the snapshot
             # re-renders a prompt the user can no longer answer: the resume
@@ -1629,7 +2493,9 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             # here specifically because this runs at the *head* of a non-resume
             # turn — any breadcrumb this turn goes on to write lands later, on
             # its own `done` event.
-            await clear_pending_interrupts(input_data.session_id, user_id)
+            await clear_pending_interrupts(
+                input_data.session_id, user_id, snapshot=session_meta
+            )
         except Exception as e:
             logger.error("Failed to clear stale paused_turn on new turn: %s", e, exc_info=True)
 
@@ -1641,7 +2507,7 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
     if not is_resume:
         try:
             from apis.shared.sessions.metadata import clear_truncated_turn
-            await clear_truncated_turn(input_data.session_id, user_id)
+            await clear_truncated_turn(input_data.session_id, user_id, snapshot=session_meta)
         except Exception as e:
             logger.error("Failed to clear stale truncated_turn on new turn: %s", e, exc_info=True)
 
@@ -1654,7 +2520,9 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
         # in the stream generator below.
         try:
             from apis.shared.sessions.metadata import clear_interrupted_turn
-            interrupted_turn_reason = await clear_interrupted_turn(input_data.session_id, user_id)
+            interrupted_turn_reason = await clear_interrupted_turn(
+                input_data.session_id, user_id, snapshot=session_meta
+            )
         except Exception as e:
             logger.error("Failed to clear stale interrupted_turn on new turn: %s", e, exc_info=True)
 
@@ -1691,6 +2559,14 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             )
         )
 
+    # The prime suspect: five of the preamble's eight reads of the session's
+    # META row live in this stage (pre-create plus the four stale-marker
+    # clears), each on its own round trip, and four of them short-circuit
+    # without writing anything. The title task is inside the boundary because
+    # spawning it is first-turn session state; it is an `asyncio.create_task`,
+    # so it contributes nothing to the number.
+    prelude.mark("preamble.session_state")
+
     # Check quota if enforcement is enabled
     quota_warning_event = None
     quota_session_notice_event = None
@@ -1698,7 +2574,23 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
     if is_quota_enforcement_enabled() and not is_resume and not is_continuation:
         try:
             quota_checker = get_quota_checker()
-            quota_result = await quota_checker.check_quota(user=current_user, session_id=input_data.session_id)
+            # Hand the quota checker the session cost we already read (PR-2b).
+            # ONLY when the row actually carries `totalCost`: absent means a
+            # legacy row that `get_session_metadata` still needs to backfill,
+            # and `None` routes the checker back to that read. Passing 0.0 for
+            # a missing attribute would silence the notice on exactly the
+            # long-lived conversations it exists to catch.
+            session_total_cost = None
+            if session_meta.row is not None and "totalCost" in session_meta.row:
+                try:
+                    session_total_cost = float(session_meta.row["totalCost"])
+                except (TypeError, ValueError):
+                    session_total_cost = None
+            quota_result = await quota_checker.check_quota(
+                user=current_user,
+                session_id=input_data.session_id,
+                session_total_cost=session_total_cost,
+            )
 
             if not quota_result.allowed:
                 # Quota blocked - stream as SSE instead of 429 for better UX
@@ -1727,6 +2619,11 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             # Log error but don't block request - fail open for quota errors
             logger.error("Error checking quota for user", exc_info=True)
 
+    # The quota round trip: a cached tier resolve, a cached O(1) cost-summary
+    # GetItem, and — the uncached one — the per-session notice, which reads the
+    # META row for the eighth time this turn.
+    prelude.mark("preamble.quota")
+
     # If quota exceeded, stream the quota exceeded message instead of agent response
     if quota_exceeded_event:
         return StreamingResponse(
@@ -1734,6 +2631,27 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 message=quota_exceeded_event.message,
                 stop_reason="quota_exceeded",
                 metadata_event=quota_exceeded_event,
+                session_id=input_data.session_id,
+                user_id=user_id,
+                user_input=input_data.message,
+            ),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Session-ID": input_data.session_id},
+        )
+
+    # A retired model with no successor is denied for everyone, wildcard holders
+    # included — as a conversational message, not the bare 403 below. Not on a
+    # resume: that turn finishes on its paused snapshot's model, whatever the
+    # request carries.
+    if retired_model_denial and not is_resume:
+        retired_event = ConversationalErrorEvent(
+            code=ErrorCode.FORBIDDEN, message=retired_model_denial, recoverable=False
+        )
+        return StreamingResponse(
+            stream_conversational_message(
+                message=retired_model_denial,
+                stop_reason="error",
+                metadata_event=retired_event,
                 session_id=input_data.session_id,
                 user_id=user_id,
                 user_input=input_data.message,
@@ -1757,11 +2675,18 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
     context_chunks = None
     augmented_message = input_data.message
     system_prompt = input_data.system_prompt  # Start with provided system prompt
+    # One settings read per turn: the default model and personal instructions both
+    # come from it. A preview is an author testing an agent, so it gets none of theirs.
+    user_settings = await _load_user_settings(user_id)
+    personal_instructions = (
+        None if is_preview_session(input_data.session_id) else _personal_instructions(user_settings)
+    )
     # Agent Designer Phase 3: governed capabilities resolved per invoking user
     # (D5). None ⇒ resolve exactly as today. Set in the assistant block below,
     # consumed at model resolution / prompt assembly; None on resume/continuation.
     agent_model_override = None
     agent_memory = None
+    memory_context = None
     # Agent Designer: an Agent's ``tool`` bindings, resolved per invoker (D5), replace
     # the request's ``enabled_tools`` for the turn (like ``model_override`` replaces the
     # model). None ⇒ the Agent binds no tools ⇒ the request's enabled_tools drive the turn.
@@ -1770,6 +2695,17 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
     # request's skills AND force skill-mode (agent_type="skill") for the turn. None ⇒ the
     # Agent binds no skills ⇒ the request's agent_type/enabled_skills drive the turn.
     agent_skills_override = None
+    # Shared Projects: set when this turn's agent is a project's hidden harness. Carried to
+    # the session binding and to every cost row of the turn (``projectId`` plus the
+    # project's monthly rollup). ``agent_notice_event`` names what a degraded resolution
+    # dropped (§9.6) and is streamed before ``message_start``; it never reaches the prompt.
+    turn_project_id: Optional[str] = None
+    agent_notice_event: Optional[AgentNoticeEvent] = None
+    # Shared Projects 2.4b: a harness turn's memory load (started once the project is
+    # known) and its result, which supplies `memory_context`, the scope-addressed
+    # memory tools and their cache-key element.
+    project_memory_task: Optional["asyncio.Task[ProjectMemoryTurn]"] = None
+    project_memory: Optional["ProjectMemoryTurn"] = None
     # Version snapshots (§4): which Agent snapshot this turn resolved to, for the log line
     # below. ``None`` means the live record ran — a plain chat turn with no Agent, an Agent
     # with nothing published, or the owner running their own draft.
@@ -1778,7 +2714,7 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
     # key is built from construction *values*, and everything a version changes about
     # behavior already reaches it: instructions via ``system_prompt``, tool bindings via
     # ``enabled_tools``, skills via ``skills_hash``/``agent_type``, the model via
-    # ``model_id``, and a memory binding by skipping the cache entirely (extra_tools). So
+    # ``model_id``, and a memory binding via the ``memory_binding`` key element. So
     # promoting a version already misses. Adding the number would buy no discrimination and
     # would cost real safety: the resume path rebuilds its key from ``PausedTurnSnapshot``,
     # so a new key element the snapshot did not carry orphans the paused agent and breaks
@@ -1976,6 +2912,28 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             logger.warning(
                 "Assistant lookup returned None (review_preview=%s)", is_review_preview
             )
+            # A project task while Projects are switched off: the harness refuses
+            # everyone, so say why in the conversation rather than as a bare 403.
+            from apis.shared.assistants.service import is_disabled_project_harness
+
+            if await is_disabled_project_harness(input_data.rag_assistant_id):
+                refusal = PROJECTS_DISABLED_MESSAGE
+                refused_event = ConversationalErrorEvent(
+                    code=ErrorCode.FORBIDDEN, message=refusal, recoverable=False
+                )
+                return StreamingResponse(
+                    stream_conversational_message(
+                        message=refusal,
+                        stop_reason="error",
+                        metadata_event=refused_event,
+                        session_id=input_data.session_id,
+                        user_id=user_id,
+                        user_input=input_data.message,
+                    ),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Session-ID": input_data.session_id},
+                )
+
             # Check if assistant exists at all to provide better error message
             from apis.shared.assistants.service import assistant_exists
 
@@ -2069,16 +3027,61 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                     f"{scrub_log(input_data.rag_assistant_id)}: {scrub_log(bump_err)}"
                 )
 
+        # 2a'. Shared Projects — a project's harness only runs while its project is
+        # active. Access (membership) was already settled by the check above.
+        from apis.shared.assistants.service import is_project_harness
+
+        runs_project_harness = is_project_harness(assistant)
+        if runs_project_harness:
+            refusal, turn_project = await _project_turn_gate(assistant.project_id)
+            if refusal:
+                refused_event = ConversationalErrorEvent(
+                    code=ErrorCode.FORBIDDEN, message=refusal, recoverable=False
+                )
+                return StreamingResponse(
+                    stream_conversational_message(
+                        message=refusal,
+                        stop_reason="error",
+                        metadata_event=refused_event,
+                        session_id=input_data.session_id,
+                        user_id=user_id,
+                        user_input=input_data.message,
+                    ),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Session-ID": input_data.session_id},
+                )
+            turn_project_id = assistant.project_id
+            # Shared Projects 2.4b: the project's memory spaces, read now and awaited at
+            # prompt assembly (5b), so the reads overlap binding resolution and the
+            # knowledge-base search instead of adding to the time to first token.
+            if memory_spaces_enabled():
+                from apis.inference_api.chat.project_memory import load_project_memory
+
+                project_memory_task = asyncio.create_task(
+                    load_project_memory(turn_project_id, turn_project.shared_space_id, user_id)
+                )
+
         # 2b. Agent Designer Phase 3 — resolve the Agent's governed capabilities
         # for the INVOKING user (D5), before the expensive KB search. v1 blocks
         # with a conversational message when the invoker lacks a required model.
+        # A project's harness degrades instead (shared-projects §9.6): a member missing
+        # one bound tool still gets to work, and is told what was left out.
         if agents_enabled():
             try:
-                agent_plan = await resolve_agent_invocation(assistant, current_user)
+                agent_plan = await resolve_agent_invocation(
+                    assistant, current_user, degrade=runs_project_harness
+                )
                 agent_model_override = agent_plan.model_override
                 agent_memory = agent_plan.memory
                 agent_tools_override = agent_plan.tools
                 agent_skills_override = agent_plan.skills
+                if agent_plan.unavailable:
+                    agent_notice_event = AgentNoticeEvent.from_unavailable(
+                        agent_plan.unavailable,
+                        session_id=input_data.session_id,
+                        agent_id=input_data.rag_assistant_id,
+                        project_id=turn_project_id,
+                    )
             except AgentBindingBlockedError as block:
                 blocked_event = ConversationalErrorEvent(
                     code=ErrorCode.FORBIDDEN, message=block.message, recoverable=False
@@ -2149,8 +3152,10 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             base_prompt_builder = SystemPromptBuilder()
             base_prompt = base_prompt_builder.build(include_date=True)
 
-            # Append assistant instructions to the base prompt
-            system_prompt = f"{base_prompt}\n\n## Assistant-Specific Instructions\n\n{effective_instructions}"
+            # Append assistant instructions to the base prompt.
+            system_prompt = compose_agent_system_prompt(
+                base_prompt, effective_instructions, project_harness=bool(turn_project_id)
+            )
             if preview_instructions_override:
                 logger.info(
                     "Using live preview instructions override"
@@ -2172,8 +3177,29 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 "Assistant has no instructions - using fallback system prompt"
             )
 
-        # 5b. Agent Designer Phase 3: inject the bound Memory Space content (read-only)
-        # after instructions, in either branch. Hydration re-reads via the invoker
+        # 5a. The user's personal instructions, below the agent's, which win a conflict.
+        if personal_instructions:
+            system_prompt = compose_personal_instructions(
+                system_prompt,
+                personal_instructions,
+                over=_instructions_heading(bool(turn_project_id)) if effective_instructions else None,
+            )
+
+        # 5b. A project harness's memory: the `project` and `mine` blocks, read by the
+        # task started at 2a'. It replaces any Agent memory binding (the harness has no
+        # binding surface, and the two tool families share names).
+        if project_memory_task is not None:
+            from apis.inference_api.chat.project_memory import await_project_memory
+
+            project_memory = await await_project_memory(project_memory_task)
+            memory_context = project_memory.memory_context or None
+            if agent_memory is not None:
+                logger.warning("Project harness has a memory binding; project memory replaces it")
+                agent_memory = None
+
+        # 5b'. Agent Designer Phase 3: hydrate the bound Memory Space content (read-only),
+        # in either branch. Sent as `memory_context`, not appended to the prompt.
+        # Hydration re-reads via the invoker
         # (MemorySpaceService re-checks viewer+ internally). Empty for a fresh space.
         if agent_memory is not None:
             from apis.shared.memory.hydration import render_memory_block, resolve_always_load
@@ -2190,8 +3216,11 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 )
                 memory_block = render_memory_block(agent_memory.space_name, fragments)
                 if memory_block:
-                    system_prompt = f"{system_prompt}\n\n{memory_block}" if system_prompt else memory_block
-                    logger.info("Injected bound Memory Space content into system prompt")
+                    # Kept apart from system_prompt: it goes after the prompt,
+                    # outside <user_instructions>, behind its own cache point
+                    # (Shared Projects 2.2).
+                    memory_context = memory_block
+                    logger.info("Hydrated bound Memory Space content for the prompt")
             except Exception:
                 # Never fail a turn on a memory-read hiccup — the permission was already
                 # resolved; injection is best-effort context.
@@ -2229,6 +3258,8 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                         else {}
                     )
                     prefs_dict["assistant_id"] = input_data.rag_assistant_id
+                    if turn_project_id:
+                        prefs_dict["project_id"] = turn_project_id
                     merged_preferences = SessionPreferences(**prefs_dict)
 
                     updated_metadata = existing_metadata.model_copy(
@@ -2240,7 +3271,9 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                     from datetime import datetime, timezone
 
                     now = datetime.now(timezone.utc).isoformat()
-                    preferences = SessionPreferences(assistantId=input_data.rag_assistant_id)
+                    preferences = SessionPreferences(
+                        assistantId=input_data.rag_assistant_id, projectId=turn_project_id
+                    )
 
                     updated_metadata = SessionMetadata(
                         sessionId=input_data.session_id,
@@ -2268,6 +3301,10 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 % is_agent_mention
             )
 
+    # Assistant resolution, the knowledge-base search and its metadata writes.
+    # Zero on a plain chat turn, which is what makes it worth separating.
+    prelude.mark("rag")
+
     # Append active custom system prompt (if any). Gating rules + lookup live
     # in `system_prompt_resolver.py` so they can be unit-tested independently
     # of the route.
@@ -2291,6 +3328,10 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 system_prompt = SystemPromptBuilder().build(include_date=True)
             system_prompt = append_active_prompt(system_prompt, prompt_name, prompt_text)
             logger.info(f"Appended custom system prompt: {prompt_name!r}")
+
+    # A turn without an agent carries the user's personal instructions too.
+    if not input_data.rag_assistant_id:
+        system_prompt = personal_plain_prompt(system_prompt, personal_instructions)
 
     # Per-session single-flight guard (docs/specs/session-single-flight-guard.md,
     # follow-up to PR #653). A client abort doesn't propagate through the
@@ -2402,6 +3443,30 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 mantle_region=snapshot.mantle_region,
                 agent_type=snapshot.agent_type,
                 is_resume=True,
+                # The original turn's key carried whether the session had a
+                # readable document; the gate is monotonic, so re-asking it
+                # rebuilds the same key (an orphaned paused agent otherwise).
+                has_document_tools=await _document_tools_gate(
+                    input_data.session_id, user_id
+                ),
+                # The assistant the original turn ran against is a key element
+                # (spreadsheet tools close over it). Replay the snapshot's
+                # value, not the request's: a snapshot written before the
+                # field existed carries None, which misses the slot and
+                # rebuilds — the pre-existing eviction path, never a wrong hit.
+                assistant_id=snapshot.assistant_id,
+                # The memory binding is a key element too (memory tools close
+                # over it); replay the snapshot's value for the same reason.
+                memory_binding=snapshot.memory_binding,
+                # The memory block is hashed with the system prompt in the key.
+                memory_context=snapshot.memory_context,
+                # Resume never builds injected tools, so an agent built on a
+                # resume *miss* lacks them. Writing it would put a tool-less
+                # agent in the slot the next plain turn hits (same key), and
+                # that turn would silently lose its artifact / document /
+                # spreadsheet / memory tools. Read the paused agent if it is
+                # still cached; never populate.
+                cache_write=False,
                 # Resume must rebuild the SAME cache key the original turn used,
                 # or the paused agent is orphaned. New snapshots carry the
                 # original turn's exact effective set in enabled_skills, so
@@ -2457,22 +3522,9 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 effective_model_id = agent_model_override.model_id
                 effective_provider = agent_model_override.provider or effective_provider
             if not effective_model_id:
-                user_default_id, user_default_provider = await _resolve_user_default_model(user_id)
-                if user_default_id:
-                    # Re-check model access against the resolved id. The
-                    # earlier guard only ran on `input_data.model_id`, so a
-                    # stale saved default the user no longer has rights to
-                    # would otherwise sneak past RBAC here.
-                    app_role_service = get_app_role_service()
-                    if await app_role_service.can_access_model(current_user, user_default_id):
-                        effective_model_id = user_default_id
-                        if not effective_provider and user_default_provider:
-                            effective_provider = user_default_provider
-                        logger.info("Applied user default model from settings")
-                    else:
-                        logger.info(
-                            "User default model exists but RBAC denies access; falling back to system default"
-                        )
+                effective_model_id, effective_provider = await _resolve_fallback_model(
+                    user_id, current_user, effective_provider, settings=user_settings
+                )
 
             # Agent-authored params sit as defaults BENEATH explicit request params,
             # then flow through _resolve_model_settings' admin bounds/locks like any
@@ -2521,6 +3573,33 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 if agent_tools_override is not None
                 else input_data.enabled_tools
             )
+            # A session holding a spreadsheet gets the Spreadsheet Analysis
+            # tools whether or not the picker has them on, gated on the
+            # caller's RBAC grant. Applied to the *effective* list so it
+            # flows into the cache key, every builder below, the attachment
+            # guidance and the paused-turn snapshot as one value. Sticky
+            # across the session (see `_session_has_tabular`), so the key
+            # does not flip between the attach turn and the follow-up.
+            effective_enabled_tools = await _apply_attachment_tool_autoenable(
+                effective_enabled_tools,
+                current_user,
+                input_data.session_id,
+                user_id,
+                turn_has_tabular=bool(diverted_tabular),
+            )
+
+            # Tools an admin pinned are unioned in for users whose roles grant
+            # them, unless this Agent binds its own toolset (D4). Applied to
+            # the same *effective* list for the same reason as the line above:
+            # one value flows into the cache key, every builder, and the
+            # paused-turn snapshot. The set depends only on the catalog and the
+            # user's roles, so it is constant across a session and does not
+            # flip the key turn to turn.
+            effective_enabled_tools = await _apply_admin_always_on_tools(
+                effective_enabled_tools,
+                current_user,
+                agent_bound_tools=agent_tools_override is not None,
+            )
 
             # An Agent's skill bindings replace the request's skills for this turn so
             # ChatAgent's AgentSkills plugin discloses exactly the bound set (D5,
@@ -2557,14 +3636,31 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 enabled_tools=effective_enabled_tools,
                 session_id=input_data.session_id,
                 user_id=user_id,
-            )
+            ) + _build_account_tools(effective_enabled_tools, current_user)
 
             memory_tools = _build_memory_tools(
                 agent_memory=agent_memory,
                 user_id=user_id,
                 user_email=current_user.email,
             )
+            # A project harness addresses its spaces by scope instead (2.4b).
+            if project_memory is not None:
+                from apis.inference_api.chat.project_memory import build_project_memory_tools
+
+                memory_tools = build_project_memory_tools(project_memory, current_user)
             extra_tools = extra_tools + memory_tools
+
+            # document_read for any session that carries a readable attachment
+            # (this turn's uploads count). Gated on session state, not the
+            # picker; its presence goes into the cache key below rather than
+            # vetoing the cache, so an attachment session that could keep a
+            # warm agent still does.
+            document_tools = await _build_document_tools(
+                session_id=input_data.session_id,
+                user_id=user_id,
+                turn_has_document=turn_has_document,
+            )
+            extra_tools = extra_tools + document_tools
 
             # Can this turn's agent be cached despite carrying injected tools?
             # Only when every builder that fired closes over values the cache
@@ -2574,27 +3670,83 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             # and the key disagree about which builders ran.
             extra_tools_key_described = injected_tools_are_key_described(
                 enabled_tools=effective_enabled_tools,
-                has_memory_binding=bool(memory_tools),
             )
+            # Memory tools close over the resolved binding, so it is a cache-key
+            # element (Shared Projects 2.1). Only set when the tools were built,
+            # so the key and the toolset cannot disagree.
+            if project_memory is not None:
+                memory_binding_key = project_memory.binding_key()
+            elif memory_tools:
+                memory_binding_key = {
+                    "spaceId": agent_memory.space_id,
+                    "spaceName": agent_memory.space_name,
+                    "access": agent_memory.access,
+                }
+            else:
+                memory_binding_key = None
 
-            agent = await get_agent(
-                session_id=input_data.session_id,
-                user_id=user_id,
-                auth_token=auth_token,
-                enabled_tools=effective_enabled_tools,
-                model_id=effective_model_id,
-                system_prompt=system_prompt,  # Use assistant's instructions if available
-                caching_enabled=caching_enabled,
-                provider=effective_provider,
-                inference_params=inference_params,
-                mantle_api_mode=mantle_api_mode,
-                mantle_region=mantle_region,
-                agent_type=effective_agent_type,
-                extra_tools=extra_tools,
-                is_resume=False,
-                accessible_skill_ids=effective_skill_ids,
-                extra_tools_key_described=extra_tools_key_described,
-            )
+            # System-prompt assembly, the single-flight lease, skill
+            # resolution and every tool builder (documents, attachments,
+            # memory, agent binding).
+            prelude.mark("tools")
+
+            def _mark_build_stage(stage: str) -> None:
+                """Namespace a build sub-stage under `agent_build.` so the
+                emitted line groups them the way the preamble's are."""
+                prelude.mark(f"agent_build.{stage}")
+
+            async def _build_main_agent():
+                """The turn's agent. Called eagerly here, or from the stream.
+
+                A closure rather than an inline call because it now has two
+                call sites — see `defer_agent_build` below — and eighteen
+                keyword arguments that must not drift between them.
+                """
+                return await get_agent(
+                    session_id=input_data.session_id,
+                    user_id=user_id,
+                    auth_token=auth_token,
+                    enabled_tools=effective_enabled_tools,
+                    model_id=effective_model_id,
+                    system_prompt=system_prompt,  # Use assistant's instructions if available
+                    caching_enabled=caching_enabled,
+                    provider=effective_provider,
+                    inference_params=inference_params,
+                    mantle_api_mode=mantle_api_mode,
+                    mantle_region=mantle_region,
+                    agent_type=effective_agent_type,
+                    extra_tools=extra_tools,
+                    is_resume=False,
+                    accessible_skill_ids=effective_skill_ids,
+                    extra_tools_key_described=extra_tools_key_described,
+                    has_document_tools=bool(document_tools),
+                    assistant_id=input_data.rag_assistant_id,
+                    build_stage_recorder=_mark_build_stage,
+                    memory_binding=memory_binding_key,
+                    memory_context=memory_context,
+                )
+
+            # Defer the build into the stream so it can be narrated.
+            #
+            # Measured on dev: a cold agent-cache miss spends 1478ms here
+            # against a 2542ms pre-stream window, and every millisecond of it
+            # is dead air — FastAPI flushes headers when this handler returns,
+            # so until then there is no channel to say anything on. Deferring
+            # opens the response first and emits a `preparing` frame, turning
+            # the longest silence in the product into a sentence.
+            #
+            # A warm turn spends 0-38ms here, so this changes nothing for the
+            # common case; it exists for the cold one.
+            # See docs/specs/agent-state-feedback.md PR-3.
+            if agent_preparing_phase_enabled():
+                agent = None
+                deferred_build = True
+            else:
+                agent = await _build_main_agent()
+                # The remainder after the sub-stages the build itself recorded;
+                # `groups.agent_build` sums them, keeping the pre-split
+                # number comparable exactly as it did for the preamble.
+                prelude.mark("agent_build.rest")
 
         # Resume requests must target interrupts that the cached agent
         # actually has paused. Cache eviction, a process restart, or a
@@ -2620,14 +3772,32 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 )
 
         # Build citations list for persistence (convert context chunks to citation format)
+        # Build citations list for persistence (convert context chunks to citation format)
+        #
+        # #111: when the agent's ``show_citations`` flag is off, suppress citations
+        # entirely — leaving this list empty is a single choke point that turns off all
+        # three downstream consumers at once: the ``event: citation`` SSE below, the
+        # ``citations=...`` persisted on the stored message, and the copy handed to
+        # ``agent.stream_async``. RAG retrieval and prompt augmentation above are
+        # deliberately untouched: the model still receives the context chunks, the user
+        # just is not shown (or able to download) the sources.
+        show_citations = getattr(assistant, "show_citations", True)
         citations_for_storage = []
-        if context_chunks:
+        if context_chunks and show_citations:
             for chunk in context_chunks:
                 citations_for_storage.append(
                     {
                         "assistantId": input_data.rag_assistant_id,
                         "documentId": chunk.get("metadata", {}).get("document_id", ""),
-                        "fileName": chunk.get("metadata", {}).get("source", "Unknown Source"),
+                        # Managed KBs carry the filename under ``filename`` (set at ingest,
+                        # managed_backend.py); legacy S3-Vectors used ``source``. Read
+                        # managed first, fall back to legacy, then the placeholder — before
+                        # this, every managed-KB citation rendered "Unknown Source".
+                        "fileName": (
+                            chunk.get("metadata", {}).get("filename")
+                            or chunk.get("metadata", {}).get("source")
+                            or "Unknown Source"
+                        ),
                         "text": chunk.get("text", "")[:500],  # Limit excerpt length
                     }
                 )
@@ -2675,6 +3845,10 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             if quota_session_notice_event:
                 yield quota_session_notice_event.to_sse_format()
 
+            # …then what a project's harness is running without for this member (§9.6).
+            if agent_notice_event:
+                yield agent_notice_event.to_sse_format()
+
             # Yield citation events BEFORE the agent stream starts
             # This allows the UI to display sources immediately
             if citations_for_storage:
@@ -2697,6 +3871,10 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 diverted_presentations,
                 oversized_inline,
                 effective_enabled_tools,
+                over_budget=over_budget_inline,
+                dropped_over_count_names=dropped_over_count_names,
+                dropped_over_count_total=dropped_over_count_total,
+                max_files=MAX_FILES_PER_MESSAGE,
             )
             # When multiple spreadsheets are visible, ship the full inventory
             # up front so the agent can disambiguate intentionally instead of
@@ -2793,6 +3971,12 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 original_message=input_data.message if message_will_be_modified else None,
                 interrupt_responses=interrupt_responses_payload,
                 continue_truncated=is_continuation,
+                # The turn's true start, so the end-of-turn recap spans the
+                # WHOLE turn. The coordinator's own clock starts when its
+                # generator is iterated, which is AFTER the deferred agent
+                # build — measured on dev, that under-reported a 7.8s turn as
+                # 2.1s.
+                turn_started_at=prelude.started_at,
                 # Which Agent ran this turn (#756). Recorded on the cost row so a
                 # deliberate `@`-mention prefix swap is distinguishable from the
                 # nondeterministic-ordering regression the fingerprints exist to catch.
@@ -2800,6 +3984,9 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 # cached and shared across turns, so per-turn state must never live on it
                 # (see #741/#751).
                 turn_agent_id=input_data.rag_assistant_id,
+                # The project whose harness ran this turn, for the same cost row and the
+                # project's monthly rollup. Per turn for the same reason as turn_agent_id.
+                turn_project_id=turn_project_id,
                 # This turn's lease doubles as the mid-turn steering inbox
                 # (docs/specs/mid-turn-steering.md). Passed per turn for the
                 # same reason as turn_agent_id — the agent is cached, the lease
@@ -2867,16 +4054,134 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
         # generator's finally is the release site for the happy path (the two
         # except handlers below cover pre-stream failures).
         async def _guarded_stream() -> AsyncGenerator[str, None]:
-            heartbeat_task = (
-                asyncio.create_task(_lease_heartbeat_loop(session_lease, agent))
-                if session_lease is not None
-                else None
-            )
+            nonlocal agent
+
+            heartbeat_task = None
             try:
+                # The deferred agent build (PR-3). Narrated, because this is
+                # where a cold turn spends over a second with nothing on the
+                # wire. The frame goes out FIRST so the client hears something
+                # the moment the response opens; the build follows.
+                if agent is None:
+                    # Announce the build unconditionally; the SPA decides
+                    # whether it is worth SHOWING.
+                    #
+                    # This used to race the build against a 250ms timer here
+                    # and emit only if it was still running, so a warm build
+                    # (0-38ms) never flashed a phase nobody can read. That
+                    # cannot work: `create_agent` is synchronous
+                    # (`agent_factory.py`), so a cold build occupies the event
+                    # loop for its whole duration and `asyncio.wait` cannot
+                    # fire its timeout — it returned only once the build was
+                    # already done, `finished` was non-empty, and the frame was
+                    # never sent. Verified on dev: a 1548ms build, six times
+                    # the threshold, emitted nothing.
+                    #
+                    # A timer only works where the clock actually runs, which
+                    # is the client. The SPA holds this phase for 250ms before
+                    # rendering it, so a warm build still never shows — see
+                    # `message-list.component.ts`.
+                    yield (
+                        "event: agent_status\ndata: "
+                        + json.dumps(
+                            {
+                                "type": "agent_status",
+                                "sessionId": input_data.session_id,
+                                "phase": "preparing",
+                            }
+                        )
+                        + "\n\n"
+                    )
+                    try:
+                        agent = await _build_main_agent()
+                    except Exception as build_error:
+                        # The handler has already returned, so the two `except`
+                        # arms below cannot see this — a build that fails here
+                        # would otherwise be a silent, hung stream. Surface it
+                        # the way every other mid-stream failure is surfaced
+                        # (CLAUDE.md: errors stream as assistant messages), and
+                        # let the `finally` release the lease.
+                        logger.error(
+                            "Deferred agent build failed", exc_info=True
+                        )
+                        error_event = build_conversational_error_event(
+                            code=ErrorCode.AGENT_ERROR,
+                            error=build_error,
+                            session_id=input_data.session_id,
+                            recoverable=True,
+                        )
+                        async for frame in stream_conversational_message(
+                            message=error_event.message,
+                            stop_reason="error",
+                            metadata_event=error_event,
+                            session_id=input_data.session_id,
+                            user_id=user_id,
+                            user_input=input_data.message,
+                        ):
+                            yield frame
+                        return
+                    prelude.mark("agent_build.rest")
+
+                    # Tell the client the build is OVER.
+                    #
+                    # Without this the SPA can only infer it from the next
+                    # status, which is `thinking` — and that does not arrive
+                    # until the head-of-turn context work and the event loop's
+                    # startup have also run, well over the 250ms the SPA waits
+                    # before rendering "Getting ready…". So a 1ms cache-hit
+                    # build still showed the label: `preparing` was not a state
+                    # with an end, it was just the latest event. Measured on
+                    # dev, builds of 0ms, 1ms and 40ms all rendered it.
+                    #
+                    # `durationMs` is the build's own measured time, which is
+                    # what makes this frame worth more than a bare marker: it
+                    # says how long the thing the user was told about took.
+                    yield (
+                        "event: agent_status\ndata: "
+                        + json.dumps(
+                            {
+                                "type": "agent_status",
+                                "sessionId": input_data.session_id,
+                                "phase": "prepared",
+                                "durationMs": prelude.last_stage_ms,
+                            }
+                        )
+                        + "\n\n"
+                    )
+
+                # Emitted here rather than before the return: with the build
+                # deferred, "the window before the client can hear anything"
+                # ends at the agent, not at the response.
+                prelude.emit(
+                    session_id=input_data.session_id,
+                    stream_kind="agent",
+                    extra={
+                        "isResume": is_resume,
+                        "hasAssistant": bool(input_data.rag_assistant_id),
+                        "deferredBuild": deferred_build,
+                    },
+                )
+
+                # Started only once the agent exists — it is the heartbeat's
+                # first argument.
+                heartbeat_task = (
+                    asyncio.create_task(_lease_heartbeat_loop(session_lease, agent))
+                    if session_lease is not None
+                    else None
+                )
+
                 async for chunk in stream_with_quota_warning():
                     yield chunk
             finally:
                 await _release_turn_lease(heartbeat_task, session_lease)
+
+        # Everything after the agent build: citation assembly, the title task,
+        # the lease acquire and the generator wiring. The `turn_prelude` line
+        # itself is emitted from inside `_guarded_stream`, once the agent is
+        # actually ready — with the build deferred, that is the true end of
+        # the window this measures. The early-return paths above (quota
+        # exceeded, app tool calls) are not agent turns and never emit.
+        prelude.mark("stream_setup")
 
         # Stream response from agent as SSE (with optional files)
         # Note: Compression is handled by GZipMiddleware if configured in main.py

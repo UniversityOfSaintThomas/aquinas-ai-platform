@@ -33,12 +33,14 @@ import {
   heroCheck,
   heroAdjustmentsHorizontal,
   heroChevronDown,
+  heroMagnifyingGlass,
 } from '@ng-icons/heroicons/outline';
 import { Dialog } from '@angular/cdk/dialog';
 import { PickerComponent } from '@ctrl/ngx-emoji-mart';
 import { CdkConnectedOverlay, CdkOverlayOrigin, ConnectedPosition } from '@angular/cdk/overlay';
 import { AgentService } from '../services/agent.service';
 import {
+  Agent,
   AgentBinding,
   BindableItem,
   BindableServerTool,
@@ -63,6 +65,10 @@ import {
   ShareAgentDialogData,
 } from '../components/share-agent-dialog.component';
 import { KnowledgeBaseSectionComponent } from '../../knowledge-base/knowledge-base-section.component';
+import { ToolService, retirementDetail } from '../../services/tool/tool.service';
+import { modelRetirementDetail } from '../../shared/utils/retirement';
+import { AGENT_TEMPLATE_DRAFT_KEY, TemplateDraft } from './agent-templates';
+import { reconcileToolRefs } from './tool-ref-reconcile';
 
 /** A model param rendered as an editable control (numeric or enum). */
 interface ParamView {
@@ -106,6 +112,12 @@ interface DisplayServerTool {
   name: string;
   summary: string;
   detail: string;
+}
+
+/** Tools sharing a catalog category, as one titled block of the Tools list. */
+interface ToolGroup {
+  category: string;
+  items: BindableItem[];
 }
 
 /** A memory-space selection with its per-binding config (access + alwaysLoad). */
@@ -156,6 +168,7 @@ interface MemorySelection {
       heroCheck,
       heroAdjustmentsHorizontal,
       heroChevronDown,
+      heroMagnifyingGlass,
     }),
   ],
 })
@@ -169,6 +182,7 @@ export class AgentFormPage implements OnInit, OnDestroy {
   private toast = inject(ToastService);
   private dialog = inject(Dialog);
   private host = inject(ElementRef<HTMLElement>);
+  private toolService = inject(ToolService);
 
   form!: FormGroup;
   private formSub?: Subscription;
@@ -194,6 +208,18 @@ export class AgentFormPage implements OnInit, OnDestroy {
   readonly permissionResolved = signal(false);
   readonly isEmojiPickerOpen = signal(false);
   readonly isDarkMode = this.themeService.theme;
+
+  /**
+   * Prefill-from-template notices (Agent Template Prefill — Phase 2). When a template
+   * draft is applied in create mode, tool refs are reconciled against the live catalog;
+   * a deprecated-but-present ref is still applied but flagged here, and an unknown ref is
+   * dropped and reported here. Both are dismissible and purely informational.
+   */
+  readonly templateFlaggedNotice = signal<string | null>(null);
+  readonly templateDroppedNotice = signal<string | null>(null);
+  readonly hasTemplateNotice = computed(
+    () => this.templateFlaggedNotice() !== null || this.templateDroppedNotice() !== null,
+  );
 
   readonly mode = computed<'create' | 'edit'>(() => (this.agentId() ? 'edit' : 'create'));
   readonly isViewer = computed(() => this.userPermission() === 'viewer');
@@ -225,6 +251,22 @@ export class AgentFormPage implements OnInit, OnDestroy {
   readonly expandedToolRefs = signal<Set<string>>(new Set());
   /** Which sub-tools have their `Args:` reference detail open, keyed `serverRef::name`. */
   readonly expandedToolDetails = signal<Set<string>>(new Set());
+  /**
+   * Whether the Tools list is expanded.
+   *
+   * Create mode and an empty selection leave it OPEN: a section collapsed to
+   * "none selected" hides the list at exactly the moment the author needs it, and
+   * a first-time author has no other way to learn what the platform can do. A
+   * saved agent that already has tools collapses to its summary line instead,
+   * which answers "what can this agent do?" better than the open list does.
+   *
+   * Resolved from the record when its bindings land (`applyAgentToForm`) and
+   * deliberately NOT persisted across visits — a remembered collapse state is one
+   * whose cause the author cannot see.
+   */
+  readonly toolsOpen = signal(true);
+  /** Free-text filter over the tool list. Presentation only — never submitted. */
+  readonly toolQuery = signal('');
   readonly selectedSkillRefs = signal<Set<string>>(new Set());
   readonly memorySelections = signal<MemorySelection[]>([]);
 
@@ -268,6 +310,9 @@ export class AgentFormPage implements OnInit, OnDestroy {
   readonly liveFormDescription = signal('');
   readonly liveFormEmoji = signal('');
   readonly liveFormStarters = signal<string[]>([]);
+  /** #111: mirrors the showCitations control so the template can grey out and
+   *  explain the dependent "Allow document downloads" toggle. */
+  readonly liveShowCitations = signal(true);
 
   /** Model/params/bindings resolve from the SAVED record, so the preview needs a
    * save to reflect changes to them. Persona/instructions preview live. `form.dirty`
@@ -295,6 +340,17 @@ export class AgentFormPage implements OnInit, OnDestroy {
       tags: [[] as string[]],
       starters: this.fb.array([]),
       emoji: [''],
+      // #111: default on — a new agent shows citations and allows downloads, exactly
+      // as today. The author opts out per-agent.
+      showCitations: [true],
+      allowDocumentDownload: [true],
+    });
+
+    // #111 dependency: downloads are only meaningful when citations are shown. When the
+    // citations toggle goes off, force downloads off and disable the control; when it
+    // comes back on, re-enable it. emitEvent:false so this doesn't re-enter valueChanges.
+    this.form.get('showCitations')!.valueChanges.subscribe((on: boolean) => {
+      this.syncDownloadToggleEnabled(!!on);
     });
 
     // Mirror form values into the live signals so the OnPush preview updates as the
@@ -303,7 +359,7 @@ export class AgentFormPage implements OnInit, OnDestroy {
     this.formSub = this.form.valueChanges.subscribe(() => this.syncFormToSignals());
 
     // Load the RBAC-filtered palettes in parallel; then hydrate an existing agent.
-    void this.loadPalettes().finally(() => this.loadingPalettes.set(false));
+    const palettesLoaded = this.loadPalettes().finally(() => this.loadingPalettes.set(false));
 
     const id = this.route.snapshot.paramMap.get('id');
     this.agentId.set(id);
@@ -318,6 +374,10 @@ export class AgentFormPage implements OnInit, OnDestroy {
     } else {
       // Create mode: the user is implicitly the owner — no record to resolve.
       this.permissionResolved.set(true);
+      // A "Start from a template" click stashes the chosen draft in localStorage and
+      // routes here. Apply it once the binding palettes have settled so tool refs
+      // reconcile against a loaded catalog rather than being spuriously dropped.
+      void palettesLoaded.then(() => this.applyTemplateDraftIfPresent());
     }
   }
 
@@ -332,6 +392,24 @@ export class AgentFormPage implements OnInit, OnDestroy {
     this.liveFormDescription.set(this.form.get('description')?.value || '');
     this.liveFormEmoji.set(this.form.get('emoji')?.value || '');
     this.liveFormStarters.set(this.starters.value || []);
+    this.liveShowCitations.set(this.form.get('showCitations')?.value !== false);
+  }
+
+  /**
+   * #111: keep the "Allow document downloads" control consistent with the citations
+   * toggle. Citations off ⇒ downloads are meaningless, so force the value false and
+   * disable the control; citations on ⇒ re-enable it. emitEvent:false so this never
+   * re-enters the form's valueChanges pipeline.
+   */
+  private syncDownloadToggleEnabled(citationsOn: boolean): void {
+    const dl = this.form.get('allowDocumentDownload');
+    if (!dl) return;
+    if (citationsOn) {
+      dl.enable({ emitEvent: false });
+    } else {
+      dl.setValue(false, { emitEvent: false });
+      dl.disable({ emitEvent: false });
+    }
   }
 
   private async loadPalettes(): Promise<void> {
@@ -359,57 +437,172 @@ export class AgentFormPage implements OnInit, OnDestroy {
       const agent = await this.agentService.getAgent(id);
       this.userPermission.set(agent.userPermission ?? 'owner');
       this.iconUrl.set(agent.iconUrl);
-      this.form.patchValue({
-        name: agent.name,
-        description: agent.description,
-        // Marketplace Phase 3 gates `instructions` to owner/editor. Reaching this form
-        // means one of those, so the fallback is defensive, not an expected path — the
-        // field's own `required` validator surfaces it if the gate ever changes.
-        instructions: agent.instructions ?? '',
-        visibility: agent.visibility,
-        tags: agent.tags ?? [],
-        emoji: agent.emoji ?? '',
-      });
-      this.starters.clear();
-      (agent.starters ?? []).forEach((s) => this.starters.push(new FormControl(s, Validators.required)));
-
-      this.selectedModelId.set(agent.modelConfig?.modelId ?? null);
-      this.modelParams.set(
-        stripHiddenParams(
-          (agent.modelConfig?.params ?? {}) as Record<string, number | string>,
-        ),
-      );
-
-      const toolRefs = new Set<string>();
-      const skillRefs = new Set<string>();
-      const memory: MemorySelection[] = [];
-      for (const b of agent.bindings ?? []) {
-        if (b.kind === 'tool') toolRefs.add(b.ref);
-        else if (b.kind === 'skill') skillRefs.add(b.ref);
-        else if (b.kind === 'memory_space') {
-          const cfg = (b.config ?? {}) as Partial<MemorySpaceBindingConfig>;
-          memory.push({
-            ref: b.ref,
-            label: this.spaceLabel(b.ref),
-            role: this.spaceRole(b.ref),
-            access: cfg.access === 'readwrite' ? 'readwrite' : 'read',
-            alwaysLoadIndex: (cfg.alwaysLoad ?? []).includes('MEMORY.md'),
-          });
-        }
-        // knowledge_base bindings are welded/synthesized and managed live by
-        // the knowledge-base section — no read-only display state to hydrate.
-      }
-      this.selectedToolRefs.set(toolRefs);
-      this.selectedSkillRefs.set(skillRefs);
-      this.memorySelections.set(memory);
+      this.applyAgentToForm(agent);
       // Freshly loaded state is clean — the preview matches the saved record.
-      this.syncFormToSignals();
       this.form.markAsPristine();
       this.bindingsDirty.set(false);
     } catch (err) {
       console.error('Error loading agent:', err);
       this.toast.error('Could not load this agent.');
     }
+  }
+
+  /**
+   * Agent Template Prefill — Phase 2 (create-mode entry path).
+   *
+   * The "Start from a template" picker writes the chosen {@link TemplateDraft} to
+   * `localStorage[AGENT_TEMPLATE_DRAFT_KEY]` and routes to this create form. Here we
+   * read it once, reconcile its tool bindings against the live tool catalog, feed the
+   * whole draft through the same {@link applyAgentToForm} path edit mode uses, and leave
+   * the form DIRTY so it reads as an unsaved draft the author must Save.
+   *
+   * One-shot: the key is cleared whatever the outcome, so a stale or malformed draft can
+   * never wedge every future "New Agent". Absent key ⇒ ordinary blank create.
+   */
+  private async applyTemplateDraftIfPresent(): Promise<void> {
+    const raw = localStorage.getItem(AGENT_TEMPLATE_DRAFT_KEY);
+    if (raw === null) return; // no template chosen — behave exactly as a blank create.
+    // Consume the key up front: this is a one-shot handoff, and clearing before we parse
+    // means even a malformed payload can't re-fire on the next visit.
+    localStorage.removeItem(AGENT_TEMPLATE_DRAFT_KEY);
+
+    let draft: TemplateDraft;
+    try {
+      draft = JSON.parse(raw) as TemplateDraft;
+    } catch {
+      this.toast.error('That template could not be read; starting from a blank agent.');
+      return;
+    }
+    if (!draft || typeof draft !== 'object') return;
+
+    // Reconcile requires the live tool catalog (toolId + status). It auto-loads at app
+    // start; ensure it's present so a deprecated ref is flagged, not mistaken for unknown.
+    if (!this.toolService.initialized()) {
+      await this.toolService.loadTools();
+    }
+    const catalog = this.toolService.tools();
+
+    // Only tool bindings are reconciled; skill / memory / KB bindings pass through as-is.
+    const bindings = draft.bindings ?? [];
+    const toolRefs = bindings.filter((b) => b.kind === 'tool').map((b) => b.ref);
+    const { apply, flagged, dropped } = reconcileToolRefs(toolRefs, catalog);
+    const applySet = new Set(apply);
+    const reconciledBindings = [
+      ...bindings.filter((b) => b.kind !== 'tool'),
+      ...bindings.filter((b) => b.kind === 'tool' && applySet.has(b.ref)),
+    ] as AgentBinding[];
+
+    // Feed the reconciled draft through the identical population path edit mode uses.
+    // `modelConfig.modelId === null` (platform default) ⇒ leave no model pinned.
+    this.applyAgentToForm({
+      name: draft.name,
+      description: draft.description,
+      instructions: draft.instructions,
+      tags: draft.tags,
+      starters: draft.starters,
+      emoji: draft.emoji,
+      modelConfig: draft.modelConfig?.modelId
+        ? { modelId: draft.modelConfig.modelId, params: draft.modelConfig.params }
+        : undefined,
+      bindings: reconciledBindings,
+    });
+
+    // A prefilled-but-unsaved template must read as a dirty draft. `patchValue` does not
+    // mark controls dirty, and `applyAgentToForm` deliberately leaves cleanliness alone,
+    // so mark both the form and the out-of-form binding signals dirty explicitly.
+    this.form.markAsDirty();
+    this.bindingsDirty.set(true);
+    // A template's whole point is the toolset it hands you, so override the collapse
+    // `applyAgentToForm` just derived: the author should see what they were given.
+    this.toolsOpen.set(true);
+
+    // Surface reconcile outcomes as a dismissible, one-line-each notice.
+    if (flagged.length > 0) {
+      const detail = flagged.map((f) => `${f.ref} (${f.status})`).join(', ');
+      this.templateFlaggedNotice.set(
+        `${flagged.length} ${flagged.length === 1 ? 'tool is' : 'tools are'} deprecated but still added: ${detail}`,
+      );
+    }
+    if (dropped.length > 0) {
+      this.templateDroppedNotice.set(
+        `${dropped.length} ${dropped.length === 1 ? 'tool was' : 'tools were'} unavailable and dropped: ${dropped.join(', ')}`,
+      );
+    }
+  }
+
+  /** Dismiss the prefill-from-template notice. */
+  dismissTemplateNotice(): void {
+    this.templateFlaggedNotice.set(null);
+    this.templateDroppedNotice.set(null);
+  }
+
+  /**
+   * Map an agent-shaped object into form + selection state: the persona fields,
+   * starters, model + params, and the tool/skill/memory `bindings` decomposition,
+   * finishing by mirroring the form into the live-preview signals.
+   *
+   * Deliberately does NOT touch cleanliness (`markAsPristine` / `bindingsDirty`) or
+   * record-identity state (`userPermission` / `iconUrl`). `loadAgent` marks the form
+   * pristine *after* calling this because a freshly fetched record is clean; a later
+   * prefill-from-template path reuses this exact mapping but must leave the form DIRTY
+   * so the author is prompted to save. Takes `Partial<Agent>` so a template draft that
+   * carries only some fields hydrates through the identical path.
+   */
+  private applyAgentToForm(agent: Partial<Agent>): void {
+    this.form.patchValue({
+      name: agent.name,
+      description: agent.description,
+      // Marketplace Phase 3 gates `instructions` to owner/editor. Reaching this form
+      // means one of those, so the fallback is defensive, not an expected path — the
+      // field's own `required` validator surfaces it if the gate ever changes.
+      instructions: agent.instructions ?? '',
+      // A template draft carries no visibility (it's not a template concept) — leave the
+      // form's own default (PRIVATE) rather than blanking it. Edit mode always passes a
+      // concrete visibility, so this only matters for template prefill.
+      visibility: agent.visibility ?? this.form.get('visibility')?.value ?? 'PRIVATE',
+      tags: agent.tags ?? [],
+      emoji: agent.emoji ?? '',
+      // #111: absent (legacy agent or template draft) ⇒ default on.
+      showCitations: agent.showCitations ?? true,
+      allowDocumentDownload: agent.allowDocumentDownload ?? true,
+    });
+    // Reflect the citations→downloads dependency for the freshly loaded values.
+    this.syncDownloadToggleEnabled(agent.showCitations ?? true);
+    this.starters.clear();
+    (agent.starters ?? []).forEach((s) => this.starters.push(new FormControl(s, Validators.required)));
+
+    this.selectedModelId.set(agent.modelConfig?.modelId ?? null);
+    this.modelParams.set(
+      stripHiddenParams(
+        (agent.modelConfig?.params ?? {}) as Record<string, number | string>,
+      ),
+    );
+
+    const toolRefs = new Set<string>();
+    const skillRefs = new Set<string>();
+    const memory: MemorySelection[] = [];
+    for (const b of agent.bindings ?? []) {
+      if (b.kind === 'tool') toolRefs.add(b.ref);
+      else if (b.kind === 'skill') skillRefs.add(b.ref);
+      else if (b.kind === 'memory_space') {
+        const cfg = (b.config ?? {}) as Partial<MemorySpaceBindingConfig>;
+        memory.push({
+          ref: b.ref,
+          label: this.spaceLabel(b.ref),
+          role: this.spaceRole(b.ref),
+          access: cfg.access === 'readwrite' ? 'readwrite' : 'read',
+          alwaysLoadIndex: (cfg.alwaysLoad ?? []).includes('MEMORY.md'),
+        });
+      }
+      // knowledge_base bindings are welded/synthesized and managed live by
+      // the knowledge-base section — no read-only display state to hydrate.
+    }
+    this.selectedToolRefs.set(toolRefs);
+    // Collapse Tools only when there is something to collapse *to* — see `toolsOpen`.
+    this.toolsOpen.set(toolRefs.size === 0);
+    this.selectedSkillRefs.set(skillRefs);
+    this.memorySelections.set(memory);
+    this.syncFormToSignals();
   }
 
   private spaceLabel(ref: string): string {
@@ -465,6 +658,10 @@ export class AgentFormPage implements OnInit, OnDestroy {
 
   // ---- model -----------------------------------------------------------
   selectModel(ref: string): void {
+    // A model being retired can be kept or removed, never newly chosen
+    // (docs/specs/model-retirement.md §7). The card is not rendered in that
+    // state; this is the backstop for any other path in.
+    if (ref !== this.selectedModelId() && this.isModelRetiringByRef(ref)) return;
     const next = this.selectedModelId() === ref ? null : ref;
     // Params are model-specific — a value valid on one model may be unsupported or
     // out-of-bounds on another. Drop them when the model changes so the author re-sets
@@ -473,6 +670,58 @@ export class AgentFormPage implements OnInit, OnDestroy {
     this.selectedModelId.set(next);
     this.bindingsDirty.set(true);
   }
+
+  /** `meta.status` non-active. An older backend omits it, which reads as active. */
+  isModelRetiring(item: BindableItem): boolean {
+    const status = item.meta?.['status'];
+    return typeof status === 'string' && status !== 'active';
+  }
+
+  private isModelRetiringByRef(ref: string): boolean {
+    const item = this.models().find((m) => m.ref === ref);
+    return item ? this.isModelRetiring(item) : false;
+  }
+
+  /**
+   * The model cards to render: every active model, plus the agent's own model
+   * even when it is being retired. Unlike a tool, a retired model stays in the
+   * catalog as a tombstone for good, so rendering them disabled would grow a
+   * permanent graveyard of dead cards — hide them instead.
+   */
+  readonly visibleModels = computed(() =>
+    this.models().filter((m) => !this.isModelRetiring(m) || m.ref === this.selectedModelId()),
+  );
+
+  /**
+   * The notice for an agent whose model is being retired: what happens, and what
+   * the author should do. Null for the overwhelmingly common case.
+   */
+  readonly retiringModelNotice = computed(() => {
+    const model = this.models().find((m) => m.ref === this.selectedModelId());
+    if (!model || !this.isModelRetiring(model)) return null;
+    const meta = model.meta ?? {};
+    const status = meta['status'] as string;
+    const successorName = (meta['replacedByName'] as string | null | undefined) ?? null;
+    const detail = modelRetirementDetail({
+      status,
+      successorName,
+      retirementNote: meta['retirementNote'] as string | null | undefined,
+      retiresOn: meta['retiresOn'] as string | null | undefined,
+    });
+    let action: string;
+    if (status === 'retired' && !successorName) {
+      action = 'This agent can’t run until you choose another model.';
+    } else if (status === 'retired') {
+      action = `Choose ${successorName} or another model so the agent’s settings match what runs.`;
+    } else {
+      action = 'This agent keeps working for now — choose another model when you can.';
+    }
+    return {
+      lead: `${model.label} is ${status === 'retired' ? 'retired' : 'being retired'}.`,
+      detail,
+      action: `${action} If this agent is published, resubmit it so the change reaches the people using it.`,
+    };
+  });
 
   // ---- model params ----------------------------------------------------
   /** Current value for a param, or the spec default (shown as a placeholder). */
@@ -507,6 +756,75 @@ export class AgentFormPage implements OnInit, OnDestroy {
     this.bindingsDirty.set(true);
   }
 
+  // ---- tools: search, grouping and the collapsed summary ----------------
+
+  toggleToolsOpen(): void {
+    this.toolsOpen.update((open) => !open);
+  }
+
+  onToolSearch(event: Event): void {
+    this.toolQuery.set((event.target as HTMLInputElement).value);
+  }
+
+  /** A tool's catalog category, normalised so an unset one still groups somewhere. */
+  private toolCategory(item: BindableItem): string {
+    const raw = (item.meta?.['category'] as string | undefined) ?? '';
+    return raw.trim() || 'Other';
+  }
+
+  /**
+   * Search-filtered tools grouped by catalog category, both levels sorted.
+   *
+   * `meta.category` already rides on every bindable item, so grouping is what turns
+   * thirty-plus rows into something scannable without a backend change. Display order
+   * is free to be alphabetical: the determinism contract that matters is on what
+   * reaches `toolConfig`, not on what the author reads.
+   */
+  readonly toolGroups = computed<ToolGroup[]>(() => {
+    const query = this.toolQuery().trim().toLowerCase();
+    const matches = this.tools().filter((t) => {
+      if (!query) return true;
+      return (
+        t.label.toLowerCase().includes(query) ||
+        t.description.toLowerCase().includes(query) ||
+        this.toolCategory(t).toLowerCase().includes(query)
+      );
+    });
+
+    const byCategory = new Map<string, BindableItem[]>();
+    for (const t of matches) {
+      const key = this.toolCategory(t);
+      const bucket = byCategory.get(key);
+      if (bucket) bucket.push(t);
+      else byCategory.set(key, [t]);
+    }
+    return [...byCategory.entries()]
+      .map(([category, items]) => ({
+        category,
+        items: [...items].sort((a, b) => a.label.localeCompare(b.label)),
+      }))
+      .sort((a, b) => a.category.localeCompare(b.category));
+  });
+
+  /** How many catalog tools this agent has bound, whole or narrowed. */
+  readonly selectedToolCount = computed(
+    () => this.tools().filter((t) => this.isToolSelected(t.ref)).length,
+  );
+
+  /**
+   * The collapsed header's one-line answer to "what can this agent do?". Capped at
+   * three names so the header stays one line at the widths this form is used at.
+   */
+  readonly selectedToolSummary = computed<string>(() => {
+    const labels = this.tools()
+      .filter((t) => this.isToolSelected(t.ref))
+      .map((t) => t.label)
+      .sort((a, b) => a.localeCompare(b));
+    if (labels.length === 0) return '';
+    const shown = labels.slice(0, 3).join(', ');
+    return labels.length > 3 ? `${shown} +${labels.length - 3} more` : shown;
+  });
+
   // ---- tools (server toggle + per-tool scoping) -------------------------
   /**
    * `selectedToolRefs` holds `binding.ref` values verbatim, which may be a bare
@@ -520,11 +838,89 @@ export class AgentFormPage implements OnInit, OnDestroy {
    * it is what `collect_tool_name_filters` means by whole-server anyway.
    */
   toggleTool(ref: string): void {
+    // A retiring tool can be turned OFF but not ON. The chip is disabled in that
+    // direction, so this is the keyboard/programmatic backstop behind it — the
+    // same shape as the `alwaysOn` guard in ToolService.toggleTool, and the same
+    // reason. Deselecting stays open precisely because that is the action we are
+    // asking authors to take (docs/specs/mcp-server-retirement.md §7).
+    if (!this.isToolSelected(ref) && this.isToolRetiringByRef(ref)) return;
     this.selectedToolRefs.update((set) =>
       this.isToolSelected(ref) ? withoutServer(set, ref) : toggle(set, ref),
     );
     this.bindingsDirty.set(true);
   }
+
+  /**
+   * An administrator has marked this tool non-`active` — it is on its way out and
+   * must not be bound to anything new. Presentation only: the palette still lists
+   * it, `can_access_tool` still admits it, and an Agent that already binds it
+   * keeps running unchanged. See docs/specs/mcp-server-retirement.md §1 for why
+   * this is a picker concern and never a grant one.
+   *
+   * An older backend omits `meta.status`, which reads as `undefined` and leaves
+   * every tool selectable — i.e. today's behaviour.
+   */
+  isToolRetiring(item: BindableItem): boolean {
+    const status = item.meta?.['status'];
+    return typeof status === 'string' && status !== 'active';
+  }
+
+  /**
+   * The retirement line on a tool row: the lead-in (phrased for whether this agent
+   * already binds it), then the replacement and the date.
+   *
+   * Returned as one string for the row's existing **visible** warning line — not a
+   * tooltip. PR #1233 moved this disclosure out of hover text on purpose ("hover-only
+   * text is dead on touch and cannot be scanned at all"), and the replacement is the
+   * part an author most needs to read without hunting for it.
+   */
+  retiringRowText(item: BindableItem): string {
+    const lead = this.isToolSelected(item.ref)
+      ? 'Being retired — remove it from this agent when you can.'
+      : 'Being retired and can no longer be added to an agent.';
+    const detail = retirementDetail({
+      retirementNote: item.meta?.['retirementNote'] as string | null | undefined,
+      retiresOn: item.meta?.['retiresOn'] as string | null | undefined,
+    });
+    return detail ? `${lead} ${detail}` : lead;
+  }
+
+  /** {@link isToolRetiring} keyed by ref, for the guard inside {@link toggleTool}. */
+  private isToolRetiringByRef(ref: string): boolean {
+    const item = this.tools().find((t) => t.ref === ref);
+    return item ? this.isToolRetiring(item) : false;
+  }
+
+  /**
+   * The retiring tools this agent still binds, for the section notice.
+   *
+   * The chip's own `retiring` badge is easy to miss on a form with twenty chips,
+   * and the action we need from the author (remove it, and resubmit if published)
+   * does not fit on a chip. Empty for every agent that binds none, so the notice
+   * does not exist for the overwhelmingly common case.
+   *
+   * One line per tool rather than one sentence listing them all: two tools being
+   * retired are usually two different stories, with different replacements and
+   * different dates, and joining them with a comma would attribute one tool's
+   * replacement to the other.
+   */
+  readonly retiringSelectedTools = computed(() =>
+    this.tools()
+      .filter((t) => this.isToolRetiring(t) && this.isToolSelected(t.ref))
+      .map((t) => {
+        const detail = retirementDetail({
+          retirementNote: t.meta?.['retirementNote'] as string | null | undefined,
+          retiresOn: t.meta?.['retiresOn'] as string | null | undefined,
+        });
+        return {
+          label: t.label,
+          // Falls back to the vague form ONLY when the admin recorded neither a
+          // replacement nor a date. Earlier copy named "the retirement date"
+          // unconditionally, pointing at a fact the UI never carried.
+          detail: detail || 'It will stop working once the retirement completes.',
+        };
+      }),
+  );
   isToolSelected(ref: string): boolean {
     for (const selected of this.selectedToolRefs()) {
       if (baseToolId(selected) === ref) return true;
@@ -716,6 +1112,10 @@ export class AgentFormPage implements OnInit, OnDestroy {
         ...(Object.keys(params).length ? { params } : {}),
       },
       bindings: this.buildBindings(),
+      // #111: citations on/off, and downloads AND-ed under citations (a disabled
+      // downloads control is dropped from form.value, so derive it explicitly).
+      showCitations: v.showCitations !== false,
+      allowDocumentDownload: v.showCitations !== false ? v.allowDocumentDownload !== false : false,
     };
 
     this.saving.set(true);

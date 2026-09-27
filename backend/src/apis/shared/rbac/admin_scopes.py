@@ -95,6 +95,12 @@ ADMIN_SCOPES: tuple[AdminScope, ...] = (
         description="Manage skill bundles, their reference files, and skill role grants.",
     ),
     AdminScope(
+        id="admin.agent_templates",
+        label="Agent Templates",
+        group=GROUP_AI_CONFIG,
+        description="Manage the catalog of agent templates users start new agents from.",
+    ),
+    AdminScope(
         id="admin.connectors",
         label="Connectors",
         group=GROUP_AI_CONFIG,
@@ -120,6 +126,12 @@ ADMIN_SCOPES: tuple[AdminScope, ...] = (
             "Review agent submissions, handle reports and takedowns, and curate the "
             "storefront, categories, and default pins."
         ),
+    ),
+    AdminScope(
+        id="admin.projects",
+        label="Projects",
+        group=GROUP_MARKETPLACE,
+        description="See every Shared Project, read its audit trail, and archive or restore it.",
     ),
     AdminScope(
         id="admin.users",

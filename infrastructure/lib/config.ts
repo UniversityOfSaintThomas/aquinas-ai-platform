@@ -10,6 +10,30 @@ export interface CognitoConfig {
   // COGNITO is always included; entries here are added on top.
   supportedIdentityProviders?: string[];
   passwordMinLength?: number;  // Override default 8
+  // Whether anyone on the internet can self-register a native Cognito account
+  // through the Hosted UI's "Sign up" link.
+  //
+  // Defaults to FALSE — closed. Nothing in this stack needs it open:
+  //  - Federated sign-in is unaffected. This gates the `SignUp` API only; users
+  //    arriving through Entra/Okta are still provisioned just-in-time. Per AWS:
+  //    with self-registration off, "new users must be created by administrative
+  //    API actions using IAM API credentials or by sign-in with federated
+  //    providers."
+  //  - First-boot is unaffected. `CognitoService.create_admin_user` uses
+  //    `AdminCreateUser` + `AdminSetUserPassword`, which ignore this setting, so
+  //    a fresh fork still bootstraps its first admin through /auth/first-boot.
+  //
+  // Set `CDK_COGNITO_SELF_SIGNUP_ENABLED=true` to run an open-registration
+  // environment. Defaulting closed rather than open is deliberate: an operator
+  // who forgets to set the variable gets the safe posture, not a public signup
+  // page. This intentionally departs from the repo's "flags default ON" rule,
+  // which is about feature rollout, not access control.
+  //
+  // This MUST live here rather than being toggled in the console: CDK always
+  // renders `AdminCreateUserConfig.allowAdminCreateUserOnly` into the template,
+  // so the next deploy that touches the user pool for any reason overwrites an
+  // out-of-band console change without saying so.
+  selfSignUpEnabled?: boolean;
 }
 
 export interface AppConfig {
@@ -51,13 +75,19 @@ export interface AppConfig {
   kbSync: KbSyncConfig;
   managedKb: ManagedKbConfig;
   scheduledRuns: ScheduledRunsConfig;
+  platformCosts: PlatformCostsConfig;
   memorySpaces: MemorySpacesConfig;
+  projects: ProjectsConfig;
+  platformSelfService: PlatformSelfServiceConfig;
+  feedbackEvalSampling: FeedbackEvalSamplingConfig;
   skills: SkillsConfig;
   agents: AgentsConfig;
   agentMarketplace: AgentMarketplaceConfig;
+  dictation: DictationConfig;
   fineTuning: FineTuningConfig;
   artifacts: ArtifactsConfig;
   mcpSandbox: McpSandboxConfig;
+  browser: BrowserConfig;
   mcpIdentity: McpIdentityConfig;
   gateway: GatewayConfig;
   /**
@@ -93,6 +123,31 @@ export interface McpSandboxConfig {
   extraFrameAncestors: string[];
 }
 
+/**
+ * AgentCore Browser policy (docs/specs/authenticated-web-assessment.md D6).
+ */
+export interface BrowserConfig {
+  /**
+   * Hosts the browser must refuse to navigate to, as Chromium
+   * `URLBlocklist` entries.
+   *
+   * This is a **security control**, not a preference. A browser takeover hands
+   * a human a fully interactive Chromium, so the only thing that stops them
+   * navigating to the LMS and having an agent act as them is Chromium itself
+   * refusing — no check in our own code can, because it only ever sees the
+   * page the takeover started on.
+   *
+   * A blocklist rather than an allowlist because the list has to be
+   * maintainable: an allowlist of vendors under assessment would churn with
+   * every VPAT review, while institutional systems change about yearly.
+   *
+   * Lives here rather than as an S3 object edited in place, so a change to it
+   * is a reviewed deploy. Match the origin actually navigated to — a vanity
+   * CNAME that redirects is not what Chromium sees.
+   */
+  urlBlocklist: string[];
+}
+
 export interface ArtifactsConfig {
   // ACM certificate ARN for the artifact iframe origin (artifacts.{domainName}).
   // MUST be in us-east-1 — CloudFront requires its certs there. Validation
@@ -117,6 +172,12 @@ export interface FrontendConfig {
   bucketName?: string;
   cloudFrontPriceClass: string;
   additionalCorsOrigins?: string; // Extra CORS origins to append (comma-separated)
+  /**
+   * CloudFront standard access logging for the SPA distribution. Default ON
+   * with a kill switch; `undefined` is treated as on so a hand-built config
+   * cannot silently turn it off by omission.
+   */
+  accessLogsEnabled?: boolean;
 }
 
 export interface AppApiConfig {
@@ -263,6 +324,25 @@ export interface ScheduledRunsConfig {
 }
 
 /**
+ * Platform cost sync (AWS Cost Explorer -> admin cost dashboard).
+ *
+ * OPT-IN, deliberately against this repo's usual default-on-with-a-kill-switch
+ * posture. Every other flag gates a feature built entirely from resources we
+ * own; this one calls Cost Explorer, which (a) bills $0.01 per request,
+ * (b) needs `ce:GetCostAndUsage` that an SCP may deny, and (c) may not even be
+ * enabled in the account. Reading the account's billing data is a scoping
+ * decision per environment, so it follows `feedbackEvalSampling`: only the
+ * literal "true" enables, and a workflow forwarding an unset variable (which
+ * arrives as an EMPTY STRING) must never be what turns it on.
+ *
+ * When off, the construct produces zero resources and the dashboard shows
+ * inference cost only, exactly as it did before.
+ */
+export interface PlatformCostsConfig {
+  enabled: boolean;
+}
+
+/**
  * Memory Spaces feature flag. Default ON with a kill switch — the feature is
  * complete and ships enabled for every deployer (opt-out), disabled per
  * environment with CDK_MEMORY_SPACES_ENABLED=false (or a
@@ -271,6 +351,45 @@ export interface ScheduledRunsConfig {
  * are provisioned unconditionally, so this only gates route mounting at runtime.
  */
 export interface MemorySpacesConfig {
+  enabled: boolean;
+}
+
+/**
+ * Shared Projects feature flag (docs/specs/shared-projects.md). **Opt-in while the
+ * feature is in development**: off unless CDK_PROJECTS_ENABLED=true (or a
+ * `projects.enabled: true` cdk.json context), so a deployment turns it on by choice.
+ * See CLAUDE.md "Feature flags". Sets the PROJECTS_ENABLED env var
+ * on app-api and inference-api. The projects table is provisioned
+ * unconditionally, so this only gates route mounting and the project harness on
+ * the invocation path at runtime.
+ */
+export interface ProjectsConfig {
+  enabled: boolean;
+}
+
+/**
+ * Platform self-service feature flag (docs/specs/platform-self-service). **Opt-in
+ * while in development**: off unless CDK_PLATFORM_SELF_SERVICE_ENABLED=true (or a
+ * `platformSelfService.enabled: true` cdk.json context), so a deployment turns it
+ * on by choice. See CLAUDE.md "Feature flags". Sets the
+ * PLATFORM_SELF_SERVICE_ENABLED env var on inference-api ONLY — the flag is read
+ * solely by the AgentCore Runtime (inference_api/chat/routes.py); app-api never
+ * reads it, so wiring it there would only burn readability. With the flag off the
+ * runtime builds no account tools and injects nothing, so it is dark per
+ * environment until deliberately enabled. The tool catalog rows must also be
+ * seeded in that environment's DynamoDB before the tools appear.
+ */
+export interface PlatformSelfServiceConfig {
+  enabled: boolean;
+}
+
+/**
+ * Feedback eval sampling (response-feedback spec §11 PR-4): lets an admin
+ * send down-thumbed conversations to AgentCore Evaluations. **Opt-in** —
+ * the managed evaluator reads the conversation's spans (system prompt and
+ * user messages), so each environment turns it on deliberately.
+ */
+export interface FeedbackEvalSamplingConfig {
   enabled: boolean;
 }
 
@@ -313,6 +432,26 @@ export interface AgentsConfig {
  */
 export interface AgentMarketplaceConfig {
   enabled: boolean;
+}
+
+/**
+ * Composer dictation — speech-to-text into the message box via Amazon
+ * Transcribe Streaming, proxied by app-api (`/dictation/*`).
+ *
+ * Default ON with a kill switch: CDK_DICTATION_ENABLED=false (or a
+ * `dictation.enabled: false` cdk.json context) makes the routes 404, and the
+ * SPA hides the Dictate button on the first 404. Sets DICTATION_ENABLED and
+ * DICTATION_LANGUAGES on **app-api only**.
+ */
+export interface DictationConfig {
+  enabled: boolean;
+  /**
+   * Comma-separated Transcribe language codes. One code (the default,
+   * `en-US`) pins the language; two or more switch on automatic language
+   * identification with the first as the preferred language. At most one
+   * dialect per language (`en-US,en-GB` is rejected by the service).
+   */
+  languages: string;
 }
 
 export interface FineTuningConfig {
@@ -597,6 +736,13 @@ export interface ObservabilityConfig {
   /** AgentCore APPLICATION_LOGS vended delivery. Off by default: the records
    *  carry full prompts and responses, so it is both high-volume and PII. */
   agentCoreApplicationLogsEnabled: boolean;
+  /**
+   * Daily sweep that applies `logRetentionDays` to every generation of this
+   * deployment's AgentCore Runtime log groups, including ones left behind by
+   * a replaced Runtime. On by default; `false` for an account whose
+   * governance requires longer retention.
+   */
+  runtimeLogRetentionSweepEnabled: boolean;
 }
 
 /**
@@ -704,12 +850,22 @@ export function loadConfig(scope: cdk.App): AppConfig {
       passwordMinLength: parseIntEnv(process.env.CDK_COGNITO_PASSWORD_MIN_LENGTH)
         || scope.node.tryGetContext('cognito')?.passwordMinLength
         || 8,
+      selfSignUpEnabled: parseBooleanEnv(process.env.CDK_COGNITO_SELF_SIGNUP_ENABLED)
+        ?? scope.node.tryGetContext('cognito')?.selfSignUpEnabled
+        ?? false,
     },
     frontend: {
       certificateArn: process.env.CDK_FRONTEND_CERTIFICATE_ARN || scope.node.tryGetContext('frontend').certificateArn,
       bucketName: process.env.CDK_FRONTEND_BUCKET_NAME || scope.node.tryGetContext('frontend')?.bucketName,
       cloudFrontPriceClass: process.env.CDK_FRONTEND_CLOUDFRONT_PRICE_CLASS || scope.node.tryGetContext('frontend')?.cloudFrontPriceClass,
       additionalCorsOrigins: process.env.CDK_FRONTEND_CORS_ORIGINS || scope.node.tryGetContext('frontend')?.additionalCorsOrigins,
+      // Default ON with a kill switch, same empty-string-safe ternary as
+      // `projects` below: the workflow forwards an EMPTY STRING when the
+      // variable is unset, so treat empty/unset as the default (on) and only
+      // the literal "false" as the kill switch.
+      accessLogsEnabled: process.env.CDK_FRONTEND_ACCESS_LOGS_ENABLED
+        ? process.env.CDK_FRONTEND_ACCESS_LOGS_ENABLED !== 'false'
+        : scope.node.tryGetContext('frontend')?.accessLogsEnabled ?? true,
     },
     appApi: {
       // Precedence for every sizing knob: env var > FLAT dotted context >
@@ -872,6 +1028,26 @@ export function loadConfig(scope: cdk.App): AppConfig {
         ? process.env.CDK_SCHEDULED_RUNS_ENABLED !== 'false'
         : scope.node.tryGetContext('scheduledRuns')?.enabled ?? true,
     },
+    platformCosts: {
+      // Default OFF, opt-in — see PlatformCostsConfig for why this one does
+      // not follow the default-on pattern above. Only the literal "true"
+      // enables; an empty/unset workflow variable leaves it off. A
+      // `platformCosts.enabled: true` cdk.json context also enables it.
+      enabled: process.env.CDK_PLATFORM_COSTS_ENABLED
+        ? process.env.CDK_PLATFORM_COSTS_ENABLED === 'true'
+        : scope.node.tryGetContext('platformCosts')?.enabled ?? false,
+    },
+    feedbackEvalSampling: {
+      // Default OFF, opt-in (the `fineTuning`-style deferred pattern inverted):
+      // only the literal "true" enables. Sending real conversations to an
+      // AWS-managed judge is the scoping decision the evaluations spike says to
+      // make explicitly per environment — a workflow's empty/unset variable must
+      // never make it. A `feedbackEvalSampling.enabled: true` cdk.json context
+      // also enables it.
+      enabled: process.env.CDK_FEEDBACK_EVAL_SAMPLING_ENABLED
+        ? process.env.CDK_FEEDBACK_EVAL_SAMPLING_ENABLED === 'true'
+        : scope.node.tryGetContext('feedbackEvalSampling')?.enabled ?? false,
+    },
     memorySpaces: {
       // Default ON with a kill switch: Memory Spaces is a complete feature and
       // ships enabled for every deployer (opt-out, not opt-in — matches kbSync /
@@ -883,6 +1059,23 @@ export function loadConfig(scope: cdk.App): AppConfig {
       enabled: process.env.CDK_MEMORY_SPACES_ENABLED
         ? process.env.CDK_MEMORY_SPACES_ENABLED !== 'false'
         : scope.node.tryGetContext('memorySpaces')?.enabled ?? true,
+    },
+    projects: {
+      // Opt-in while in development (CLAUDE.md "Feature flags"): only the literal
+      // "true" turns it on. The workflow forwards an EMPTY STRING when the variable
+      // is unset, which falls through to the context and then to off.
+      enabled: process.env.CDK_PROJECTS_ENABLED
+        ? process.env.CDK_PROJECTS_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('projects')?.enabled ?? false,
+    },
+    platformSelfService: {
+      // Opt-in while in development (CLAUDE.md "Feature flags"): only the literal
+      // "true" turns it on. The workflow forwards an EMPTY STRING when the variable
+      // is unset, which falls through to the context and then to off. Sets
+      // PLATFORM_SELF_SERVICE_ENABLED on the inference-api runtime only.
+      enabled: process.env.CDK_PLATFORM_SELF_SERVICE_ENABLED
+        ? process.env.CDK_PLATFORM_SELF_SERVICE_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('platformSelfService')?.enabled ?? false,
     },
     skills: {
       // Default ON with a kill switch (house style, mirroring memorySpaces /
@@ -917,6 +1110,17 @@ export function loadConfig(scope: cdk.App): AppConfig {
         ? process.env.CDK_AGENT_MARKETPLACE_ENABLED !== 'false'
         : scope.node.tryGetContext('agentMarketplace')?.enabled ?? true,
     },
+    dictation: {
+      // Default ON with a kill switch, same empty-string-safe ternary as
+      // `agentMarketplace` above.
+      enabled: process.env.CDK_DICTATION_ENABLED
+        ? process.env.CDK_DICTATION_ENABLED !== 'false'
+        : scope.node.tryGetContext('dictation')?.enabled ?? true,
+      languages:
+        process.env.CDK_DICTATION_LANGUAGES
+        || scope.node.tryGetContext('dictation')?.languages
+        || 'en-US',
+    },
     fineTuning: {
       additionalCorsOrigins: process.env.CDK_FINE_TUNING_CORS_ORIGINS || scope.node.tryGetContext('fineTuning')?.additionalCorsOrigins,
       // Default ON with a kill switch, same empty-string-safe ternary as
@@ -950,6 +1154,44 @@ export function loadConfig(scope: cdk.App): AppConfig {
       shareInboxEnabled: process.env.CDK_ARTIFACT_SHARE_INBOX_ENABLED
         ? process.env.CDK_ARTIFACT_SHARE_INBOX_ENABLED !== 'false'
         : scope.node.tryGetContext('artifacts')?.shareInboxEnabled ?? true,
+    },
+    browser: {
+      // Hostnames Chromium refuses to navigate to during a browser session.
+      // This is a security control: it is what stops a human in a browser
+      // takeover navigating to a system the agent must not act inside.
+      //
+      // **Deliberately empty by default.** The contents are a per-deployment
+      // policy decision, not a property of this stack — the hosts that matter
+      // to one institution mean nothing to another — so this follows the
+      // `domainName` / `corsOrigins` convention: fork-neutral in the repo,
+      // supplied per environment by the `CDK_BROWSER_URL_BLOCKLIST` GitHub
+      // Actions variable that `platform.yml` forwards. Deployments that
+      // carried the old hardcoded seed MUST set that variable; a deploy whose
+      // list comes out empty while the browser tool is grantable says so in
+      // the deploy log (see the warning below).
+      //
+      // Comma-separated in the env var. Empty/unset falls through to context
+      // and then to `[]` — the house empty-string rule, because an unset
+      // GitHub Actions variable arrives as '' and must not be distinguishable
+      // from "not configured". "Block nothing" is the default, so opting out
+      // needs no sentinel; note it leaves the RBAC grant as the only control
+      // (spec Security 3).
+      //
+      // ⚠️ Chromium's URLBlocklist matches on HOST, not on the service behind
+      // it, so a site is only as blocked as its hostname list is complete.
+      // When adding an entry, enumerate the service's aliases first — vendor
+      // host, vanity CNAME, regional and mobile hostnames — and prefer the
+      // registrable domain (`instructure.com`) over one instance, so `.test.`
+      // and `.beta.` variants are covered rather than left as side doors.
+      //
+      // ⚠️ Blocking a vendor's *sign-in* host is usually wrong: an
+      // institutional login page is exactly what an accessibility or VPAT
+      // review needs to reach, which is the use case this feature exists for.
+      // Block where it LEADS, not the doorway.
+      urlBlocklist:
+        parseListEnv(process.env.CDK_BROWSER_URL_BLOCKLIST)
+        ?? scope.node.tryGetContext('browser')?.urlBlocklist
+        ?? [],
     },
     mcpSandbox: {
       certificateArn: process.env.CDK_MCP_SANDBOX_CERTIFICATE_ARN || scope.node.tryGetContext('mcpSandbox')?.certificateArn,
@@ -1110,6 +1352,11 @@ export function loadConfig(scope: cdk.App): AppConfig {
         ?? parseBooleanEnv(scope.node.tryGetContext('observability.agentCoreApplicationLogsEnabled'))
         ?? scope.node.tryGetContext('observability')?.agentCoreApplicationLogsEnabled
         ?? false,
+      runtimeLogRetentionSweepEnabled:
+        parseBooleanEnv(process.env.CDK_OBSERVABILITY_RUNTIME_LOG_RETENTION_SWEEP_ENABLED)
+        ?? parseBooleanEnv(scope.node.tryGetContext('observability.runtimeLogRetentionSweepEnabled'))
+        ?? scope.node.tryGetContext('observability')?.runtimeLogRetentionSweepEnabled
+        ?? true,
     },
     tags: {
       ...(scope.node.tryGetContext('tags') || {}),
@@ -1160,12 +1407,52 @@ export function loadConfig(scope: cdk.App): AppConfig {
     + ` xraySamplingRate=${config.observability.xraySamplingRate}`
     + ` xrayReservoir=${config.observability.xraySamplingReservoir}`
     + ` agentCoreAppLogs=${config.observability.agentCoreApplicationLogsEnabled}`
+    + ` runtimeLogRetentionSweep=${config.observability.runtimeLogRetentionSweepEnabled}`
   );
+
+  // Printed because this list is a security control supplied entirely from
+  // outside the repo: a deploy that ships an empty one has to say so, or a
+  // forgotten `CDK_BROWSER_URL_BLOCKLIST` variable is indistinguishable in
+  // the log from a deliberate "block nothing".
+  if (config.browser.urlBlocklist.length > 0) {
+    console.log(
+      `   Browser URL blocklist (${config.browser.urlBlocklist.length}): `
+      + config.browser.urlBlocklist.join(', ')
+    );
+  } else {
+    console.warn(
+      '   ⚠️  Browser URL blocklist is EMPTY — browser sessions can reach any'
+      + ' host. Set the CDK_BROWSER_URL_BLOCKLIST variable if this environment'
+      + ' is meant to block one. RBAC on browse_web / request_user_login is'
+      + ' then the only control.'
+    );
+  }
 
   // Validate configuration
   validateConfig(config);
 
   return config;
+}
+
+/**
+ * Parse a comma-separated list environment variable.
+ *
+ * Returns undefined for a missing OR empty value so that nullish coalescing
+ * (??) falls through to context defaults — the house empty-string rule. An
+ * unset GitHub Actions variable is forwarded as '', and treating that as an
+ * explicit "empty list" would let a forgotten variable silently override a
+ * configured default.
+ *
+ * @param value The environment variable value to parse
+ * @returns Trimmed, non-empty entries, or undefined if unset/empty
+ */
+export function parseListEnv(value: string | undefined): string[] | undefined {
+  if (value === undefined || value.trim() === '') {
+    return undefined;
+  }
+
+  const entries = value.split(',').map((s) => s.trim()).filter(Boolean);
+  return entries.length > 0 ? entries : undefined;
 }
 
 /**
@@ -1451,11 +1738,25 @@ function validateConfig(config: AppConfig): void {
     });
   }
 
-  // Validate top-level CORS origins.
-  if (!config.corsOrigins) {
-    console.warn(
-      'Warning: no CORS origins configured. ' +
-      'Set CDK_DOMAIN_NAME or CDK_CORS_ORIGINS to enable browser uploads.'
+  // Validate top-level CORS origins. Without at least one origin the uploads
+  // bucket (`FileUploadConstruct`) is created with NO CORS rule, and every
+  // browser upload fails at S3 with no server-side signal. A production-mirror
+  // load test shipped exactly that (docs/specs/load-test-assessment-2026-09.md
+  // §1 fix 4) because this used to be a console.warn lost in synth output.
+  // Fail synth instead; a deployment that genuinely has no browser front-end
+  // opts out explicitly.
+  //
+  // Gate on `buildCorsOrigins` -- the same filtered list FileUploadConstruct
+  // consumes -- not on the raw string. A value that is truthy but filters to
+  // nothing (`","` from a templated list's trailing comma, `" "` from a YAML
+  // value that quotes to a space, `"${UNSET_VAR},"` in CI) would otherwise
+  // pass the guard and still produce a bucket with no CORS rule. Pass no
+  // `additionalOrigins` here, for the same reason: the construct does not.
+  if (buildCorsOrigins(config).length === 0 && parseBooleanEnv(process.env.CDK_ALLOW_NO_CORS_ORIGINS) !== true) {
+    throw new Error(
+      'No CORS origins configured: the uploads bucket would be created without a CORS rule ' +
+      'and every browser upload would fail. Set CDK_DOMAIN_NAME (or CDK_CORS_ORIGINS), ' +
+      'or set CDK_ALLOW_NO_CORS_ORIGINS=true for a deployment with no browser front-end.'
     );
   }
 

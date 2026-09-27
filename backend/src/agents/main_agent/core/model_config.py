@@ -285,6 +285,25 @@ class RetryConfig:
         )
 
 
+# Bedrock's long cache TTL. Only "1h" is a change from the default; anything
+# else (unset, "5m", garbage) means "today's shape" — no ttl key on any point,
+# which is what keeps the static prefix bytes identical across the flip.
+LONG_CACHE_TTL = "1h"
+
+
+def static_prefix_cache_ttl() -> Optional[str]:
+    """The long TTL to put on the tools + system cachePoints, or ``None``.
+
+    Read from ``AGENTCORE_PROMPT_CACHE_STATIC_PREFIX_TTL`` at agent
+    construction (a cached agent keeps the arm it was built under). See
+    docs/specs/compaction-model-relative-thresholds.md §3.6 PR-5 for the
+    economics: 2x write premium on the static segments in exchange for
+    reading them, rather than re-writing them, on every 5–60 minute pause.
+    """
+    raw = os.environ.get(EnvVars.PROMPT_CACHE_STATIC_PREFIX_TTL, "").strip().lower()
+    return LONG_CACHE_TTL if raw == LONG_CACHE_TTL else None
+
+
 @dataclass
 class ModelConfig:
     """Configuration for multi-provider LLM models.
@@ -342,6 +361,15 @@ class ModelConfig:
         # Default to configured provider
         return self.provider
 
+    def long_ttl_static_prefix(self) -> bool:
+        """True when this model's tools + system cachePoints carry the 1h TTL.
+
+        The cost path uses it to bill the static segment's cache writes at
+        Bedrock's 1h premium (2x base) instead of the 5m one (1.25x) — the
+        correction that keeps the experiment arm's own cost rows honest.
+        """
+        return bool(self.caching_enabled and self.bedrock_cache_points_supported() and static_prefix_cache_ttl())
+
     def bedrock_cache_points_supported(self) -> bool:
         """Whether a hand-placed Bedrock system cachePoint may be sent.
 
@@ -393,16 +421,20 @@ class ModelConfig:
             config, self.inference_params, _BEDROCK_PARAM_MAP, "bedrock", self.model_id
         )
 
-        # Native Bedrock CountTokens. With this on, Strands' per-turn estimate
-        # (BeforeModelCallEvent.projected_input_tokens) and agent.model.count_tokens()
-        # return authoritative Bedrock counts instead of the chars/4 heuristic —
-        # the foundation for per-turn context attribution (decomposing the
+        # Native Bedrock CountTokens is available to this model — the
+        # foundation for per-call context attribution (decomposing the
         # otherwise-aggregate inputTokens into system / tools / messages via the
-        # CountTokens differential). Every catalog model is Claude family and
-        # supports the API; the runtime-role IAM grant landed in #428. Strands
-        # falls back to the heuristic and caches the skip if a model ever
-        # AccessDenies or doesn't support counting, so this is safe to set
-        # unconditionally on the Bedrock path.
+        # CountTokens differential). The runtime-role IAM grant landed in #428.
+        # Strands' pre-call estimate stays the heuristic regardless: the
+        # factory builds the model with `native_projection=False`, so no count
+        # ever sits in front of a model call (see bedrock_count_tokens.py).
+        # Not every model supports the API — Claude Sonnet 5's base id is
+        # rejected as unsupported — and the count falls back to the heuristic
+        # and caches the skip when a model AccessDenies or doesn't support
+        # counting, so this is safe to set unconditionally on the Bedrock
+        # path. The attribution hook reads that skip
+        # (`token_count_is_authoritative`) and records nothing rather than a
+        # heuristic split.
         config["use_native_token_count"] = True
 
         # Bedrock prompt caching — three cachePoints per request (Bedrock
@@ -471,10 +503,22 @@ class ModelConfig:
         # that reaches Bedrock without going through that factory.
         if self.caching_enabled:
             from strands.models import CacheConfig
+
+            # PR-5 (thresholds spec §3.6): an explicit "1h" on the two STATIC
+            # points only. system_prompt_ttl as a string is "honored as
+            # written" by _apply_system_cache_ttl, which rewrites the TTL on
+            # the hand-placed, TTL-less system point AgentFactory places;
+            # tools_ttl as a string sets the tools point's own TTL. The
+            # message-level auto point carries no ttl (cache_config.ttl stays
+            # unset) and so stays at 5m — tools(1h) → system(1h) → messages(5m)
+            # is the non-increasing order Bedrock requires. Off (the default)
+            # emits exactly today's bytes.
+            supported = self.bedrock_cache_points_supported()
+            long_ttl = static_prefix_cache_ttl() if supported else None
             config["cache_config"] = CacheConfig(
                 strategy="auto",
-                system_prompt_ttl=True,
-                tools_ttl=self.bedrock_cache_points_supported(),
+                system_prompt_ttl=long_ttl or True,
+                tools_ttl=(long_ttl or True) if supported else False,
             )
 
         if self.retry_config:

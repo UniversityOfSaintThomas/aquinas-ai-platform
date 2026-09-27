@@ -44,7 +44,7 @@ export type SummaryCardIcon =
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div
-      class="bg-white dark:bg-gray-800 rounded-lg shadow-xs border border-gray-200 dark:border-gray-700 p-6"
+      class="rounded-2xl border border-gray-200 bg-white p-6 shadow-xs dark:border-gray-700 dark:bg-gray-800"
     >
       <div class="flex items-start justify-between gap-3">
         <p class="text-sm/6 font-medium text-gray-500 dark:text-gray-400">
@@ -62,6 +62,16 @@ export type SummaryCardIcon =
         {{ value() }}
       </p>
 
+      @if (detail()) {
+        <!-- A breakdown of the headline, not a trend. Exists so a composite
+             figure (all-in cost per user = inference + platform) can show
+             what it is composed of; a headline whose basis changed silently
+             is a number two people will quote differently. -->
+        <p class="mt-1 text-xs/5 text-gray-500 tabular-nums dark:text-gray-400">
+          {{ detail() }}
+        </p>
+      }
+
       @if (trend() !== null && trend() !== undefined) {
         <div class="mt-2 flex items-center gap-1">
           @if (trend()! > 0) {
@@ -69,7 +79,7 @@ export type SummaryCardIcon =
               name="heroArrowTrendingUp"
               class="size-4 text-state-success-500"
             />
-            <span class="text-sm text-state-success-600 dark:text-state-success-400">
+            <span class="text-sm text-state-success-700 dark:text-state-success-400">
               +{{ trend() | number : '1.1-1' }}%
             </span>
           } @else if (trend()! < 0) {
@@ -98,6 +108,8 @@ export class SystemSummaryCardComponent {
   value = input.required<string>();
   trend = input<number | null>(null);
   icon = input<SummaryCardIcon>('heroCurrencyDollar');
+  /** Optional sub-line under the value — see the template comment. */
+  detail = input<string | null>(null);
 
   // Decorative per-metric icon colors (Total Cost/Active Users/Cache
   // Savings/Avg Cost per User) — purely to keep the summary cards visually

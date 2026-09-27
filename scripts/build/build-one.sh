@@ -134,6 +134,9 @@ case "$SERVICE" in
             "backend/src/apis/shared/oauth"
             "backend/src/apis/shared/embeddings"
             "backend/src/apis/shared/assistants"
+            # projects/ — assistants/service.py imports projects/access.py
+            # (lazily) for a project harness's access check.
+            "backend/src/apis/shared/projects"
             # caching/ — oauth/provider_repository.py memoizes its provider
             # list in the process-wide config cache.
             "backend/src/apis/shared/caching"
@@ -145,6 +148,7 @@ case "$SERVICE" in
             "backend/src/apis/shared/timestamps.py"
             "backend/src/apis/shared/dynamo_errors.py"
             "backend/src/apis/shared/feature_flags.py"
+            "backend/src/apis/shared/aws_clients.py"
         )
         # Both kb-sync Lambdas are arm64 (see the kb-sync CDK construct).
         PLATFORM="linux/arm64"
@@ -192,8 +196,11 @@ case "$SERVICE" in
             "backend/src/apis/shared/scheduled_prompts"
             "backend/src/apis/shared/sessions_bff"
             "backend/src/apis/shared/sessions"
+            "backend/src/apis/shared/browser_takeover"
             "backend/src/apis/shared/storage"
             "backend/src/apis/shared/observability"
+            # projects/ — sessions/metadata.py's project cost rollup (lazy import).
+            "backend/src/apis/shared/projects"
         )
         # Single-file COPYs hashed as manifests (same as kb-sync/rag-ingestion);
         # the dispatcher's requirements.txt lives inside its own source dir.
@@ -201,6 +208,7 @@ case "$SERVICE" in
             "backend/src/apis/shared/__init__.py"
             "backend/src/apis/shared/errors.py"
             "backend/src/apis/shared/feature_flags.py"
+            "backend/src/apis/shared/dynamo_errors.py"
         )
         # Both scheduled-runs Lambdas are arm64 (see the scheduled-runs
         # CDK construct).

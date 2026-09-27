@@ -6,11 +6,14 @@ This is the default agent type for standard chat interactions.
 """
 
 import logging
+import os
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from agents.main_agent.base_agent import BaseAgent
 from agents.main_agent.core import AgentFactory
 from agents.main_agent.skills.strands_mapping import build_skills_runtime
+
+from apis.shared.observability.build_stages import mark_stage
 
 logger = logging.getLogger(__name__)
 
@@ -51,14 +54,18 @@ class ChatAgent(BaseAgent):
         """Create Strands Agent with filtered tools, hooks, and skills plugin."""
         try:
             tools = self._build_filtered_tools()
+            # External MCP pre-flight lives in here — the spec's standing
+            # (and unverified) hypothesis for the cold build.
+            mark_stage("tools")
             hooks = self._create_hooks()
+            mark_stage("hooks")
 
             # Skills disclosure: the AgentSkills plugin injects the catalog +
             # activation tool; read_skill_file is the S3 adapter for reference
             # files (added after tool filtering — it is infrastructure, not an
             # RBAC-gated tool, and is implicitly scoped to the turn's skills).
             plugin, read_skill_file = build_skills_runtime(self._accessible_skill_ids)
-            plugins = [plugin] if plugin else None
+            plugins = [plugin] if plugin else []
             if plugin:
                 tools = list(tools) + [read_skill_file]
                 logger.info(
@@ -66,6 +73,30 @@ class ChatAgent(BaseAgent):
                     len(self._accessible_skill_ids or []),
                 )
 
+            # Tool-result offload at intake (compaction PR-4): oversized tool
+            # results become a bounded preview + retrieval references before
+            # they enter the cacheable prefix. Fail-open: None when off or
+            # unconfigured. The plugin registers retrieve_offloaded_content
+            # itself — one stable spec in toolConfig, not an RBAC-gated tool,
+            # like read_skill_file above.
+            from agents.main_agent.core.tool_result_offload import build_tool_result_offloader
+
+            offload_session = getattr(self, "session_id", None)
+            offload_user = getattr(self, "user_id", None)
+            offloader = (
+                build_tool_result_offloader(
+                    session_id=offload_session,
+                    user_id=offload_user,
+                    region=os.environ.get("AWS_REGION"),
+                )
+                if offload_session and offload_user
+                else None
+            )
+            if offloader is not None:
+                plugins.append(offloader)
+            plugins = plugins or None
+
+            mark_stage("plugins")
             self.agent = AgentFactory.create_agent(
                 model_config=self.model_config,
                 system_prompt=self._system_prompt_for(tools),
@@ -73,6 +104,7 @@ class ChatAgent(BaseAgent):
                 session_manager=self.session_manager,
                 hooks=hooks,
                 plugins=plugins,
+                memory_context=getattr(self, "memory_context", None),
             )
 
         except Exception as e:
@@ -129,7 +161,9 @@ class ChatAgent(BaseAgent):
         interrupt_responses: Optional[List[Dict[str, Any]]] = None,
         continue_truncated: bool = False,
         turn_agent_id: Optional[str] = None,
+        turn_project_id: Optional[str] = None,
         turn_lease: Any = None,
+        turn_started_at: Optional[float] = None,
     ) -> AsyncGenerator[str, None]:
         """
         Stream agent responses.
@@ -156,6 +190,9 @@ class ChatAgent(BaseAgent):
                 event loop re-runs against restored history whose tail is the
                 truncated assistant message — the model continues it
                 (assistant-prefill) instead of answering a new instruction.
+            turn_project_id: The Shared Project whose harness ran this turn, if
+                any; recorded on each cost row and in the project's monthly rollup.
+                Per turn for the same reason as `turn_agent_id`.
             turn_lease: This turn's single-flight `SessionLease`, which doubles
                 as the mid-turn steering inbox. Passed per turn rather than read
                 off the agent for the same reason as `turn_agent_id`: the agent
@@ -194,6 +231,8 @@ class ChatAgent(BaseAgent):
             citations=citations,
             original_message=original_message,
             turn_agent_id=turn_agent_id,
+            turn_project_id=turn_project_id,
             turn_lease=turn_lease,
+            turn_started_at=turn_started_at,
         ):
             yield event

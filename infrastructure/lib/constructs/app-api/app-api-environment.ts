@@ -37,8 +37,6 @@ export interface AppApiSsmParams {
   oauthProvidersTableArn: string;
   oauthUserTokensTableName: string;
   oauthUserTokensTableArn: string;
-  oauthTokenEncryptionKeyArn: string;
-  oauthClientSecretsArn: string;
   userQuotasTableName: string;
   userQuotasTableArn: string;
   quotaEventsTableName: string;
@@ -59,6 +57,8 @@ export interface AppApiSsmParams {
   announcementsTableArn: string;
   systemPromptsTableName: string;
   systemPromptsTableArn: string;
+  agentTemplatesTableName: string;
+  agentTemplatesTableArn: string;
   authProvidersTableName: string;
   authProvidersTableArn: string;
   authProviderSecretsArn: string;
@@ -81,6 +81,8 @@ export interface AppApiSsmParams {
   voiceTicketSigningSecretArn: string;
   // Inference
   inferenceApiRuntimeEndpointUrl: string;
+  /** AgentCore Runtime CloudWatch log group (spans + content log records) for eval sampling. */
+  agentCoreRuntimeLogGroupName: string;
   // File uploads
   userFilesBucketName: string;
   userFilesBucketArn: string;
@@ -99,6 +101,7 @@ export interface AppApiSsmParams {
   memoryId: string;
   // Memory Spaces
   memorySpacesTableName: string;
+  projectsTableName: string;
   memorySpacesBucketName: string;
   // Workload identity
   workloadIdentityName: string;
@@ -117,6 +120,8 @@ export interface AppApiBackendOverrides {
   memoryId: string;
   /** AgentCore Runtime endpoint URL (from InferenceAgentCoreConstruct.runtimeEndpointUrl). */
   inferenceApiRuntimeEndpointUrl: string;
+  /** AgentCore Runtime log group name (from InferenceAgentCoreConstruct.runtimeLogGroupName). */
+  agentCoreRuntimeLogGroupName: string;
 }
 
 /** Resolve every value the App API construct needs.
@@ -156,8 +161,6 @@ export function resolveAppApiParams(
     oauthProvidersTableArn: refs.oauthProvidersTable.tableArn,
     oauthUserTokensTableName: refs.oauthUserTokensTable.tableName,
     oauthUserTokensTableArn: refs.oauthUserTokensTable.tableArn,
-    oauthTokenEncryptionKeyArn: refs.oauthTokenEncryptionKey.keyArn,
-    oauthClientSecretsArn: refs.oauthClientSecretsSecret.secretArn,
     userQuotasTableName: refs.userQuotasTable.tableName,
     userQuotasTableArn: refs.userQuotasTable.tableArn,
     quotaEventsTableName: refs.quotaEventsTable.tableName,
@@ -178,6 +181,8 @@ export function resolveAppApiParams(
     announcementsTableArn: refs.announcementsTable.tableArn,
     systemPromptsTableName: refs.systemPromptsTable.tableName,
     systemPromptsTableArn: refs.systemPromptsTable.tableArn,
+    agentTemplatesTableName: refs.agentTemplatesTable.tableName,
+    agentTemplatesTableArn: refs.agentTemplatesTable.tableArn,
     authProvidersTableName: refs.authProvidersTable.tableName,
     authProvidersTableArn: refs.authProvidersTable.tableArn,
     authProviderSecretsArn: refs.authProviderSecretsSecret.secretArn,
@@ -200,6 +205,7 @@ export function resolveAppApiParams(
     voiceTicketSigningSecretArn: refs.voiceTicketSigningSecret.secretArn,
     // Inference
     inferenceApiRuntimeEndpointUrl: overrides.inferenceApiRuntimeEndpointUrl,
+    agentCoreRuntimeLogGroupName: overrides.agentCoreRuntimeLogGroupName,
     // File uploads
     userFilesBucketName: refs.fileUploadBucket.bucketName,
     userFilesBucketArn: refs.fileUploadBucket.bucketArn,
@@ -218,6 +224,7 @@ export function resolveAppApiParams(
     memoryId: overrides.memoryId,
     // Memory Spaces
     memorySpacesTableName: refs.memorySpacesTable.tableName,
+    projectsTableName: refs.projectsTable.tableName,
     memorySpacesBucketName: refs.memorySpacesBucket.bucketName,
     // Workload identity
     workloadIdentityName: refs.platformWorkloadIdentity.name,
@@ -295,8 +302,6 @@ export function buildAppApiEnvironment(
     AGENTCORE_MEMORY_TYPE: 'dynamodb',
     AGENTCORE_MEMORY_ID: params.memoryId,
     DYNAMODB_API_KEYS_TABLE_NAME: params.apiKeysTableName,
-    OAUTH_TOKEN_ENCRYPTION_KEY_ARN: params.oauthTokenEncryptionKeyArn,
-    OAUTH_CLIENT_SECRETS_ARN: params.oauthClientSecretsArn,
     DYNAMODB_OAUTH_PROVIDERS_TABLE_NAME: params.oauthProvidersTableName,
     DYNAMODB_OAUTH_USER_TOKENS_TABLE_NAME: params.oauthUserTokensTableName,
     AGENTCORE_RUNTIME_WORKLOAD_NAME: params.workloadIdentityName,
@@ -306,6 +311,7 @@ export function buildAppApiEnvironment(
     DYNAMODB_USER_MENU_LINKS_TABLE_NAME: params.userMenuLinksTableName,
     DYNAMODB_ANNOUNCEMENTS_TABLE_NAME: params.announcementsTableName,
     DYNAMODB_SYSTEM_PROMPTS_TABLE_NAME: params.systemPromptsTableName,
+    DYNAMODB_AGENT_TEMPLATES_TABLE_NAME: params.agentTemplatesTableName,
     COGNITO_USER_POOL_ID: params.cognitoUserPoolId,
     COGNITO_APP_CLIENT_ID: params.cognitoAppClientId,
     COGNITO_ISSUER_URL: params.cognitoIssuerUrl,
@@ -338,8 +344,19 @@ export function buildAppApiEnvironment(
     // every read 502s (ResourceNotFoundException). inference-api already sets
     // the identical trio — app-api owns the CRUD surface, so it needs them too.
     MEMORY_SPACES_ENABLED: config.memorySpaces.enabled ? 'true' : 'false',
+    // Feedback eval sampling (response-feedback spec §11 PR-4): OPT-IN per
+    // environment — the admin batch sends down-thumbed conversations' spans to
+    // an AWS-managed evaluator. The runtime log group is where those spans and
+    // the content-bearing log records live (evaluations spike §1); it is wired
+    // regardless so turning the flag on is a one-variable change.
+    FEEDBACK_EVAL_SAMPLING_ENABLED: config.feedbackEvalSampling.enabled ? 'true' : 'false',
+    AGENTCORE_RUNTIME_LOG_GROUP: params.agentCoreRuntimeLogGroupName,
     DYNAMODB_MEMORY_SPACES_TABLE_NAME: params.memorySpacesTableName,
     S3_MEMORY_SPACES_BUCKET_NAME: params.memorySpacesBucketName,
+    // Shared Projects (default ON with a kill switch per env). The table name
+    // is always wired; only PROJECTS_ENABLED gates whether the routes mount.
+    PROJECTS_ENABLED: config.projects.enabled ? 'true' : 'false',
+    DYNAMODB_PROJECTS_TABLE_NAME: params.projectsTableName,
     // Skills v2 (default ON with a kill switch per env). Skills live in the
     // shared app-roles table, which is already wired, so this only gates route
     // mounting. Cohort access is the separate `skills` RBAC capability — this
@@ -354,6 +371,10 @@ export function buildAppApiEnvironment(
     // inference-api routes. It reads and writes the same assistants table the Agent
     // surface already uses, so there is no extra wiring beyond the flag.
     AGENT_MARKETPLACE_ENABLED: config.agentMarketplace.enabled ? 'true' : 'false',
+    // Composer dictation (Transcribe Streaming via the `/dictation` WS proxy).
+    // Rides the voice ticket signing secret + replay table wired below.
+    DICTATION_ENABLED: config.dictation.enabled ? 'true' : 'false',
+    DICTATION_LANGUAGES: config.dictation.languages,
     VOICE_TICKET_REPLAY_TABLE_NAME: params.voiceTicketReplayTableName,
     VOICE_TICKET_SIGNING_SECRET_ARN: params.voiceTicketSigningSecretArn,
   };

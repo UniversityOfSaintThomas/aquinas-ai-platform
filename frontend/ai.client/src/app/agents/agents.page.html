@@ -63,6 +63,16 @@
 
           <button
             type="button"
+            (click)="onStartFromTemplate()"
+            [disabled]="loading()"
+            class="inline-flex items-center gap-2 rounded-2xl bg-white px-4 py-2.5 text-sm/6 font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset transition duration-200 hover:bg-gray-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50 dark:bg-white/10 dark:text-white dark:shadow-none dark:ring-white/5 dark:hover:bg-white/20"
+          >
+            <ng-icon name="heroSparkles" class="size-4" aria-hidden="true" />
+            Start from a template
+          </button>
+
+          <button
+            type="button"
             (click)="onCreateNew()"
             [disabled]="loading()"
             class="group inline-flex items-center gap-2 rounded-2xl bg-primary-accessible px-4 py-2.5 text-sm/6 font-semibold text-white shadow-xs transition duration-200 hover:brightness-95 hover:shadow-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
@@ -145,17 +155,17 @@
                 <span class="hidden shrink-0 text-xs/5 lowercase text-gray-400 sm:block dark:text-gray-500">{{ agent.visibility }}</span>
 
                 <div class="flex shrink-0 items-center gap-0.5">
-                  <button (click)="onChat(agent)" class="rounded-md p-1.5 text-gray-400 transition hover:bg-gray-100 hover:text-primary-600 dark:hover:bg-gray-700" [appTooltip]="'Chat'" appTooltipPosition="top">
+                  <button type="button" (click)="onChat(agent)" [attr.aria-label]="'Chat with ' + agent.name" class="rounded-md p-1.5 text-gray-400 transition hover:bg-gray-100 hover:text-primary-600 dark:hover:bg-gray-700" [appTooltip]="'Chat'" appTooltipPosition="top">
                     <ng-icon name="heroChatBubbleLeftRight" class="size-4" aria-hidden="true" />
                   </button>
-                  <button (click)="onEdit(agent)" class="rounded-md p-1.5 text-gray-400 transition hover:bg-gray-100 hover:text-primary-600 dark:hover:bg-gray-700" [appTooltip]="'Edit'" appTooltipPosition="top">
+                  <button type="button" (click)="onEdit(agent)" [attr.aria-label]="'Edit ' + agent.name" class="rounded-md p-1.5 text-gray-400 transition hover:bg-gray-100 hover:text-primary-600 dark:hover:bg-gray-700" [appTooltip]="'Edit'" appTooltipPosition="top">
                     <ng-icon name="heroPencilSquare" class="size-4" aria-hidden="true" />
                   </button>
                   @if ((agent.userPermission ?? 'owner') === 'owner') {
-                    <button (click)="onShare(agent)" class="rounded-md p-1.5 text-gray-400 transition hover:bg-gray-100 hover:text-primary-600 dark:hover:bg-gray-700" [appTooltip]="'Share'" appTooltipPosition="top">
+                    <button type="button" (click)="onShare(agent)" [attr.aria-label]="'Share ' + agent.name" class="rounded-md p-1.5 text-gray-400 transition hover:bg-gray-100 hover:text-primary-600 dark:hover:bg-gray-700" [appTooltip]="'Share'" appTooltipPosition="top">
                       <ng-icon name="heroShare" class="size-4" aria-hidden="true" />
                     </button>
-                    <button (click)="onDelete(agent)" class="rounded-md p-1.5 text-gray-400 transition hover:bg-state-danger-50 hover:text-state-danger-600 dark:hover:bg-state-danger-900/20" [appTooltip]="'Delete'" appTooltipPosition="top">
+                    <button type="button" (click)="onDelete(agent)" [attr.aria-label]="'Delete ' + agent.name" class="rounded-md p-1.5 text-gray-400 transition hover:bg-state-danger-50 hover:text-state-danger-600 dark:hover:bg-state-danger-900/20" [appTooltip]="'Delete'" appTooltipPosition="top">
                       <ng-icon name="heroTrash" class="size-4" aria-hidden="true" />
                     </button>
                   }
@@ -196,17 +206,17 @@
               <div class="mt-4 flex items-center justify-between border-t border-gray-100 pt-3 dark:border-gray-700/60">
                 <span class="text-xs/5 lowercase text-gray-400 dark:text-gray-500">{{ agent.visibility }}</span>
                 <div class="flex items-center gap-0.5">
-                  <button (click)="onChat(agent)" class="rounded-md p-1.5 text-gray-400 transition hover:bg-gray-100 hover:text-primary-600 dark:hover:bg-gray-700" [appTooltip]="'Chat'" appTooltipPosition="top">
+                  <button type="button" (click)="onChat(agent)" [attr.aria-label]="'Chat with ' + agent.name" class="rounded-md p-1.5 text-gray-400 transition hover:bg-gray-100 hover:text-primary-600 dark:hover:bg-gray-700" [appTooltip]="'Chat'" appTooltipPosition="top">
                     <ng-icon name="heroChatBubbleLeftRight" class="size-4" aria-hidden="true" />
                   </button>
-                  <button (click)="onEdit(agent)" class="rounded-md p-1.5 text-gray-400 transition hover:bg-gray-100 hover:text-primary-600 dark:hover:bg-gray-700" [appTooltip]="'Edit'" appTooltipPosition="top">
+                  <button type="button" (click)="onEdit(agent)" [attr.aria-label]="'Edit ' + agent.name" class="rounded-md p-1.5 text-gray-400 transition hover:bg-gray-100 hover:text-primary-600 dark:hover:bg-gray-700" [appTooltip]="'Edit'" appTooltipPosition="top">
                     <ng-icon name="heroPencilSquare" class="size-4" aria-hidden="true" />
                   </button>
                   @if ((agent.userPermission ?? 'owner') === 'owner') {
-                    <button (click)="onShare(agent)" class="rounded-md p-1.5 text-gray-400 transition hover:bg-gray-100 hover:text-primary-600 dark:hover:bg-gray-700" [appTooltip]="'Share'" appTooltipPosition="top">
+                    <button type="button" (click)="onShare(agent)" [attr.aria-label]="'Share ' + agent.name" class="rounded-md p-1.5 text-gray-400 transition hover:bg-gray-100 hover:text-primary-600 dark:hover:bg-gray-700" [appTooltip]="'Share'" appTooltipPosition="top">
                       <ng-icon name="heroShare" class="size-4" aria-hidden="true" />
                     </button>
-                    <button (click)="onDelete(agent)" class="rounded-md p-1.5 text-gray-400 transition hover:bg-state-danger-50 hover:text-state-danger-600 dark:hover:bg-state-danger-900/20" [appTooltip]="'Delete'" appTooltipPosition="top">
+                    <button type="button" (click)="onDelete(agent)" [attr.aria-label]="'Delete ' + agent.name" class="rounded-md p-1.5 text-gray-400 transition hover:bg-state-danger-50 hover:text-state-danger-600 dark:hover:bg-state-danger-900/20" [appTooltip]="'Delete'" appTooltipPosition="top">
                       <ng-icon name="heroTrash" class="size-4" aria-hidden="true" />
                     </button>
                   }

@@ -4,6 +4,261 @@ All notable changes to this project are documented in this file. Format follows 
 
 For narrative release notes written for operators and product owners, see [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
+## [1.25.1] - 2026-09-26
+
+A single SPA fix on top of 1.25.0, which carries this week's features. **Upgrading from 1.24.x? Follow the 1.25.0 deployment notes** (CDK deploy plus post-deploy scripts). 1.25.1 adds no steps of its own.
+
+### 🐛 Fixed
+
+- New Session reopened with the previous conversation's first message, because the empty-state composer was destroyed before its draft effect could clear the saved `composer-draft:new` (#1362)
+
+## [1.25.0] - 2026-09-25
+
+The assistant remembers more, and it is cheaper to see why. **Long-term memory reaches the model for the first time**: the relevance cut drops from 0.7 to 0.4, retrieval survives dead pooled connections, and it logs its scores. **Compaction keeps the facts that matter**: extract-then-compress is on by default, the summary model moves to Nova 2 Lite, and a truncated summary is salvaged rather than discarded. Users get **personal instructions**, **dictation**, a **redesigned compact composer**, a **context meter** that itemizes the window, and a paged sidebar. Admins get **model retirement with redirect to a successor** and drag-to-order for the model picker. **Shared Projects** lands as an in-development preview that is **off by default** (`CDK_PROJECTS_ENABLED=true` to opt in). The release also closes three channels that exported conversation text to logs and traces, stops agent deletes leaking documents and knowledge bases, and repairs managed-KB byte accounting. **A CDK deploy is required, and three post-deploy scripts should be run** (see the release notes).
+
+### 🚀 Added
+
+- **Personal instructions** — a 4,000-character setting under Settings › Chat, appended to every conversation's instructions (plain chat, agents, projects, `@`-mentions); byte-identical prompt for users who leave it empty (#1273, #1280)
+- **Dictation** — a Dictate button transcribes speech live into the composer through a ticketed app-api proxy to Amazon Transcribe Streaming (`POST /dictation/ticket`, `WS /dictation/stream`); start/stop tones. `DICTATION_ENABLED` default on with a kill switch (#1250, #1277)
+- **Context meter** — a ring beside the model picker opens an itemized breakdown of the context window (platform/agent/project/personal instructions, skills by name, tools by origin, memory, messages, free) with conversation cost and quota; computed after the model answers, nothing added before the first token (#1296, #1298)
+- **Model retirement** — `status` (active/deprecated/retired), `replacedBy`, `retiresOn` and `retirementNote` on managed models; a retired model redirects to its successor at every invocation site (chat, saved defaults, agent configs, `/chat/api-converse`), or is refused when it has none. Runbook in `docs/specs/model-retirement.md` (#1271, #1285, #1286)
+- **Admin model picker order** — drag or keyboard reordering on Manage Models (`PUT /admin/managed-models/order`); the chat picker follows it (#1248)
+- **Shared Projects (preview, off by default)** — team-owned projects with owner/editor/viewer roles, versioned settings, shared files, private and project-shared tasks, a people directory for invites, an audit trail and Activity tab, project and per-member memory spaces, and per-project cost rollups. New `{prefix}-projects` table and `ProjectSessionIndex` on sessions-metadata. Gated by `PROJECTS_ENABLED` / `CDK_PROJECTS_ENABLED` (only `true` enables) and the SPA's `features.projects` (#1253, #1257, #1258, #1259, #1261, #1265, #1267, #1269, #1270, #1275, #1276, #1280, #1284, #1293, #1294, #1328, #1344)
+- **`agent_notice` SSE event** — a project harness running without some of its tools, skills, model or memory reports what it dropped; SSE only, never in the prompt (#1258, #1276)
+- **In-app notification inbox** — a sidebar bell with unread badge (`GET /notifications`, `POST /notifications/{id}/read`, `POST /notifications/read-all`), keyed by email so invitations reach people who have never signed in (#1270, #1280)
+- **Memory Space version history and save validation** — every save keeps a readable version (`GET /memory/spaces/{id}/history`); canonical-format spaces enforce structure and an 8,000-token file cap (#1315, #1316)
+- **Platform self-service tools (preview, off by default)** — a `system`/`hidden` tool tier and account tools `whoami`, `get_my_quota`, `get_my_settings` and a confirm-before-write `set_default_model`. Opt in with `CDK_PLATFORM_SELF_SERVICE_ENABLED=true` plus the bootstrap seed (#1279, #1314, #1325)
+- **SPA compile-time feature flags** — `FEATURES` injection token, `environment.development.ts` and a `dev-deploy` build configuration selected by `SPA_BUILD_CONFIGURATION` (#1289)
+- **Operator scripts** — `repair_managed_kb_byte_counters.py`, `cleanup_orphaned_agent_rows.py` (with `--s3-prefixes`), `cleanup_stray_doc_rows.py`, `audit_user_duplicates.py`, `scripts/memory-audit/audit.py`, the offline `compaction_quality_harness.py`, and `scripts/load-test/teardown.sh --orphans` (#1247, #1263, #1291, #1301, #1311, #1320, #1331, #1347)
+
+### ✨ Improved
+
+- **Long-term memory recall** — the relevance cut moves 0.7 → 0.4 (calibrated on a labelled set: the right memory now reaches the model for 59% of realistic questions, up from 7%, at 94% precision); per-namespace score logging with no ids or text (#1292, #1349, #1350)
+- **Extract-then-compress compaction, default on** — standing instructions, decisions, identifiers and latest values are pinned verbatim ahead of the narrative summary, via two concurrent calls. Kill switch `COMPACTION_SUMMARY_EXTRACT_ENABLED=false` on the Runtime (#1335, #1355)
+- **Compaction summary model defaults to Nova 2 Lite** (was Nova Micro); `AGENTCORE_MEMORY_COMPACTION_SUMMARY_MODEL_ID` still overrides (#1334)
+- **Compact composer redesign** — no send button (Enter sends), a one-row composer in conversations with cost, context and model on a line beneath, in-text `@agent`/`/skill` highlighting, and the bound agent as a top-nav breadcrumb (#1249, #1277, #1283, #1287)
+- **Paged sidebar** — sessions load 30 at a time on scroll; one scroll region under a pinned New Session button; compact user bar (#1274)
+- **Stale-deploy recovery** — a tab left open across a frontend deploy reloads to the requested view or offers a "new version available" toast instead of failing a lazy chunk load (#1262, #1264)
+- **UI polish** — smaller agent-state orb, larger response pulse dot, compact tooltips, one-line admin model rows with Delete moved to a Danger zone (#1251, #1266, #1286, #1288)
+- **Admin user search lists every profile matching an email**, the live one first and badged (#1263)
+
+### 🐛 Fixed
+
+- **Agent instructions silently cut at ~1,400 characters** — the 8 KiB block cap was shared with the platform prompt; agent instructions now allow 100,000 characters, enforced at the API (#1272)
+- **Long-term memory retrieval lost on ~10% of turns** — a `None`-unsafe error handler discarded every namespace on a dead pooled connection; now reconnects once and caps the query at the API limit (#1338)
+- **Deleting an agent from the Agents page left its documents, S3 objects, vectors, shares and managed KB behind** — both delete routes share one full cleanup (#1301, #1331)
+- **Deleted agents and projects left managed Bedrock KBs running** — teardown is queued and completes in one worker run (#1293, #1313)
+- **Managed-KB byte caps** — deletes now refund bytes, `totalBytes` stays equal to `storedBytes + reservedBytes`, migrated corpora settle at promotion, the reconciler can list the bucket, and late writes no longer resurrect deleted `KB#`/`DOC#`/`KBTOMB#` rows or re-ingest a deleted document (#1322, #1327, #1342, #1347, #1348)
+- **Agent icon uploads were ingested as documents** and dead-lettered on managed-KB deployments (#1320)
+- **Turns that named no model ran on a hard-coded id with no catalog row** and were stored at $0 — the fallback now uses the catalog's `isDefault` model; new `UnmeteredModelCall` alarm (#1278)
+- **Compaction summaries and other side-channel calls failed silently on Claude 4.5+** (temperature and topP sent together) (#1330)
+- **A compaction summary that hit its token ceiling fell back to raw truncation** — complete lines are now salvaged, and `maxTokens` follows the model's ceiling (#1353)
+- **Parked compaction cuts waited for the paid hard-ceiling apply** because a head-of-turn save reset the gap (#1312)
+- **About 43% of compaction cuts were missing from the cost ledger**, and heuristic token splits were recorded as if native (#1337)
+- **`skills` tool results could be offloaded**, weakening skill adherence (#1309)
+- **Memory-bound agents rebuilt every turn**, and a resumed turn could drop artifact/Office/workspace tools from the cached agent (#1297)
+- **Email lookup could resolve a legacy duplicate profile** (#1263)
+- **`Failed to detach context` OpenTelemetry errors** (3–5 per turn) and mis-parented Memory/DynamoDB spans (#1357)
+- **Backup and restore skipped four tables and three buckets** (#1254)
+- **A PlatformStack update rolled back when the runtime log group did not exist yet** (#1345)
+- Accessible names on icon-only buttons on the Agents page and admin connector pages; notification bell states pass axe (#1293, #1313, #1318)
+
+### 🔒 Security
+
+- **Conversation text kept out of observability storage** — streamed model text no longer printed to runtime stdout (#1310), GenAI content capture redacted in OTEL logs (#1317), and MCP tool arguments/results no longer written to trace spans (#1326)
+- **Web-source crawler DoS** — a second crawl for an agent returns 409, and parsing and DynamoDB calls run off the event loop (#1252)
+- **Archived projects are read-only for every member**, including through `/assistants/*` (#1267)
+- **Retired dead OAuth env vars** and app-api's Secrets Manager grant on an unused secret (#1253, #1255)
+- 21 Dependabot alerts closed, including critical `anyio` GHSA-82r6-8w77-94w6 and a critical `astro` alert (#1268)
+
+### ⚡ Performance
+
+- **Native CountTokens for `global.*` profiles, off the model-call path** — accurate context breakdowns in production, and `us.*` deployments stop paying ~70 ms before each model call (#1343)
+- **Memory Space content behind its own prompt-cache point** — a memory edit no longer re-writes the static system prompt (54% less cache write on the next turn); budget now in tokens (`MEMORY_INJECTION_MAX_TOKENS`) (#1299)
+
+### ⚠️ Changed
+
+- In-development features now default **off**; `PROJECTS_ENABLED` enables only on `true`. Policy in `CLAUDE.md` → Feature Flags (#1289)
+- Assistant create/update rejects instructions over 100,000 characters with 422 (#1272)
+- `PUT /memory/spaces/{id}/entries/{slug}` returns `SaveEntryResponse` (#1316)
+- `CDK_COMPACTION_SUMMARY_EXTRACT_ENABLED` is no longer read; delete it if set (#1355)
+
+### 🏗️ Infrastructure
+
+- New `{prefix}-projects` table (`OwnerIndex`, `MemberIndex`) and `ProjectSessionIndex` GSI on sessions-metadata (#1253, #1259)
+- CloudFront access logs on the SPA distribution into a 90-day bucket; `CDK_FRONTEND_ACCESS_LOGS_ENABLED=false` opts out (#1260)
+- Daily retention sweep for every AgentCore Runtime log group generation; `CDK_OBSERVABILITY_RUNTIME_LOG_RETENTION_SWEEP_ENABLED=false` opts out (#1332, #1341, #1345)
+- RAG documents bucket expires noncurrent versions after 35 days (#1336)
+- IAM: `transcribe:StartStreamTranscriptionWebSocket` and `bedrock:CountTokens` on app-api; user-settings write on the runtime; documents-bucket read on the KB reconciler (#1250, #1316, #1325, #1348)
+- `UnmeteredModelCall` alarm and dashboard widgets (#1278); ALB unhealthy-host alarm needs a sustained 20-minute window (#1319)
+- New SSM parameters for the memory-spaces and skill-resources bucket names, used by backup tooling (#1254)
+
+### 🔧 CI/CD
+
+- `frontend-deploy.yml` and the nightly pipeline build `production` from `main` and `dev-deploy` otherwise (#1289)
+- Repo-root supply-chain tests and the restore-data script tests run on every PR (#1254, #1256)
+- npm pinned to 12.1.0; the lockfile-sync check uses it and fails when npm fails (#1304)
+
+### 📦 Dependencies
+
+- Backend: `anyio` 4.14.2 (new explicit pin), `soupsieve` 2.8.4 → 2.9.0
+- Frontend: `@angular/*` 21.2.19 → 21.2.20, `vitest` / `@vitest/coverage-v8` 4.1.5 → 4.1.11, `sharp` 0.33.0 → 0.35.4
+- Docs site: `astro` 7.1.3 → 7.2.8, `sharp` 0.35.3 → 0.35.4
+- Load tests: `pytest` 8.4.2 → 9.0.3
+
+### 📚 Docs
+
+- Shared Projects user and admin guides (#1281); model retirement runbook (#1271); memory baseline decision record (#1291, #1321, #1350)
+
+## [1.24.0] - 2026-09-22
+
+Admins get a say over the toolset, and everyone gets a clearer view of what things cost. **Admin-managed always-on tools** pin a tool into every granted user's turn, enforced server-side and shown as locked in the picker, with no effect on deploy until an admin flags a tool. **Tool retirement** gains a staged runbook, one-way picker guards, and a replacement note plus stop date shown on five surfaces. The cost surfaces fill in: users now see their **quota limit** next to their spend, the session cost badge **counts up** each turn, and the admin cost dashboard is **tabbed** and can report **all-in platform cost from the AWS bill** (opt-in). **Unsent composer state is kept per conversation**, agents gain **per-agent citation and download controls**, and **Kimi K3** joins the catalog. Two fixes matter more than their size: the **tool-result offloader shipped in 1.23.0 had never run** and now does, and **Cognito self-signup now defaults to closed**. **A CDK deploy is required**, and in any environment that has not set `CDK_COGNITO_SELF_SIGNUP_ENABLED` this deploy closes public self-registration.
+
+### 🚀 Added
+
+- **Admin-managed always-on tools** — a catalog flag (`alwaysOn`, per tool or per `MCPToolEntry`) that pins a tool into every turn for users whose roles grant it. Enforced server-side at the same seam as attachment auto-enable, so the main turn, MCP App dispatch and voice compute the same toolset; it enables and never grants. An Agent that binds its own toolset is exempt; an unbound Agent is not. Gated by `ADMIN_ALWAYS_ON_TOOLS_ENABLED` (default on with a kill switch) (#1215, #1217, #1220, #1223, #1227, #1229, #1231)
+- **Locked always-on tools in the user's tool picker** — `GET /tools` carries the effective lock; a stored opt-out is kept but not honoured while the pin is in force, and a preference `PUT` that contradicts a pin is normalized rather than rejected (#1226)
+- **MCP server retirement** — a staged runbook (`docs/specs/mcp-server-retirement.md`) and picker guards on six surfaces: a retiring tool can be turned off but not on, and nothing is filtered out of any list (#1230)
+- **Retirement replacement and stop date** — `retirementNote` (≤300 chars) and `retiresOn` (validated ISO date) on the tool record, rendered as one shared sentence across the Agent Designer, Customize → Tools, the tool detail page and the scheduled-run form. Display-only; neither reaches `toolConfig` (#1237)
+- **Quota limit shown with usage** — read-only `GET /costs/quota-status` (caller-scoped, records no enforcement events), a quota progress bar on the Usage page for every period, and a quota tooltip on the composer cost counter (#1210)
+- **All-in platform cost on the admin dashboard** — a daily Cost Explorer sync writes `PLATFORM#*` rows into the existing system cost rollup table, scoped to this deployment by the `Project` tag, falling back to account scope and labelling it as such. Opt-in via the `CDK_PLATFORM_COSTS_ENABLED` GitHub variable or `platformCosts.enabled` context (#1235, #1245)
+- **Per-agent source citations and document download** — `showCitations` and `allowDocumentDownload` on the agent record, both default `true` with no migration. Citations off suppresses the SSE event and its persistence; the download endpoint 403s unless both are on (#1240)
+- **Kimi K3** curated on `bedrock-responses`, with explicit prompt caching required per model — its default implicit caching measured 25% more expensive than no caching at all (#1212)
+- **Unsent composer state kept per conversation** — text, the bound `@`-mention, unarmed queued follow-ups and attachments are saved in `localStorage` per conversation and restored on return; attachments reconcile against the server before they are trusted. Cleared on sign-out and wiped at sign-in when the owner differs (#1228)
+
+### ✨ Improved
+
+- **Tabbed admin cost analytics** — Model Usage, Cost Trends, Top Users and Conversations each get the full console width; the period KPIs stay pinned above the tabs (#1235)
+- **The admin console takes over the sidenav** — admin navigation replaces the chat list in the sidebar, and admin pages drop the `max-w-7xl` cap, driven by `data.chrome: 'admin'` on the route (#1232)
+- **Agent Composer tools as a searchable, category-grouped list** instead of a chip cloud; descriptions visible, per-tool scoping nested under its own row (#1233)
+- **Session cost badge counts up** to each turn's new total; reduced motion snaps (#1234)
+- **Quota warning and cost badge share one row** above the composer, and dismissing a warning holds until a higher threshold fires, across reloads and new conversations (#1243)
+- **Model-family logos** (Claude, Kimi, Qwen) preferred over company marks, matched on `modelId` (#1238)
+- **Context window reconciled against Strands' model table** — the catalog value wins, Strands fills an absence, and a disagreement is logged. Both the context badge and the compaction policy now read one resolver (#1221)
+
+### 🐛 Fixed
+
+- **The tool-result offloader never offloaded anything.** An undecorated override hid Strands' `@hook` registration, so `BoundedToolResultOffloader` published `retrieve_offloaded_content` every turn but never saw a tool result. One production session carried a 107,802-token calendar result for 15 calls, about 75% of its cost (#1239)
+- **Browsing failed permanently after a sign-in handback** — the service closes the CDP socket when the automation stream is disabled, and the pool kept returning the dead socket. It now reconnects to the session the user signed into (#1208)
+- **Managed-KB retrieval returned duplicate content** to both the model and the citation cards; repeated sentences within a chunk and near-duplicate chunks are now removed at answer time (#1241)
+- **Managed-KB citations read "Unknown Source"** — the builder now reads `metadata["filename"]` before `source` (#1240)
+- **Attaching an image or spreadsheet injected `document_read`** and re-wrote the prompt-cache prefix, sometimes flapping per microVM. The gate now classifies the turn's uploads (#1218)
+- **Broken thumbnails for files with non-ASCII names** (e.g. macOS screenshots) — S3 rejected the `response-content-disposition`. A shared RFC 6266/5987 header builder now serves three call sites (#1214)
+- **Changing a quota assignment's tier returned 400** (#1225)
+- **Context attribution reported unstable tool token counts** on `bedrock-responses`/mantle models, where token counting is a heuristic; the split is now withheld there (#1216)
+- **`prefixTokens` splits larger than the prompt they sit inside** are dropped rather than rendered (#1222)
+- **A partial tool update could persist an incoherent `alwaysOn`/`enabledByDefault` pair** — patched state is now re-validated before persisting (#1231)
+- **`asyncio.get_event_loop()` raised on Python 3.12** in the external-MCP tool build when no loop was running (#1213)
+
+### 🔒 Security
+
+- **Cognito self-signup defaults to closed**, set by `CDK_COGNITO_SELF_SIGNUP_ENABLED` (only an explicit `true` opens it). The runtime `disable_self_signup()` call is removed: CDK re-rendered the setting on every deploy, so it never held. First-boot (`AdminCreateUser`) and federated sign-in are unaffected (#1211)
+
+### 🏗️ Infrastructure
+
+- **New `PlatformCostSyncConstruct`** — Lambda + daily EventBridge rule (07:10 UTC) with `ce:GetCostAndUsage` / `ce:GetDimensionValues`, created only when `platformCosts.enabled` is true (#1235)
+- **app-api ECS tasks now receive the service's tags** (`propagateTags: SERVICE`), so Fargate appears in tag-scoped cost queries (#1235)
+- **Cognito user pool `selfSignUpEnabled` read from config** (#1211)
+
+### 🔧 CI/CD
+
+- **Deploy runs pushed out of the shared concurrency group are re-dispatched** — a `recover-evicted-peer` job in `platform.yml` and `backend.yml` finds a peer run cancelled before it ran any jobs and dispatches it again (#1224)
+- **CSP tests** now cover the `/api/*` edge policy's `sandbox` omission and the artifact CSP parity between the edge and the render Lambda (#1219)
+- **`platform.yml` forwards `CDK_PLATFORM_COSTS_ENABLED`** — the variable `config.ts` reads for platform cost sync was never passed to the CDK deploy, so setting it in GitHub had no effect (#1245)
+
+### 📚 Docs
+
+- **Shared Projects implementation plan** (`docs/specs/shared-projects.md`) — spec only (#1242)
+- **Kaizen**: POC comment loop retired, quality vetoes waived with written triggers (#1221)
+
+## [1.23.0] - 2026-09-20
+
+The agent stops working in silence, and stops paying to re-read what it already knows. **Live turn narration** replaces the cycling placeholder with what the agent is actually doing — thinking, which tool is running, how long it took, and a one-line model-written summary of each tool batch — drained concurrently so "Using list_assignments" arrives *while* that tool runs rather than after it. **Document context offload** stops an attached PDF being re-sent on every turn: a digest replaces the bytes and a `document_read` tool pulls back the pages the model actually asks for, measured on a 60-page canary at a **109.1K → ~15K prefix drop**. A five-part **compaction overhaul** makes thresholds model-relative, bounds the summary at 8k tokens, parks cuts until the re-write is free, and offloads oversized tool results at intake. **Browser sign-in handover** lets the agent pause and hand the user a live, interactive browser to sign in to a site it cannot reach, then continue in the authenticated session — gated behind its own RBAC tool id and a MANAGED Chromium URL blocklist. **Response feedback** ships thumbs, retry-with-correction, implicit copy/continue signals and fleet-level attribution by config arm. Plus **.docx / .pptx / .csv / .xlsx previews** in a docked pane, **Agent Templates**, and a performance pass worth ~500ms off the pre-stream window. **A CDK deploy is required**, and operators who use the browser tool must set `CDK_BROWSER_URL_BLOCKLIST`.
+
+### 🚀 Added
+
+- **Browser sign-in handover (`request_user_login`)** — the agent pauses the turn and hands the user a live, interactive browser to sign in to a site it cannot reach, then continues in the authenticated session. New `browser_login_required` SSE event; the interrupt is raised by the tool itself via `ToolContext`, so the `PausedTurnSnapshot`, resume route and `PendingInterrupt` breadcrumb need no special case. While the user holds the browser the automation stream is `DISABLED` at the service, so the agent provably cannot act. Gated by `BROWSER_TAKEOVER_ENABLED` **and** its own catalog entry (`enabledByDefault: false`) (#1177, #1183)
+- **Live-view viewer with no third-party code** — DCV streamed into a first-party viewer page. The event deliberately carries **no URL**: `generate_live_view_url` signs with SigV4 query auth and caps at 300s, so app-api mints one per request instead, and `assert_no_url` enforces that on the interrupt, the event and the persisted row (#1178, #1186, #1189, #1190, #1196, #1199, #1200, #1203)
+- **MANAGED Chromium URL blocklist** — a per-environment hostname blocklist applied as a browser-session policy, so a human holding the browser cannot navigate to a system the agent must not act inside (#1180, #1181, #1202)
+- **Document context offload** — `document_read` tool, `DocumentDigest` built at upload and persisted on `FileMetadata`, restore rehydrating stripped documents as digests, and live offload of unpinned documents once the re-write is free. Gated by `DOCUMENT_READ_ENABLED` / `DOCUMENT_OFFLOAD_ENABLED`, bucketed by `DOCUMENT_OFFLOAD_ROLLOUT_PERCENT` (#1137, #1138, #1139, #1140, #1143)
+- **Per-call context ledger** — prefix split (system / tools / messages), window trims and compaction events on every `C#` cost row, surfaced through the admin cost drill-down (#1130)
+- **Model-relative compaction thresholds** — floor-seeking cut with hysteresis, replacing fixed token ceilings that scaled wrong across models (#1129)
+- **Bounded compaction summary + per-cut metrics** — summary capped at 8k tokens (#1131)
+- **Deferred compaction apply** — cuts are parked post-turn and applied in place when the prefix re-write is free (#1132)
+- **Tool-result offload at intake** — oversized tool results go to S3 with a text preview in context, `document_read` exempt (#1133)
+- **Selective 1h prompt-cache TTL on the static prefix**, behind a flag and priced honestly against the 2× write premium (#1134)
+- **Live turn narration (`agent_status`)** — `thinking` / `tool_start` / `tool_end` phases with Strands' own measured durations, drained concurrently with the agent stream so a status line lands while its tool is running. Deliberately no "responding" phase, and durations are live-only, never persisted (#1160, #1165)
+- **Model-written tool-batch summaries (`tool_group_summary`)** — a Nova Micro side-channel task, structured like `session_title`: its own call on its own messages, so it never appends to the conversation or the cacheable prefix. Persisted as `TSUM#` rows and replayed on `GET /messages` (#1161)
+- **Thinking time and turn recap** — how long the model spent thinking, and how long a finished turn took, shown in the loader's slot on the latest turn only (#1157, #1170, #1174)
+- **Response feedback** — content-free thumbs on assistant messages joined to cost rows (`F#` rows), six reason buckets, and an explicit/implicit signal discriminator (#1142, #1146)
+- **Retry-with-correction** — the consequence behind a thumbs down (#1148)
+- **Implicit feedback signals** — copy and continue as unweighted positive signals (#1151)
+- **Eval sampling** — down-thumbed turns feed AgentCore Evaluations. Opt-in at both CDK and runtime (`FEEDBACK_EVAL_SAMPLING_ENABLED`), because it sends real conversations to an AWS-managed judge (#1153)
+- **Fleet-level feedback attribution** — down-thumb rate by config arm (model, tools, skills), plus a down-thumb reason split on the per-session profile (#1152, #1159)
+- **File previews in a docked pane** — `.docx` and `.pptx` (uploaded or generated), `.csv` as a data grid, and `.xlsx` read server-side with openpyxl. The preview pane opens on a file the turn just created (#1119, #1121, #1122, #1123, #1136)
+- **Agent Templates** — create-form prefill backed by an admin-managed template store (#1149)
+- **Spreadsheet Analysis auto-enables** for a session that holds a spreadsheet, so an uploaded `.xlsx` is answerable without the user finding the toggle (#1163)
+- **Turn-latency observability construct** — EMF metrics decomposing the pre-stream window into named stages (#1184, #1201)
+
+### ✨ Improved
+
+- **gzip on app-api JSON responses**, with SSE passed through un-buffered (#1125, #1127)
+- **Spreadsheet previews show ten times the rows** and the scroller is no longer frozen (#1124)
+- **Copy and thumbs reveal on response hover** rather than occupying the transcript permanently (#1179)
+- **Agent-state orb** gains a halo and settles on finished turns (#1182)
+- **Attachment turn guard** holds a turn's inline attachments to the AgentCore Memory event quota (#1145)
+
+### 🐛 Fixed
+
+- **KaTeX swallowed the prose between two currency amounts** — `$4.50 … $9.00` rendered as math. The earlier HTML-entity workaround never worked and leaked `&#36;` into generated files; both are removed (#1128, #1135)
+- **A new frontend build was not actually served** — the deploy sent no `Cache-Control`, so CloudFront served the old bundle from cache. Hashed filenames do not save you when `index.html` itself is stale (#1197)
+- **The system-prompt date line carried the hour**, re-writing the prompt-cache prefix every hour for the life of every session (#1126)
+- **Deleted conversations were invisible to the admin cost drill-down**, so a user's costs did not reconcile (#1120)
+- **`documentTokens` understated PDFs by ~14×** — `bytes/4` ignores that Bedrock dual-encodes each PDF page as an image on top of the text layer. Every analytic built on it was low by that factor (#1144)
+- **`DOCUMENT_READ_ENABLED=false` left the other two paths running**, so pulling the kill switch still evicted bytes and emitted handles for a tool that was not injected (#1147)
+- **ReDoS in `document_read` pattern mode** — a valid but catastrophic regex ran unbounded. Two defences: a structural `catastrophic_pattern` check that degrades to literal search, and a scan budget (#1147)
+- **Synth now fails when the uploads bucket would have no CORS rule** — a truthy-but-empty origin list synthesised green with no rule at all (#1166, #1172)
+- **The tool/skill lists are awaited before a chat turn is assembled**, closing a first-turn race that re-wrote the prompt-cache prefix (#1168)
+- **Browser policy fixes** — MANAGED was being sent at session level (breaking every session), the policy object key was double-prefixed, and the caller needed read on the policy object (#1173, #1175, #1176, #1183)
+- **`state-*` colour steps that failed AA** in light mode for file-type chips and success text (#1118, #1119)
+
+### ⚠️ Changed
+
+- **The browser URL blocklist ships empty and is supplied per environment.** It was hardcoded to `instructure.com`, and `platform.yml` never forwarded `CDK_BROWSER_URL_BLOCKLIST` — so the list was effectively unconfigurable through the deploy pipeline and every fork inherited one institution's policy. **Set the variable for any environment that needs a blocklist**; the synth log prints the list or warns when it is empty (#1205)
+- **`list_spreadsheets` and `analyze_spreadsheet` are now seeded.** They were catalogued but never written to the tool-catalog table, so a fresh deployment could not grant them to any role (#1205)
+
+### ⚡ Performance
+
+- **~500ms off the pre-stream window.** The session row was read **eight times** per turn — 445ms of a 455ms stage (#1191). boto3 clients rebuilt per call cost 21ms, ~20% of the remaining warm preamble (#1198). Quota now takes session cost from the row the preamble already read (#1193)
+- **Bytecode precompiled in the app-api, inference-api and Lambda images** — `uv` does not compile by default, unlike `pip`, so first-touch import was paid at runtime (#1155, #1169)
+- **CountTokens bounded on the reply path**, and the model id is no longer swapped mid-call; a throttle now costs one failed request instead of a 5.8s stall (#1158)
+- **Long-term memory retrieved through a bounded client**, and the session's own summary is no longer re-fetched per message (#1164)
+- **Agent cache extended to four more tool families**, and spreadsheet-analysis sessions are cached by carrying `assistant_id` in the key (#1156, #1162)
+- **mermaid lazy-loaded** out of the eager scripts bundle (#1119)
+- **app-api and inference-api ship code root-owned**, and app-api no longer ships `/app` twice (#1167, #1171)
+
+### 🔒 Security
+
+- **No test reaches AWS.** 25 test cases across 6 files were making real authenticated AWS calls, hidden by fail-open error handling. An off-box socket guard now blocks them, and the quarantine is burned down — the suite also runs in half the time (#1154, #1157)
+
+### 🏗️ Infrastructure
+
+- **New `browser-policy-construct`** — S3-backed MANAGED Chromium policy object for browser sessions, with `ConnectBrowserLiveViewStream` granted on `*` as AWS requires (#1180, #1194)
+- **New `turn-latency-observability-construct`** — EMF metrics for the decomposed pre-stream stages (#1184)
+- **New `agent-templates` table** — no GSIs (#1149)
+- **`connect-src` allows `data:`/`blob:` in the MCP sandbox CSP** so DCV can load its decoder (#1192)
+- **The Platform Stack deploy triggers on the assets it actually deploys** (#1187)
+
+### 📦 Dependencies
+
+- Backend: `openpyxl` 3.1.5 (new — server-side `.xlsx` reading)
+- Frontend: `docx-preview` 0.4.0, `pptx-preview` 1.0.7 (new), `echarts` stubbed via a local shim
+
+### 🔧 CI/CD
+
+- **Off-box socket guard** in `tests/conftest.py`, with tiktoken warmed before the guard arms (#1154, #1157)
+- **Seed/catalog parity test** — every tool in `TOOL_CATALOG` must have a row in `seed_bootstrap_data.py` (#1205)
+
 ## [1.22.0] - 2026-09-14
 
 The agent can stop guessing. **Clarifying questions** ship end to end: when a request is genuinely ambiguous the agent pauses the turn, the SPA renders a multiple-choice picker in the transcript, and the answer resumes that same tool call — surviving a page refresh. The tool worked from PR-2 but the model reached for it 4 times in 24 ambiguous requests; a measured system-prompt clause takes that to 24/24 while leaving clear requests at 0/18. On the admin side, the **cost drill-down** closes the gap between "top users by cost" and the per-session anatomy: an admin walks user → conversations → session profile with 15 diagnosis rules, a context trajectory chart and a copyable diagnostic JSON — all **content-free by construction**, enforced by a denylist test and a moto test that seeds content and proves none returns. Two silent data bugs are fixed: deleting a knowledge-base document mid-upload **permanently leaked its byte reservation**, and born-managed provisioning **mistook an established legacy agent for a new one** and stranded its corpus. And an `@`-mention now **binds the conversation** instead of borrowing one turn — measured on prod, 247 of 247 mentions started the conversation, so the borrow was paying an invisible tool-loss failure for a case that has never occurred. **No CDK deploy required.** One operator step: enable the Clarifying Questions tool in each existing environment's catalog — the seed skips a tool row that already exists.

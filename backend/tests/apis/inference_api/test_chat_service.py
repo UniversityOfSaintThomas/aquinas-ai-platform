@@ -548,3 +548,296 @@ class TestInjectedToolCacheEligibility:
             )
 
         assert mentioned.agent.messages, "the second live Agent forked the conversation"
+
+
+def test_adopting_the_conversation_also_adopts_the_compaction_offset(monkeypatch):
+    """The live list's coordinate system travels with it (thresholds spec §3.5).
+
+    Compaction expresses its checkpoint as ``_live_offset + index into the
+    list`` and the pending-cut apply slices the list in place at that offset,
+    so an instance that adopts another instance's list must adopt its offset.
+    """
+    live_inner = SimpleNamespace(messages=[{"role": "user", "t": 1}, {"role": "assistant", "t": 2}])
+    live_wrapper = SimpleNamespace(agent=live_inner, session_manager=SimpleNamespace(_live_offset=7))
+    monkeypatch.setattr(service, "_agent_cache", {("s", "key-a"): live_wrapper})
+
+    fresh_inner = SimpleNamespace(messages=[{"role": "user", "t": 1}])
+    fresh = SimpleNamespace(agent=fresh_inner, session_manager=SimpleNamespace(_live_offset=0))
+
+    service._adopt_session_conversation(fresh, "s")
+
+    assert fresh.agent.messages is live_inner.messages
+    assert fresh.session_manager._live_offset == 7
+
+
+def test_create_cache_key_includes_assistant_id():
+    """Spreadsheet-analysis tools close over the assistant, so two assistants
+    must not share a cache slot; no assistant hashes to a stable empty element
+    so pre-field keys are unchanged."""
+    base = dict(
+        session_id="s",
+        user_id="u",
+        enabled_tools=["analyze_spreadsheet"],
+        model_id="m",
+        inference_params={},
+        system_prompt=None,
+        caching_enabled=False,
+        provider="bedrock",
+        freshness_hash="f",
+        agent_type="chat",
+    )
+    k_a = service._create_cache_key(**base, assistant_id="asst-a")
+    k_b = service._create_cache_key(**base, assistant_id="asst-b")
+    k_none = service._create_cache_key(**base)
+    assert k_a != k_b
+    assert k_a != k_none
+    assert "asst-a" in k_a
+    assert "" in k_none and "asst-a" not in k_none
+    # skills_hash stays the trailing element (other tests index it as [-1]).
+    assert k_none[-1] == ""
+
+
+@pytest.mark.asyncio
+async def test_assistant_id_is_stamped_on_the_construction_snapshot(
+    mock_create_agent, mock_freshness_hash
+):
+    agent = await service.get_agent(
+        session_id="s1", user_id="u1", is_resume=False, assistant_id="asst-a"
+    )
+    assert agent._construction_snapshot["assistant_id"] == "asst-a"
+
+    bare = await service.get_agent(session_id="s2", user_id="u1", is_resume=False)
+    assert bare._construction_snapshot["assistant_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_resume_replays_assistant_id_onto_the_same_slot(
+    mock_create_agent, mock_freshness_hash
+):
+    """A spreadsheet turn against an assistant pauses; resume feeds the
+    snapshot's assistant_id back and must land on the paused agent. A
+    different assistant (or none) must NOT."""
+    first = await service.get_agent(
+        session_id="s1",
+        user_id="u1",
+        enabled_tools=["analyze_spreadsheet"],
+        extra_tools=[object()],
+        extra_tools_key_described=True,
+        is_resume=False,
+        assistant_id="asst-a",
+    )
+    first.agent._interrupt_state.activated = True
+    replay = first._construction_snapshot["assistant_id"]
+
+    same = await service.get_agent(
+        session_id="s1",
+        user_id="u1",
+        enabled_tools=["analyze_spreadsheet"],
+        is_resume=True,
+        assistant_id=replay,
+    )
+    assert same is first
+    assert mock_create_agent.call_count == 1
+
+    other = await service.get_agent(
+        session_id="s1",
+        user_id="u1",
+        enabled_tools=["analyze_spreadsheet"],
+        is_resume=True,
+        assistant_id="asst-b",
+    )
+    assert other is not first
+    assert mock_create_agent.call_count == 2
+
+
+class TestProjectMemoryCacheKey:
+    """Shared Projects 2.4b: a project harness's scope-addressed memory tools.
+
+    They close over the project and its two space ids, which reach the key
+    through the same ``memory_binding`` element in a second shape. The 2.1
+    binding digest must not move, or every memory-bound Agent misses once.
+    """
+
+    SCOPES = {"projectId": "prj_1", "sharedSpaceId": "spc_shared", "personalSpaceId": None}
+
+    def test_the_agent_binding_digest_is_unchanged(self):
+        # md5(json.dumps(["spc_1", "Brain", "readwrite"]))[:8], as 2.1 shipped it.
+        assert service.memory_binding_digest(
+            {"spaceId": "spc_1", "spaceName": "Brain", "access": "readwrite"}
+        ) == "2f6a3184"
+
+    def test_the_project_digest_separates_project_and_both_spaces(self):
+        d = service.memory_binding_digest
+        base = d(self.SCOPES)
+        assert base and base == d(dict(self.SCOPES))
+        assert base != d({**self.SCOPES, "projectId": "prj_2"})
+        assert base != d({**self.SCOPES, "sharedSpaceId": None})
+        assert base != d({**self.SCOPES, "personalSpaceId": "spc_mine"})
+
+    def test_the_shapes_cannot_collide(self):
+        d = service.memory_binding_digest
+        as_binding = {"spaceId": "prj_1", "spaceName": "spc_shared", "access": None}
+        assert d(as_binding) != d(self.SCOPES)
+
+    @pytest.mark.asyncio
+    async def test_a_harness_turn_caches_and_a_new_personal_space_misses(
+        self, mock_create_agent, mock_freshness_hash
+    ):
+        common = dict(session_id="s", user_id="u", extra_tools=[object()], extra_tools_key_described=True)
+        first = await service.get_agent(**common, memory_binding=self.SCOPES)
+        assert await service.get_agent(**common, memory_binding=dict(self.SCOPES)) is first
+        after_save = await service.get_agent(
+            **common, memory_binding={**self.SCOPES, "personalSpaceId": "spc_mine"}
+        )
+        assert after_save is not first
+        assert mock_create_agent.call_count == 2
+
+
+class TestMemoryBindingCacheKey:
+    """Shared Projects 2.1: agents bound to a Memory Space are cacheable.
+
+    The memory tools close over the resolved binding (space id, name, access),
+    so it is a key element instead of a cache veto. A resume replays it from
+    ``PausedTurnSnapshot`` and never populates the slot.
+    """
+
+    RW = {"spaceId": "space-1", "spaceName": "Team notes", "access": "readwrite"}
+
+    def test_the_digest_separates_space_name_and_access(self):
+        d = service.memory_binding_digest
+        assert d(None) == "" and d({}) == ""
+        assert d(self.RW) == d(dict(self.RW))
+        assert d(self.RW) != d({**self.RW, "spaceId": "space-2"})
+        assert d(self.RW) != d({**self.RW, "access": "read"})
+        assert d(self.RW) != d({**self.RW, "spaceName": "Renamed"})
+
+    def test_the_key_carries_the_binding_without_moving_other_elements(self):
+        base = dict(
+            session_id="s", user_id="u", enabled_tools=None, model_id="m",
+            inference_params={}, system_prompt=None, caching_enabled=False,
+            provider="bedrock", freshness_hash="f", agent_type="chat",
+        )
+        bound = service._create_cache_key(**base, memory_binding="abc123", skills_hash="k")
+        unbound = service._create_cache_key(**base, skills_hash="k")
+        assert bound != unbound
+        assert bound[-4] == "abc123" and unbound[-4] == ""
+        assert bound[-1] == "k"
+        assert bound[:-4] == unbound[:-4] and bound[-3:] == unbound[-3:]
+
+    @pytest.mark.asyncio
+    async def test_a_memory_bound_turn_caches_and_the_next_turn_hits(
+        self, mock_create_agent, mock_freshness_hash
+    ):
+        kwargs = dict(
+            session_id="s", user_id="u", extra_tools=[object()],
+            extra_tools_key_described=True, memory_binding=self.RW,
+        )
+        first = await service.get_agent(**kwargs)
+        second = await service.get_agent(**kwargs)
+        assert second is first
+        assert mock_create_agent.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_changed_binding_misses(self, mock_create_agent, mock_freshness_hash):
+        common = dict(session_id="s", user_id="u", extra_tools=[object()], extra_tools_key_described=True)
+        rw = await service.get_agent(**common, memory_binding=self.RW)
+        downgraded = await service.get_agent(**common, memory_binding={**self.RW, "access": "read"})
+        unbound = await service.get_agent(**common, memory_binding=None)
+        assert downgraded is not rw and unbound is not rw and unbound is not downgraded
+        assert mock_create_agent.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_resume_replays_the_binding_onto_the_paused_agent(
+        self, mock_create_agent, mock_freshness_hash
+    ):
+        first = await service.get_agent(
+            session_id="s1", user_id="u1", extra_tools=[object()],
+            extra_tools_key_described=True, memory_binding=self.RW,
+        )
+        assert first._construction_snapshot["memory_binding"] == self.RW
+        first.agent._interrupt_state.activated = True
+
+        resumed = await service.get_agent(
+            session_id="s1", user_id="u1", is_resume=True, cache_write=False,
+            memory_binding=first._construction_snapshot["memory_binding"],
+        )
+        assert resumed is first
+        assert mock_create_agent.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_resume_miss_never_seeds_the_slot_the_next_turn_hits(
+        self, mock_create_agent, mock_freshness_hash
+    ):
+        # The paused agent was evicted; resume rebuilds without injected tools.
+        resumed = await service.get_agent(
+            session_id="s1", user_id="u1", is_resume=True, cache_write=False,
+            memory_binding=self.RW,
+        )
+        # The next plain turn (same key) must build its own, fully-tooled agent.
+        plain = await service.get_agent(
+            session_id="s1", user_id="u1", extra_tools=[object()],
+            extra_tools_key_described=True, memory_binding=self.RW,
+        )
+        assert plain is not resumed
+        assert mock_create_agent.call_count == 2
+
+
+def test_paused_turn_snapshot_round_trips_the_memory_binding():
+    from apis.shared.sessions.models import PausedTurnSnapshot
+
+    binding = {"spaceId": "space-1", "spaceName": "Team notes", "access": "read"}
+    snap = PausedTurnSnapshot(
+        memory_binding=binding, captured_at="2026-01-01T00:00:00+00:00",
+        expires_at="2026-01-01T01:00:00+00:00",
+    )
+    dumped = snap.model_dump(by_alias=True)
+    assert dumped["memoryBinding"] == binding
+    assert PausedTurnSnapshot.model_validate(dumped).memory_binding == binding
+    legacy = {k: v for k, v in dumped.items() if k != "memoryBinding"}
+    assert PausedTurnSnapshot.model_validate(legacy).memory_binding is None
+
+
+class TestMemoryContextCacheKey:
+    """Shared Projects 2.2: the memory block is no longer inside system_prompt,
+    so the key folds it into the prompt hash; resume replays it."""
+
+    BASE = dict(
+        session_id="s", user_id="u", enabled_tools=None, model_id="m",
+        inference_params={}, system_prompt="PROMPT", caching_enabled=False,
+        provider="bedrock", freshness_hash="f", agent_type="chat",
+    )
+
+    def test_no_memory_hashes_exactly_as_before(self):
+        import hashlib
+
+        key = service._create_cache_key(**self.BASE)
+        assert hashlib.md5(b"PROMPT").hexdigest()[:8] in key
+
+    def test_a_memory_edit_changes_the_key(self):
+        a = service._create_cache_key(**self.BASE, memory_context="index v1")
+        b = service._create_cache_key(**self.BASE, memory_context="index v2")
+        none = service._create_cache_key(**self.BASE)
+        assert len({a, b, none}) == 3
+
+    @pytest.mark.asyncio
+    async def test_memory_context_reaches_the_agent_factory(self, mock_create_agent, mock_freshness_hash):
+        await service.get_agent(session_id="s", user_id="u", system_prompt="P", memory_context="MEM")
+        assert mock_create_agent.call_args.kwargs["memory_context"] == "MEM"
+        await service.get_agent(session_id="s2", user_id="u", system_prompt="P")
+        assert "memory_context" not in mock_create_agent.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_resume_with_the_snapshot_memory_hits_the_paused_agent(
+        self, mock_create_agent, mock_freshness_hash
+    ):
+        first = await service.get_agent(session_id="s1", user_id="u1", system_prompt="P", memory_context="MEM")
+        first.agent._interrupt_state.activated = True
+        resumed = await service.get_agent(
+            session_id="s1", user_id="u1", system_prompt="P", memory_context="MEM",
+            is_resume=True, cache_write=False,
+        )
+        assert resumed is first
+        stale = await service.get_agent(
+            session_id="s1", user_id="u1", system_prompt="P", is_resume=True, cache_write=False,
+        )
+        assert stale is not first

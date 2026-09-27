@@ -14,6 +14,7 @@ from agents.main_agent.core import ModelConfig, SystemPromptBuilder, AgentFactor
 from agents.main_agent.session import SessionFactory
 from agents.main_agent.session.hooks import (
     AgentStatusHook,
+    ContextLedgerHook,
     ToolCensusHook,
     DisplayTextHook,
     SteeringHook,
@@ -31,6 +32,8 @@ from agents.main_agent.tools import (
 from agents.main_agent.multimodal import PromptBuilder
 from agents.main_agent.streaming import StreamCoordinator
 from apis.shared.tools.scoped_ids import base_tool_id
+
+from apis.shared.observability.build_stages import mark_stage
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +72,15 @@ class BaseAgent(ABC):
         mantle_region: Optional[str] = None,
         skip_persistence: bool = False,
         extra_tools: Optional[List[Any]] = None,
+        memory_context: Optional[str] = None,
     ):
         """
         Initialize base agent with shared infrastructure.
+
+        ``memory_context`` is the rendered Memory-Space block (reference data,
+        not instructions). It is kept apart from ``system_prompt`` so it lands
+        OUTSIDE the ``<user_instructions>`` wrapper and behind its own prompt
+        cache point (Shared Projects 2.2).
 
         Args:
             session_id: Session identifier for message persistence
@@ -95,6 +104,7 @@ class BaseAgent(ABC):
         self.auth_token = auth_token
         self.enabled_tools = enabled_tools
         self.extra_tools = extra_tools or []
+        self.memory_context = memory_context or None
         self.agent = None
 
         # Merge legacy temperature/max_tokens into the canonical dict. Explicit
@@ -158,6 +168,13 @@ class BaseAgent(ABC):
         # restored from AgentCore Memory regardless, so the model still sees
         # prior turns; only the system-prompt date line shifts.
         self._construction_snapshot["system_prompt"] = system_prompt
+        # A cache-key component too (hashed with the prompt), so resume must
+        # replay it verbatim.
+        self._construction_snapshot["memory_context"] = self.memory_context
+
+        # Sub-stages of `agent_build` (docs/specs/turn-latency-preamble.md).
+        # A no-op unless the inference-api turn path installed a recorder.
+        mark_stage("prompt")
 
         # Initialize tool registry and filter
         self.tool_registry = create_default_registry()
@@ -165,6 +182,7 @@ class BaseAgent(ABC):
 
         # Register external MCP tool IDs from enabled tools
         self._register_external_mcp_tools()
+        mark_stage("registry")
 
         # Initialize gateway integration
         self.gateway_integration = GatewayIntegration()
@@ -176,12 +194,16 @@ class BaseAgent(ABC):
         self.session_manager = SessionFactory.create_session_manager(
             session_id=session_id, user_id=self.user_id, caching_enabled=self.model_config.caching_enabled
         )
+        # Conversation restore from AgentCore Memory happens in here, so this
+        # is a prime suspect for the cold build and has never been timed.
+        mark_stage("session_mgr")
 
         # Initialize streaming coordinator
         self.stream_coordinator = StreamCoordinator()
 
         # Create the agent (subclass-specific)
         self._create_agent()
+        mark_stage("finalize")
 
     @abstractmethod
     def _create_agent(self) -> None:
@@ -329,8 +351,10 @@ class BaseAgent(ABC):
         # Per-turn context-token attribution (system / tools / messages).
         # Best-effort; computes the breakdown on BeforeModelCallEvent and
         # stashes it on the agent for the stream coordinator to surface on the
-        # final metadata SSE event.
-        hooks.append(ContextAttributionHook())
+        # final metadata SSE event. The session id keys a process-level memo
+        # of the stable split, so an Agent rebuilt for this session (cache
+        # bypass, @-mention, memory binding) adopts it instead of re-counting.
+        hooks.append(ContextAttributionHook(session_id=self.session_id))
 
         # Live narration of what the agent is doing (model call / tool call
         # boundaries) plus Strands-measured per-tool durations. Held on the
@@ -349,6 +373,13 @@ class BaseAgent(ABC):
         # COST_DIAGNOSTICS_ENABLED=false.
         self.tool_census_hook = ToolCensusHook()
         hooks.append(self.tool_census_hook)
+
+        # Per-model-call context ledger: the conversation window's cumulative
+        # trim count and the compaction decisions taken since the previous
+        # call. Same shape and lifecycle as the census — read per call at
+        # turn end, persisted on the cost row, off with the same kill switch.
+        self.context_ledger_hook = ContextLedgerHook()
+        hooks.append(self.context_ledger_hook)
 
         # Per-model-call prompt-cache prefix fingerprints (toolConfig /
         # system prompt / history hashes). Best-effort; the stream
@@ -509,32 +540,37 @@ class BaseAgent(ABC):
             workload_access_token = BedrockAgentCoreContext.get_workload_access_token()
 
             external_integration = get_external_mcp_integration()
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
 
-                async def _load_with_context():
-                    if oauth2_callback_url:
-                        BedrockAgentCoreContext.set_oauth2_callback_url(oauth2_callback_url)
-                    if workload_access_token:
-                        BedrockAgentCoreContext.set_workload_access_token(workload_access_token)
-                    return await external_integration.load_external_tools(
-                        external_mcp_tool_ids,
-                        user_id=self.user_id,
-                        auth_token=self.auth_token,
-                    )
+            async def _load_with_context():
+                if oauth2_callback_url:
+                    BedrockAgentCoreContext.set_oauth2_callback_url(oauth2_callback_url)
+                if workload_access_token:
+                    BedrockAgentCoreContext.set_workload_access_token(workload_access_token)
+                return await external_integration.load_external_tools(
+                    external_mcp_tool_ids,
+                    user_id=self.user_id,
+                    auth_token=self.auth_token,
+                )
+
+            # Probe with ``get_running_loop`` rather than ``get_event_loop``:
+            # on 3.12 the latter RAISES when no loop is running instead of
+            # creating one, so the old ``else: run_until_complete(...)`` arm
+            # was unreachable and the no-loop case escaped as an uncaught
+            # RuntimeError. Both arms now go through ``_load_with_context``
+            # so the captured context is restored either way.
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                # No loop in this thread — safe to drive one here.
+                external_clients = asyncio.run(_load_with_context())
+            else:
+                # A loop is already running; we cannot block it, so hand the
+                # coroutine to a worker thread with its own fresh loop.
+                import concurrent.futures
 
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     future = executor.submit(asyncio.run, _load_with_context())
                     external_clients = future.result()
-            else:
-                external_clients = loop.run_until_complete(
-                    external_integration.load_external_tools(
-                        external_mcp_tool_ids,
-                        user_id=self.user_id,
-                        auth_token=self.auth_token,
-                    )
-                )
 
             for client in external_clients:
                 if client not in local_tools:

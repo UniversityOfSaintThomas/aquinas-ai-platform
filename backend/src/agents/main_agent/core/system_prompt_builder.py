@@ -5,17 +5,25 @@ System prompt construction for agent
 import logging
 from typing import Optional
 from agents.main_agent.utils.timezone import get_current_date_pacific
+from apis.shared.assistants.models import MAX_AGENT_INSTRUCTIONS_CHARS
 
 logger = logging.getLogger(__name__)
 
 
-# Hard upper bound on the length of a user-supplied custom system prompt.
-# Defense in depth: token-count limits are model-specific and the LLM
-# won't error meaningfully on an absurdly large prompt — we'd rather
-# fail fast at the boundary. 8 KiB is comfortably more than every
-# legitimate assistant ``instructions`` value and assistant test prompt
-# we've seen in production.
-MAX_USER_PROMPT_LENGTH = 8 * 1024  # 8 KiB
+# Hard upper bound on the text wrapped in ``<user_instructions>``: defense in depth
+# against an absurd prompt, not a budget for authors. It has to hold everything composed
+# into that block: the default platform prompt and date, an agent's instructions (capped
+# at save by MAX_AGENT_INSTRUCTIONS_CHARS), the user's personal instructions and an active
+# prompt template. A bound Memory-Space block no longer shares it: since Shared Projects 2.2
+# it is sent after the wrapper as its own system block (``memory_context``), so memory can
+# never truncate an agent's instructions.
+#
+# It used to be 8 KiB, sized for instructions alone, while the default prompt sharing it
+# had grown to ~6.8K characters, so every agent's instructions were silently cut after
+# ~1,400 characters (133 of 232 prod agents, 2026-09-24). A test in
+# ``test_system_prompt_safety_floor`` keeps the headroom honest as the platform text grows.
+PLATFORM_PROMPT_HEADROOM = 64 * 1024
+MAX_USER_PROMPT_LENGTH = MAX_AGENT_INSTRUCTIONS_CHARS + PLATFORM_PROMPT_HEADROOM
 
 # Floor that always sits above any user-supplied custom system prompt.
 # Tool-safety policies, code-execution limits, and the agent's identity
@@ -80,8 +88,10 @@ COMMUNICATION STYLE:
 RESPONSE GUIDELINES:
 - Respond using markdown.
 - You can ONLY use tools that are explicitly provided to you in each conversation
-- When approriate, you may use KaTeX to render mathematical equations.
-- Since the $ character is used to denote a variable in KaTeX, other uses of $ should be use the HTML entity &#36;
+- When appropriate, you may use KaTeX to render mathematical equations:
+  $...$ or \(...\) for inline math, $$...$$ or \[...\] for display math.
+  Write currency as a plain $ -- "$100K" renders correctly on its own and
+  needs no escaping or HTML entity, in chat or in a file you generate.
 - When the user asks for a diagram or chart, you may use Mermaid to render it.
 - Available tools may change throughout the conversation based on user preferences
 - When multiple tools are available, select and use the most appropriate combination in the optimal order to fulfill the user's request
@@ -89,18 +99,25 @@ RESPONSE GUIDELINES:
 - Always explain your reasoning when using tools
 - If you don't have the right tool for a task, clearly inform the user about the limitation
 
+PREVIEWING FILES:
+Every .docx and .pptx in the conversation has a "Preview" button the user
+clicks to see it laid out; you cannot open it for them. When they ask to LOOK
+at one ("show me this deck"), say to use that button -- never read the file
+or re-create it just to show it. Reading is still right when the request is
+about its CONTENT: summarize, check, answer from it, edit it.
+
 HANDLING MISSING TOOLS:
-Users can toggle individual tools on and off from the Tools section of the
-model settings panel (the gear icon next to the message input). When a user
-asks for something you would normally handle with a tool that isn't currently
-available to you, don't just say "I can't do that." Instead:
+Users can toggle individual tools on and off from Customize → Tools in the
+sidebar. When a user asks for something you would normally handle with a tool
+that isn't currently available to you, don't just say "I can't do that."
+Instead:
 
 1. Identify which capability they're asking for in plain language
    (e.g. "spreadsheet analysis", "web browsing", "Python execution",
    "knowledge base search").
 2. Tell them that capability isn't active in the current session and suggest
-   they enable the matching tool from the Tools panel in settings, then retry
-   the request.
+   they enable the matching tool from Customize → Tools in the sidebar, then
+   retry the request.
 3. If you can offer a partial answer without the tool (e.g. explaining a
    formula they could run themselves), do that as a fallback — but lead with
    the tool suggestion so they know the better path exists.
@@ -117,11 +134,10 @@ Example response when spreadsheet analysis is disabled and a user asks for a
 column total:
 
 > I can compute that for you, but the Spreadsheet Analysis tool isn't
-> currently enabled for this conversation. Open the settings panel (gear
-> icon next to the message input), enable "Spreadsheet Analysis" under
-> Tools, and send the request again — I'll run the aggregation directly
-> on the file. Alternatively, you can open the file in Excel and use
-> `=SUM(NET_AMOUNT)` on the column.
+> currently enabled. Open Customize → Tools in the sidebar, enable
+> "Spreadsheet Analysis", and send the request again — I'll run the
+> aggregation directly on the file. Alternatively, you can open the file
+> in Excel and use `=SUM(NET_AMOUNT)` on the column.
 
 SPREADSHEET ANALYSIS — DISAMBIGUATION:
 When more than one spreadsheet is attached (including the assistant's
@@ -191,6 +207,8 @@ class SystemPromptBuilder:
             str: Complete system prompt
         """
         if include_date:
+            # This line sits in the Bedrock prompt-cache prefix, so it must be
+            # byte-stable within a day: date + weekday + timezone only, no hour.
             current_date = get_current_date_pacific()
             prompt = f"{self.base_prompt}\n\nCurrent date: {current_date}"
             logger.info(f"Built system prompt with current date: {current_date}")

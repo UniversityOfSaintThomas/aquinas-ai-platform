@@ -152,18 +152,22 @@ describe('PlatformStack', () => {
 
   describe('DynamoDB tables', () => {
     it('creates all shared tables', () => {
-      // 27 tables. Was 26 — the announcements table was added for the
-      // feature-announcement system (admin-authored notices + per-user
-      // acknowledgement rows). Prior note: the audit-log table was added
-      // for the administrative audit trail (delegated admin scopes, PR-5);
-      // before that the memory-spaces table was added for the Memory Spaces
-      // feature; before that the system-prompts table was added for
-      // admin-managed Conversation Modes (custom system prompt catalog);
-      // previously 24 before the standalone "assistants" table was
-      // decommissioned (the python app uses rag-assistants for both
-      // assistant config and document metadata via
+      // 29 tables. Was 28 — the projects table was added for Shared Projects
+      // (docs/specs/shared-projects.md §3.1). Before that, 27 → 28: the
+      // agent-templates table was added for the
+      // admin-managed Agent Templates catalog (mirrors system-prompts,
+      // read by app_api only). Before that: the announcements table was
+      // added for the feature-announcement system (admin-authored notices
+      // + per-user acknowledgement rows). Prior note: the audit-log table
+      // was added for the administrative audit trail (delegated admin
+      // scopes, PR-5); before that the memory-spaces table was added for
+      // the Memory Spaces feature; before that the system-prompts table
+      // was added for admin-managed Conversation Modes (custom system
+      // prompt catalog); previously 24 before the standalone "assistants"
+      // table was decommissioned (the python app uses rag-assistants for
+      // both assistant config and document metadata via
       // DYNAMODB_ASSISTANTS_TABLE_NAME).
-      template.resourceCountIs('AWS::DynamoDB::Table', 27);
+      template.resourceCountIs('AWS::DynamoDB::Table', 29);
     });
   });
 
@@ -173,8 +177,12 @@ describe('PlatformStack', () => {
       // artifacts-content, skill-resources (admin-managed Skills reference files),
       // memory-spaces (Memory Spaces feature content bucket),
       // shared-conversations (share snapshot-body offload),
-      // alb-access-logs (who terminated a connection — SSE disconnect attribution)
-      template.resourceCountIs('AWS::S3::Bucket', 10);
+      // alb-access-logs (who terminated a connection — SSE disconnect attribution),
+      // frontend-access-logs (what the SPA edge answered on its own — 404'd
+      // chunks never reach the ALB),
+      // browser-policy (the Chromium MANAGED policy every browser session
+      // starts with — spec D6)
+      template.resourceCountIs('AWS::S3::Bucket', 12);
     });
   });
 
@@ -228,9 +236,17 @@ describe('PlatformStack', () => {
       // CDK generates their physical names, which means the backend
       // workflow's `update-function-code` step has no way to find them
       // except through SSM — the deploy-time-discovery bucket above.
+      //
+      // Raised 49 → 51 for the agent-templates table name + ARN publishes
+      // (mirrors the system-prompts name+arn pair; consumed by restore
+      // tooling and ad-hoc IAM scoping).
+      //
+      // Raised 51 → 53 for the memory-spaces and skill-resources bucket
+      // name publishes — restore tooling only (S3_BUCKETS / BUCKET_SSM_MAP);
+      // compute still takes both buckets via PlatformComputeRefs.
       const params = template.findResources('AWS::SSM::Parameter');
       expect(Object.keys(params).length).toBeGreaterThanOrEqual(30);
-      expect(Object.keys(params).length).toBeLessThanOrEqual(49);
+      expect(Object.keys(params).length).toBeLessThanOrEqual(53);
     });
   });
 

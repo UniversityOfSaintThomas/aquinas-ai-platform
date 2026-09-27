@@ -1,8 +1,13 @@
+import { inject } from '@angular/core';
 import { Routes } from '@angular/router';
 import { authGuard } from './auth/auth.guard';
 import { adminGuard } from './auth/admin.guard';
 import { firstBootGuard } from './auth/first-boot.guard';
 import { legacyMigrationHostGuard } from './shared/utils/legacy-migration-host';
+import { FEATURES } from './services/features';
+
+/** Matches only in a build with Shared Projects on (compile-time; see environments/feature-flags.ts). */
+const projectsEnabled = () => inject(FEATURES).projects;
 
 export const routes: Routes = [
     {
@@ -50,6 +55,12 @@ export const routes: Routes = [
         loadComponent: () => import('./admin/admin.layout').then(m => m.AdminLayout),
         canActivate: [adminGuard],
         loadChildren: () => import('./admin/admin.routes').then(m => m.adminRoutes),
+        // Declared once on the parent, and read by `resolveRouteChrome`'s
+        // deepest-declared-wins walk, so every child inherits it without
+        // repeating the flag 30 times. The shell answers it two ways: the
+        // sidenav swaps its body for the admin nav, and the content box drops
+        // its `max-w-7xl` cap so the console's tables get the full width.
+        data: { chrome: 'admin' },
     },
     // ── Assistant deprecation (Designer Phase 5) ────────────────────────────────────
     // There is one noun, and it is Agent (Marketplace D1). The Designer reached parity
@@ -128,6 +139,28 @@ export const routes: Routes = [
     {
         path: 'agents',
         loadComponent: () => import('./agents/agents.page').then(m => m.AgentsPage),
+        canActivate: [authGuard],
+    },
+    {
+        // Shared Projects (shared-projects §6). The tab is part of the URL so a link can
+        // land on Members or Settings; the bare project URL opens its Overview.
+        // `projectsEnabled` keeps every /projects URL unmatched (→ not found) in a build
+        // that has Projects off (src/environments/feature-flags.ts).
+        path: 'projects/:id/:tab',
+        loadComponent: () => import('./projects/detail/project-detail.page').then(m => m.ProjectDetailPage),
+        canMatch: [projectsEnabled],
+        canActivate: [authGuard],
+    },
+    {
+        // No guard here (Angular runs redirects before guards): the redirect target
+        // is guarded, so with Projects off this still ends at not found.
+        path: 'projects/:id',
+        redirectTo: 'projects/:id/overview',
+    },
+    {
+        path: 'projects',
+        loadComponent: () => import('./projects/projects.page').then(m => m.ProjectsPage),
+        canMatch: [projectsEnabled],
         canActivate: [authGuard],
     },
     {

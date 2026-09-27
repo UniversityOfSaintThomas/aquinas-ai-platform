@@ -5,6 +5,22 @@ streaming completes. It uses DynamoDB for storage.
 
 Architecture:
 - Cloud: Stores metadata in DynamoDB table specified by DYNAMODB_SESSIONS_METADATA_TABLE_NAME
+
+Row families on the ``sessions-metadata`` table (PK = ``USER#{user_id}``; all
+carry ``GSI_PK = SESSION#{session_id}`` so ``SessionLookupIndex`` lists one
+session's rows by prefix):
+
+    S#{session_id}                    session row (rollups, preferences, compaction state)
+    C#{timestamp}#{uuid}              one model call's cost/usage record; ``messageId`` = the
+                                      assistant message's 0-based index (``_store_message_metadata_cloud``)
+    D#{session_id}#{message_id}       the user's original prompt text for display (``store_user_display_text``)
+    F#{session_id}#{message_id}       the user's thumb on an assistant message — value ±1, optional
+                                      reason code, timestamp; content-free (``apis.shared.sessions.feedback``).
+                                      Same ``messageId`` as the ``C#`` row, so feedback joins the call's
+                                      turn class on ``(sessionId, messageId)`` in one lookup.
+
+``GSI_SK`` is ``META`` / ``C#{timestamp}`` / ``D#{message_id}`` / ``F#{message_id}``
+respectively. Only ``C#`` / ``D#`` / ``F#`` rows carry a ``ttl``.
 """
 
 import logging
@@ -12,6 +28,9 @@ import json
 import math
 import os
 import base64
+from dataclasses import dataclass
+
+from apis.shared.aws_clients import get_dynamodb_table
 from typing import Iterable, List, Optional, Tuple, Any, Dict
 from decimal import Decimal
 
@@ -157,11 +176,9 @@ async def store_user_display_text(
         return
 
     try:
-        import boto3
         from datetime import datetime, timezone, timedelta
 
-        dynamodb = boto3.resource('dynamodb')
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
         timestamp = datetime.now(timezone.utc).isoformat()
         ttl = int((datetime.now(timezone.utc) + timedelta(days=365)).timestamp())
@@ -230,12 +247,10 @@ async def _store_message_metadata_cloud(
         - TTL only affects cost records (sessions don't have ttl)
     """
     try:
-        import boto3
         import uuid as uuid_lib
         from datetime import datetime, timezone, timedelta
 
-        dynamodb = boto3.resource('dynamodb')
-        table = dynamodb.Table(table_name)
+        table = get_dynamodb_table(table_name)
 
         # Prepare item for DynamoDB
         metadata_dict = message_metadata.model_dump(by_alias=True, exclude_none=True)
@@ -325,6 +340,14 @@ async def _store_message_metadata_cloud(
             user_id=user_id,
             timestamp=timestamp,
             message_metadata=message_metadata
+        )
+
+        # Shared Projects: a call made by a project's harness also counts toward that
+        # project's month. Best-effort, like every aggregate above.
+        await _update_project_rollup_async(
+            user_id=user_id,
+            timestamp=timestamp,
+            message_metadata=message_metadata,
         )
 
     except Exception as e:
@@ -627,6 +650,48 @@ def _emit_cache_metrics(
         )
     except Exception as e:  # noqa: BLE001 - metrics must never break the write path
         logger.debug("Cache EMF emission skipped: %s", e)
+
+
+async def _update_project_rollup_async(
+    user_id: str,
+    timestamp: str,
+    message_metadata: MessageMetadata,
+) -> None:
+    """Add this call to ``PROJECT#{id}/COST#{YYYY-MM}`` when it ran a project's harness.
+
+    The project id rides on the row as the ``projectId`` extra (set per turn by the stream
+    coordinator), exactly like ``turnAgentId``. Rows without one — every call that did not
+    run a project harness — return immediately and touch nothing. Never raises: a missed
+    rollup costs a number on a usage page, and the ``C#`` row it came from is still the
+    source of truth.
+    """
+    project_id = (message_metadata.model_extra or {}).get("projectId")
+    if not project_id:
+        return
+    try:
+        import asyncio
+        from datetime import datetime, timezone
+
+        from apis.shared.projects.repository import ProjectRepository
+
+        try:
+            period = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).strftime("%Y-%m")
+        except (ValueError, AttributeError):
+            period = datetime.now(timezone.utc).strftime("%Y-%m")
+
+        usage = message_metadata.token_usage
+        await asyncio.to_thread(
+            ProjectRepository().add_call_cost,
+            project_id,
+            user_id,
+            period,
+            Decimal(str(_coerce_cost_total(message_metadata.cost))),
+            (usage.input_tokens or 0) if usage else 0,
+            (usage.output_tokens or 0) if usage else 0,
+            timestamp,
+        )
+    except Exception as e:
+        logger.warning("Project cost rollup failed for project %s: %s", project_id, e)
 
 
 async def _update_cost_summary_async(
@@ -941,18 +1006,20 @@ async def _store_session_metadata_cloud(
     - Direct session lookup via GSI
     """
     try:
-        import boto3
         from botocore.exceptions import ClientError
         from datetime import datetime, timezone
 
-        dynamodb = boto3.resource('dynamodb')
-        table = dynamodb.Table(table_name)
+        table = get_dynamodb_table(table_name)
 
         # First, check if session exists via GSI to get current SK
         existing_session = await _get_session_by_gsi(session_id, user_id, table)
 
-        # Prepare item for DynamoDB
+        # Prepare item for DynamoDB. A model read back through get_session_metadata
+        # carries the row's recency keys as extras; drop them so the keys written
+        # below are derived from this write alone.
         item = session_metadata.model_dump(by_alias=True, exclude_none=True)
+        for gsi_key in _RECENCY_KEY_ATTRS:
+            item.pop(gsi_key, None)
 
         # Convert floats to Decimal for DynamoDB compatibility
         item = _convert_floats_to_decimal(item)
@@ -972,6 +1039,14 @@ async def _store_session_metadata_cloud(
         item['GSI_SK'] = 'META'
         # Sparse recency keys — added for active, absent for deleted.
         item.update(_recency_gsi_keys(user_id, session_id, last_message_at, is_active))
+        # ProjectSessionIndex (GSI5) rides beside GSI4 for project sessions. A write
+        # without `preferences` leaves the row's map untouched, so the project id then
+        # comes from the stored row.
+        prefs_source = item if 'preferences' in item else (existing_session or {})
+        project_keys = _project_gsi_keys(
+            user_id, session_id, last_message_at, _preferences_project_id(prefs_source), is_active
+        )
+        item.update(project_keys)
 
         if existing_session:
             # Session exists - check if the (now static) SK needs to change, which
@@ -980,17 +1055,19 @@ async def _store_session_metadata_cloud(
 
             if old_sk and old_sk != new_sk:
                 # Legacy row → migrate to the static SK. Deep-merge existing onto the
-                # new item, but drop any stale GSI4 keys so status drives them freshly.
+                # new item, but drop any stale recency keys so state drives them freshly.
                 merged_item = _deep_merge(
                     {k: v for k, v in existing_session.items()
-                     if k not in ['PK', 'SK', 'GSI4_PK', 'GSI4_SK']},
+                     if k not in ('PK', 'SK', *_RECENCY_KEY_ATTRS)},
                     item
                 )
                 merged_item['PK'] = pk
                 merged_item['SK'] = new_sk
-                if not is_active:
-                    merged_item.pop('GSI4_PK', None)
-                    merged_item.pop('GSI4_SK', None)
+                # The merge can surface a project id only the old row had.
+                merged_item.update(_project_gsi_keys(
+                    user_id, session_id, last_message_at,
+                    _preferences_project_id(merged_item), is_active,
+                ))
 
                 # Put new SK first, then delete old — if the put fails the original
                 # is untouched. This is the row's one-time migration move.
@@ -1024,10 +1101,12 @@ async def _store_session_metadata_cloud(
                     expression_attribute_values[placeholder_value] = value
 
                 remove_parts = []
-                if not is_active:
-                    for gsi_key in ('GSI4_PK', 'GSI4_SK'):
-                        expression_attribute_names[f"#{gsi_key}"] = gsi_key
-                        remove_parts.append(f"#{gsi_key}")
+                stale_keys = [] if is_active else ['GSI4_PK', 'GSI4_SK']
+                if not project_keys:
+                    stale_keys += ['GSI5_PK', 'GSI5_SK']
+                for gsi_key in stale_keys:
+                    expression_attribute_names[f"#{gsi_key}"] = gsi_key
+                    remove_parts.append(f"#{gsi_key}")
 
                 update_expression = ""
                 if update_expression_parts:
@@ -1091,7 +1170,48 @@ def _recency_gsi_keys(
     return {}
 
 
-async def ensure_session_metadata_exists(session_id: str, user_id: str) -> bool:
+# Sparse index keys derived from a session row's state. Never read back as
+# session fields, and never carried from one write to the next.
+_RECENCY_KEY_ATTRS = ("GSI4_PK", "GSI4_SK", "GSI5_PK", "GSI5_SK")
+
+PROJECT_SESSION_INDEX = "ProjectSessionIndex"
+
+
+def _project_gsi_pk(project_id: str, user_id: str) -> str:
+    return f"PROJECT#{project_id}#USER#{user_id}"
+
+
+def _project_gsi_keys(
+    user_id: str,
+    session_id: str,
+    last_message_at: str,
+    project_id: Optional[str],
+    is_active: bool,
+) -> Dict[str, str]:
+    """ProjectSessionIndex (GSI5) keys: one member's tasks in one project, newest first.
+
+    The same recency sort key as GSI4, and present exactly when GSI4 is, but only
+    for a session bound to a project (``preferences.projectId``).
+    """
+    if is_active and project_id:
+        return {
+            "GSI5_PK": _project_gsi_pk(project_id, user_id),
+            "GSI5_SK": f"{last_message_at}#{session_id}",
+        }
+    return {}
+
+
+def _preferences_project_id(row: Dict[str, Any]) -> Optional[str]:
+    """``preferences.projectId`` of a raw row or dumped model, if any."""
+    prefs = row.get("preferences")
+    if isinstance(prefs, dict):
+        return prefs.get("projectId") or None
+    return None
+
+
+async def ensure_session_metadata_exists(
+    session_id: str, user_id: str, snapshot: Optional["SessionMetaSnapshot"] = None
+) -> bool:
     """Idempotently create a session metadata row if it doesn't exist yet.
 
     Returns ``True`` when a new row was created (caller can use this as the
@@ -1122,16 +1242,23 @@ async def ensure_session_metadata_exists(session_id: str, user_id: str) -> bool:
         raise RuntimeError("DYNAMODB_SESSIONS_METADATA_TABLE_NAME environment variable is required")
 
     try:
-        import boto3
         from botocore.exceptions import ClientError
         from datetime import datetime, timezone
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
         # Catch a pre-existing row (legacy S#ACTIVE#… or already-migrated S#{id}) so
         # we don't create a second row for the same session.
-        existing = await _get_session_by_gsi(session_id, user_id, table)
+        #
+        # Both this and the ownership check below come out of ONE query when
+        # the caller passes a snapshot (PR-2) — they always could, since a
+        # single `SessionLookupIndex` response contains every META row for the
+        # session; `_get_session_by_gsi` just discarded the half the ownership
+        # check needed. `snapshot=None` keeps both reads exactly as they were.
+        existing = (
+            snapshot.row if snapshot is not None
+            else await _get_session_by_gsi(session_id, user_id, table)
+        )
         if existing is not None:
             return False
 
@@ -1140,7 +1267,11 @@ async def ensure_session_metadata_exists(session_id: str, user_id: str) -> bool:
         # can't see the other row) and fork the session id across two users.
         # The invocations route rejects these turns outright; this is the
         # backstop for every other path that pre-creates metadata.
-        if await session_owned_by_other_user(session_id, user_id):
+        owned_by_other = (
+            snapshot.owned_by_other if snapshot is not None
+            else await session_owned_by_other_user(session_id, user_id)
+        )
+        if owned_by_other:
             logger.warning(
                 "Refusing to create metadata for session %s — already owned by another user",
                 session_id,
@@ -1205,10 +1336,8 @@ async def update_session_title(session_id: str, user_id: str, title: str) -> Non
         raise RuntimeError("DYNAMODB_SESSIONS_METADATA_TABLE_NAME environment variable is required")
 
     try:
-        import boto3
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
         existing = await _get_session_by_gsi(session_id, user_id, table)
         if not existing:
@@ -1252,10 +1381,8 @@ async def set_session_unread(session_id: str, user_id: str, unread: bool) -> Non
         raise RuntimeError("DYNAMODB_SESSIONS_METADATA_TABLE_NAME environment variable is required")
 
     try:
-        import boto3
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
         existing = await _get_session_by_gsi(session_id, user_id, table)
         if not existing:
@@ -1330,11 +1457,9 @@ async def update_session_activity(
         raise RuntimeError("DYNAMODB_SESSIONS_METADATA_TABLE_NAME environment variable is required")
 
     try:
-        import boto3
         from datetime import datetime, timezone
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
         existing = await _get_session_by_gsi(session_id, user_id, table)
         if not existing:
@@ -1378,25 +1503,31 @@ async def update_session_activity(
         pk = f"USER#{user_id}"
         target_sk = _static_session_sk(session_id)
         gsi4 = _recency_gsi_keys(user_id, session_id, now, is_active=True)
+        gsi5 = _project_gsi_keys(
+            user_id, session_id, now, merged_prefs.get("projectId"), is_active=True
+        )
 
         if old_sk == target_sk:
             # Already migrated (issue #175): pure in-place update — lastMessageAt is a
             # plain attribute and recency lives in GSI4_SK, so SET-ting GSI4_SK just
             # re-positions the index entry. No row move → no SK rotation → the
             # ghost-row race is structurally gone.
+            set_clause = "SET lastMessageAt = :t, preferences = :p, GSI4_PK = :gp, GSI4_SK = :gs"
+            values = {
+                ":one": 1,
+                ":t": now,
+                ":p": _convert_floats_to_decimal(merged_prefs),
+                ":gp": gsi4["GSI4_PK"],
+                ":gs": gsi4["GSI4_SK"],
+            }
+            if gsi5:
+                set_clause += ", GSI5_PK = :pp, GSI5_SK = :ps"
+                values[":pp"] = gsi5["GSI5_PK"]
+                values[":ps"] = gsi5["GSI5_SK"]
             table.update_item(
                 Key={"PK": pk, "SK": target_sk},
-                UpdateExpression=(
-                    "ADD messageCount :one "
-                    "SET lastMessageAt = :t, preferences = :p, GSI4_PK = :gp, GSI4_SK = :gs"
-                ),
-                ExpressionAttributeValues={
-                    ":one": 1,
-                    ":t": now,
-                    ":p": _convert_floats_to_decimal(merged_prefs),
-                    ":gp": gsi4["GSI4_PK"],
-                    ":gs": gsi4["GSI4_SK"],
-                },
+                UpdateExpression="ADD messageCount :one " + set_clause,
+                ExpressionAttributeValues=values,
             )
             logger.info("Updated session activity for %s (in-place, static SK)", session_id)
             return True
@@ -1412,12 +1543,12 @@ async def update_session_activity(
             )
             return True
         carried = {
-            k: v for k, v in fresh.items() if k not in ("PK", "SK", "GSI4_PK", "GSI4_SK")
+            k: v for k, v in fresh.items() if k not in ("PK", "SK", *_RECENCY_KEY_ATTRS)
         }
         carried["lastMessageAt"] = now
         carried["messageCount"] = int(fresh.get("messageCount", 0) or 0) + 1
         carried["preferences"] = _convert_floats_to_decimal(merged_prefs)
-        new_item = {"PK": pk, "SK": target_sk, **carried, **gsi4}
+        new_item = {"PK": pk, "SK": target_sk, **carried, **gsi4, **gsi5}
         table.put_item(Item=new_item)
         table.delete_item(Key={"PK": pk, "SK": old_sk})
 
@@ -1467,10 +1598,8 @@ async def set_selected_prompt_id(
         return False
 
     try:
-        import boto3
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
         existing = await _get_session_by_gsi(session_id, user_id, table)
         if not existing:
@@ -1517,6 +1646,101 @@ async def set_selected_prompt_id(
         return False
 
 
+@dataclass(frozen=True)
+class SessionMetaSnapshot:
+    """One read of a session's ``META`` rows, shared by the whole preamble.
+
+    WHY THIS EXISTS
+    ---------------
+    Measured on dev (docs/specs/turn-latency-preamble.md), a warm turn read
+    this one item **eight times** before the first model call — the ownership
+    guard, the attachment pop, the metadata pre-create, four stale-marker
+    clears, and the quota session-notice — each on its own round trip. A GSI
+    query from inside an AgentCore Runtime container costs **~53ms** (measured,
+    not assumed: ``preamble.ownership`` is exactly one query and nothing else),
+    so those reads were ~445ms of a ~455ms stage.
+
+    This is the single read they now share.
+
+    WHY IT IS PASSED EXPLICITLY, NOT CACHED
+    ---------------------------------------
+    An implicit per-request memo inside ``_get_session_by_gsi`` would be a
+    smaller diff and the wrong shape. CLAUDE.md's rule — *never cache session
+    state; per-session state must be re-read per turn and must never move
+    backwards* — exists because this repo has shipped that bug twice (#741
+    conversation history, #751 compaction state). A snapshot that callers opt
+    into by passing it cannot leak into a caller that needs a fresh read; a
+    memo keyed on the request can, and the failure is silent.
+
+    So every consumer keeps working exactly as before when ``snapshot`` is
+    ``None``, which is the default and what every non-preamble caller gets.
+
+    ``row is None`` is a real answer ("this user has no META row"), not
+    "unknown" — which is why consumers take the snapshot object rather than the
+    row dict. Passing ``row`` alone would make "no row yet" indistinguishable
+    from "nothing was prefetched", and a brand-new session would silently fall
+    back to re-reading.
+    """
+
+    row: Optional[dict]
+    """This user's ``META`` row, decimal-converted, or ``None`` if absent."""
+
+    owned_by_other: bool
+    """``META`` rows exist for this session and none of them are this user's."""
+
+
+async def load_session_meta(session_id: str, user_id: str) -> SessionMetaSnapshot:
+    """Read a session's ``META`` rows once, answering ownership and content.
+
+    Replaces an ownership probe and a row lookup that were separate queries of
+    the same index for the same key. Both answers come out of one response
+    because they were always in it — ``_get_session_by_gsi`` simply discarded
+    the information the ownership check needed (it returns ``None`` both for
+    "no such session" and for "someone else's", which is the ambiguity
+    ``session_owned_by_other_user`` exists to resolve).
+
+    Best-effort in the same direction as the helpers it feeds: any failure
+    yields ``row=None, owned_by_other=False``, i.e. "nothing known, nothing
+    blocked". That matches what a failed ownership probe already did (fail
+    open) and what a failed row read already did (treat as absent), so a
+    DynamoDB outage degrades the preamble exactly as it did before.
+    """
+    empty = SessionMetaSnapshot(row=None, owned_by_other=False)
+
+    sessions_metadata_table = os.environ.get("DYNAMODB_SESSIONS_METADATA_TABLE_NAME")
+    if not sessions_metadata_table or is_preview_session(session_id):
+        return empty
+
+    try:
+        import boto3
+        from boto3.dynamodb.conditions import Key
+
+        table = get_dynamodb_table(sessions_metadata_table)
+
+        response = table.query(
+            IndexName="SessionLookupIndex",
+            KeyConditionExpression=Key("GSI_PK").eq(f"SESSION#{session_id}")
+            & Key("GSI_SK").eq("META"),
+        )
+        items = response.get("Items", []) or []
+        if not items:
+            return empty
+
+        # Scan ALL rows for this user's rather than trusting items[0] — a
+        # cross-user fork gives two rows sharing GSI_PK/GSI_SK, returned in an
+        # unspecified order. Same reasoning as `_get_session_by_gsi`, which
+        # this consolidates rather than replaces.
+        mine = next((i for i in items if i.get("userId") == user_id), None)
+        if mine is not None:
+            return SessionMetaSnapshot(row=_convert_decimal_to_float(mine), owned_by_other=False)
+
+        logger.warning("Session %s belongs to a different user", session_id)
+        return SessionMetaSnapshot(row=None, owned_by_other=True)
+    except Exception as e:
+        logger.debug("Session meta load failed, treating as absent: %s", e)
+        return empty
+
+
 async def session_owned_by_other_user(session_id: str, user_id: str) -> bool:
     """Whether this session id already has a metadata row owned by someone else.
 
@@ -1553,8 +1777,7 @@ async def session_owned_by_other_user(session_id: str, user_id: str) -> bool:
         import boto3
         from boto3.dynamodb.conditions import Key
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
         response = table.query(
             IndexName="SessionLookupIndex",
@@ -1742,6 +1965,21 @@ async def _bump_session_aggregates(
             update_parts_add.append("toolErrorCount :toolErrors")
             values[":toolCalls"] = tool_calls_total
             values[":toolErrors"] = tool_errors_total
+            # Compaction decisions, counted per kind from the call's
+            # `compactionEvents` ledger. `checkpoint` is deliberately not
+            # here — `_save_compaction_state(record_event=True)` already
+            # bumps `compactionCount` for it, and two counters for one event
+            # would disagree under concurrency.
+            for kind, attr in _COMPACTION_EVENT_COUNTERS.items():
+                update_parts_add.append(f"{attr} :{attr}")
+                values[f":{attr}"] = _compaction_event_count(message_metadata, kind)
+            # Document lifecycle rollups (docs/specs/document-context-offload.md
+            # §6.1): how many calls ran with the full document inline vs. a
+            # digest only, and how much document_read pulled back. Written
+            # as 0 while the diagnostics are on, like the counters above.
+            for attr, value in _document_rollups(message_metadata).items():
+                update_parts_add.append(f"{attr} :{attr}")
+                values[f":{attr}"] = value
 
         update_expression = (
             "ADD " + ", ".join(update_parts_add) + " SET " + ", ".join(update_parts_set)
@@ -1762,6 +2000,63 @@ async def _bump_session_aggregates(
     except Exception as e:
         # Non-fatal — lazy backfill compensates on next read.
         logger.debug("bump_session_aggregates failed (will be backfilled on read): %s", e)
+
+
+#: Session-row counter per compaction event kind (see
+#: ``TurnBasedSessionManager.record_compaction_event``). Written as 0 while
+#: the diagnostics are on so the attribute exists from the first call.
+_COMPACTION_EVENT_COUNTERS = {
+    "applied": "compactionAppliedCount",
+    "forced": "compactionForcedCount",
+    "floor_unreachable": "compactionFloorUnreachableCount",
+}
+
+
+#: Session-row counters derived from a call's document fields. ``fullDocumentCalls``
+#: and ``digestOnlyCalls`` are the digest-vs-full turn shares; the two
+#: ``documentRead*`` counters sum the call's ``documentReads`` ledger entry.
+DOCUMENT_ROLLUP_ATTRS = ("fullDocumentCalls", "digestOnlyCalls", "documentReadCalls", "documentReadPages")
+
+
+def _document_rollups(message_metadata: Any) -> Dict[str, int]:
+    """``{attr: delta}`` for every ``DOCUMENT_ROLLUP_ATTRS`` entry, from the
+    call's ``hasDocuments`` / ``documentDigests`` / ``documentReads`` extras.
+    Absent or malformed fields count as zero — the bump must never fail."""
+    extra = getattr(message_metadata, "model_extra", None)
+    extra = extra if isinstance(extra, dict) else {}
+    has_documents = bool(extra.get("hasDocuments"))
+    try:
+        digests = int(extra.get("documentDigests") or 0)
+    except (TypeError, ValueError):
+        digests = 0
+    reads = extra.get("documentReads")
+    reads = reads if isinstance(reads, dict) else {}
+
+    def _int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "fullDocumentCalls": 1 if has_documents else 0,
+        "digestOnlyCalls": 1 if (digests > 0 and not has_documents) else 0,
+        "documentReadCalls": _int(reads.get("calls")),
+        "documentReadPages": _int(reads.get("pages")),
+    }
+
+
+def _compaction_event_count(message_metadata: Any, kind: str) -> int:
+    """How many events of ``kind`` the call's ``compactionEvents`` extra carries.
+
+    Malformed entries count as zero rather than raising — the aggregate bump
+    must never fail on them.
+    """
+    extra = getattr(message_metadata, "model_extra", None)
+    events = extra.get("compactionEvents") if isinstance(extra, dict) else None
+    if not isinstance(events, list):
+        return 0
+    return sum(1 for e in events if isinstance(e, dict) and e.get("kind") == kind)
 
 
 def _tool_census_totals(message_metadata: Any) -> tuple[int, int]:
@@ -1962,8 +2257,7 @@ async def session_exists_for_other_user(session_id: str, current_user_id: str) -
         import boto3
         from boto3.dynamodb.conditions import Key
 
-        dynamodb = boto3.resource('dynamodb')
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
         response = table.query(
             IndexName='SessionLookupIndex',
@@ -2029,8 +2323,7 @@ async def _get_all_message_metadata_cloud(session_id: str, user_id: str, table_n
         import boto3
         from boto3.dynamodb.conditions import Key
 
-        dynamodb = boto3.resource('dynamodb')
-        table = dynamodb.Table(table_name)
+        table = get_dynamodb_table(table_name)
 
         logger.info(f"🔍 Querying cost records via GSI for session {session_id}")
 
@@ -2089,6 +2382,20 @@ async def _get_all_message_metadata_cloud(session_id: str, user_id: str, table_n
                     metadata_index[message_id] = {"displayText": display_text}
                 logger.debug(f"🔗 Merged displayText for user message {message_id}")
 
+        # Merge this user's thumbs (F# rows) so a reload restores the SPA's
+        # pressed state. Skipped while the feature is off — the rows stay.
+        from apis.shared.feature_flags import response_feedback_enabled
+
+        if response_feedback_enabled():
+            from .feedback import query_session_feedback
+
+            try:
+                for message_id, feedback in query_session_feedback(table, session_id, user_id).items():
+                    entry = metadata_index.setdefault(message_id, {})
+                    entry["feedback"] = feedback.model_dump(by_alias=True, exclude_none=True)
+            except Exception as e:  # noqa: BLE001 - feedback is a UI enhancement, never block history
+                logger.warning(f"Failed to merge message feedback: {e}")
+
         logger.info(f"📋 Metadata keys: {sorted(metadata_index.keys())}")
         return metadata_index
 
@@ -2128,8 +2435,7 @@ async def _get_session_metadata_cloud(
         import boto3
         from boto3.dynamodb.conditions import Key
 
-        dynamodb = boto3.resource('dynamodb')
-        table = dynamodb.Table(table_name)
+        table = get_dynamodb_table(table_name)
 
         # Use GSI for session lookup by ID
         response = table.query(
@@ -2166,7 +2472,7 @@ async def _get_session_metadata_cloud(
             )
 
         # Remove DynamoDB keys before validation
-        for key in ['PK', 'SK', 'GSI_PK', 'GSI_SK']:
+        for key in ('PK', 'SK', 'GSI_PK', 'GSI_SK', *_RECENCY_KEY_ATTRS):
             item.pop(key, None)
 
         # Dedupe pending interrupts at the storage boundary so list_append
@@ -2286,7 +2592,7 @@ def _item_to_session_metadata(item: Dict[str, Any]) -> Optional[SessionMetadata]
     """
     try:
         item = _convert_decimal_to_float(item)
-        for key in ('PK', 'SK', 'GSI_PK', 'GSI_SK', 'GSI4_PK', 'GSI4_SK'):
+        for key in ('PK', 'SK', 'GSI_PK', 'GSI_SK', *_RECENCY_KEY_ATTRS):
             item.pop(key, None)
 
         # Skip preview sessions - they should not appear in user's session list
@@ -2423,8 +2729,7 @@ async def _list_user_sessions_cloud(
         from boto3.dynamodb.conditions import Key
         from botocore.exceptions import ClientError
 
-        dynamodb = boto3.resource('dynamodb')
-        table = dynamodb.Table(table_name)
+        table = get_dynamodb_table(table_name)
 
         cursor = _decode_list_cursor(next_token)
         want = (limit + 1) if limit else None
@@ -2535,6 +2840,54 @@ async def _list_user_sessions_cloud(
         )
 
 
+async def list_project_sessions(
+    user_id: str,
+    project_id: str,
+    limit: int = 50,
+    next_token: Optional[str] = None,
+) -> Tuple[list[SessionMetadata], Optional[str]]:
+    """One member's active sessions in one project, newest first (ProjectSessionIndex).
+
+    Only the caller's own sessions: the index partition is per member, so a
+    project's tasks are never listed across people. Uses the same value cursor as
+    ``list_user_sessions``. While the index is still building, or absent, the list
+    is empty rather than an error (``dynamo_errors``).
+    """
+    from boto3.dynamodb.conditions import Key
+    from botocore.exceptions import ClientError
+
+    from apis.shared.dynamo_errors import is_missing_index_error, log_missing_index
+
+    table_name = os.environ.get('DYNAMODB_SESSIONS_METADATA_TABLE_NAME')
+    if not table_name:
+        raise RuntimeError("DYNAMODB_SESSIONS_METADATA_TABLE_NAME environment variable is required")
+    table = get_dynamodb_table(table_name)
+
+    condition = Key('GSI5_PK').eq(_project_gsi_pk(project_id, user_id))
+    cursor = _decode_list_cursor(next_token)
+    if cursor:
+        la, sid = cursor
+        condition = condition & Key('GSI5_SK').lt(f'{la}#{sid}')
+    want = limit + 1
+    params: Dict[str, Any] = {
+        'IndexName': PROJECT_SESSION_INDEX,
+        'KeyConditionExpression': condition,
+        'ScanIndexForward': False,
+        'Limit': want,
+    }
+    try:
+        sessions = _collect_valid_sessions(table, params, want)
+    except ClientError as e:
+        if is_missing_index_error(e):
+            log_missing_index(PROJECT_SESSION_INDEX, "a project's tasks")
+            return [], None
+        raise
+
+    has_more = len(sessions) > limit
+    page = sessions[:limit]
+    return page, (_encode_list_cursor(page[-1]) if has_more and page else None)
+
+
 def _deep_merge(base: dict, updates: dict) -> dict:
     """
     Deep merge two dictionaries
@@ -2638,10 +2991,8 @@ async def add_pending_interrupt(
         return
 
     try:
-        import boto3
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
         existing = await _get_session_by_gsi(session_id, user_id, table)
         if not existing:
@@ -2696,10 +3047,8 @@ async def add_export_receipt(
         return
 
     try:
-        import boto3
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
         existing = await _get_session_by_gsi(session_id, user_id, table)
         if not existing:
@@ -2747,10 +3096,8 @@ async def remove_pending_interrupts(
         return
 
     try:
-        import boto3
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
         existing = await _get_session_by_gsi(session_id, user_id, table)
         if not existing:
@@ -2780,7 +3127,9 @@ async def remove_pending_interrupts(
         logger.error("Failed to remove pending_interrupts: %s", e, exc_info=True)
 
 
-async def clear_pending_interrupts(session_id: str, user_id: str) -> None:
+async def clear_pending_interrupts(
+    session_id: str, user_id: str, snapshot: Optional["SessionMetaSnapshot"] = None
+) -> None:
     """Drop every pending-interrupt breadcrumb for a session.
 
     Distinct from :func:`remove_pending_interrupts`, which drops specific ids
@@ -2811,12 +3160,16 @@ async def clear_pending_interrupts(session_id: str, user_id: str) -> None:
         return
 
     try:
-        import boto3
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
-        existing = await _get_session_by_gsi(session_id, user_id, table)
+        # The preamble reads this row once and shares it (PR-2); `None` keeps
+        # the original per-call read for every other caller.
+        existing = (
+            snapshot.row
+            if snapshot is not None
+            else await _get_session_by_gsi(session_id, user_id, table)
+        )
         if not existing:
             return
 
@@ -2873,10 +3226,8 @@ async def set_paused_turn(
         return
 
     try:
-        import boto3
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
         existing = await _get_session_by_gsi(session_id, user_id, table)
         if not existing:
@@ -2913,7 +3264,9 @@ async def get_paused_turn(session_id: str, user_id: str) -> Optional[PausedTurnS
     return metadata.paused_turn
 
 
-async def clear_paused_turn(session_id: str, user_id: str) -> None:
+async def clear_paused_turn(
+    session_id: str, user_id: str, snapshot: Optional["SessionMetaSnapshot"] = None
+) -> None:
     """Drop the paused-turn snapshot for a session.
 
     Called on successful resume completion, on explicit dismiss, and at the
@@ -2925,12 +3278,16 @@ async def clear_paused_turn(session_id: str, user_id: str) -> None:
         return
 
     try:
-        import boto3
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
-        existing = await _get_session_by_gsi(session_id, user_id, table)
+        # The preamble reads this row once and shares it (PR-2); `None` keeps
+        # the original per-call read for every other caller.
+        existing = (
+            snapshot.row
+            if snapshot is not None
+            else await _get_session_by_gsi(session_id, user_id, table)
+        )
         if not existing:
             return
 
@@ -2951,6 +3308,120 @@ async def clear_paused_turn(session_id: str, user_id: str) -> None:
         logger.error("Failed to clear paused_turn: %s", e, exc_info=True)
 
 
+async def set_browser_session(
+    session_id: str,
+    user_id: str,
+    ref: Dict[str, Any],
+) -> None:
+    """Project the conversation's browser session onto its metadata row.
+
+    Spec D4. The agent-side source of truth is ``agent.state``, which the
+    Strands session manager restores from AgentCore Memory — a store app-api
+    cannot read. app-api is where the live-view route has to live (the
+    AgentCore Runtime data plane proxies only ``/invocations`` and ``/ping``,
+    so a route on inference-api would 404 in cloud), and it needs the browser
+    session's identity to mint a URL. Hence this projection.
+
+    Idempotent overwrite. Per the "one session can be served by more than one
+    agent" rule, readers must re-read this row rather than caching it on an
+    agent instance.
+
+    **Identifiers only.** Anything URL-shaped is rejected before the write: a
+    live-view URL is SigV4 query-signed with a 300-second cap, so a persisted
+    one is stale by the time anything reads it back, and persisting one at all
+    is the mistake PR #1101 already paid for once.
+
+    No-op when the session metadata record is missing or the table env var is
+    unset (preview/anonymous flows).
+    """
+    sessions_metadata_table = os.environ.get("DYNAMODB_SESSIONS_METADATA_TABLE_NAME")
+    if not sessions_metadata_table:
+        logger.warning(
+            "DYNAMODB_SESSIONS_METADATA_TABLE_NAME not set; skipping browser_session persistence"
+        )
+        return
+
+    try:
+        from apis.shared.browser_takeover import assert_no_url
+
+        assert_no_url(ref)
+    except ValueError as e:
+        logger.error("Refusing to persist browser_session: %s", e)
+        return
+
+    try:
+
+        table = get_dynamodb_table(sessions_metadata_table)
+
+        existing = await _get_session_by_gsi(session_id, user_id, table)
+        if not existing:
+            logger.info(
+                "Skipping browser_session write — session %s not found", session_id
+            )
+            return
+
+        sk = existing.get("SK")
+        if not sk:
+            logger.warning(
+                "Session %s has no SK; cannot update browser_session", session_id
+            )
+            return
+
+        table.update_item(
+            Key={"PK": f"USER#{user_id}", "SK": sk},
+            UpdateExpression="SET #bs = :bs",
+            ExpressionAttributeNames={"#bs": "browserSession"},
+            ExpressionAttributeValues={":bs": _convert_floats_to_decimal(ref)},
+        )
+        logger.info("Persisted browser_session for session %s", session_id)
+    except Exception as e:
+        # Best-effort: a write failure must not break the live SSE flow. The
+        # cost is that app-api cannot mint a live view for this takeover, so
+        # the user sees the prompt without a working viewer — degraded, not
+        # broken, and the turn still resumes on skip.
+        logger.error("Failed to persist browser_session: %s", e, exc_info=True)
+
+
+async def clear_browser_session(session_id: str, user_id: str) -> None:
+    """Drop the browser-session projection for a conversation.
+
+    Called when the browser session ends. Leaving a stale row behind would have
+    app-api mint live-view URLs for a session that no longer exists.
+    """
+    sessions_metadata_table = os.environ.get("DYNAMODB_SESSIONS_METADATA_TABLE_NAME")
+    if not sessions_metadata_table:
+        return
+
+    try:
+
+        table = get_dynamodb_table(sessions_metadata_table)
+
+        existing = await _get_session_by_gsi(session_id, user_id, table)
+        if not existing or not existing.get("SK"):
+            return
+        if "browserSession" not in existing:
+            return  # Already clear
+
+        table.update_item(
+            Key={"PK": f"USER#{user_id}", "SK": existing["SK"]},
+            UpdateExpression="REMOVE #bs",
+            ExpressionAttributeNames={"#bs": "browserSession"},
+        )
+        logger.info("Cleared browser_session for session %s", session_id)
+    except Exception as e:
+        logger.error("Failed to clear browser_session: %s", e, exc_info=True)
+
+
+async def get_browser_session(
+    session_id: str, user_id: str
+) -> Optional[Dict[str, Any]]:
+    """Return the persisted browser-session projection, if any."""
+    metadata = await get_session_metadata(session_id, user_id)
+    if not metadata:
+        return None
+    return metadata.browser_session
+
+
 async def set_truncated_turn(session_id: str, user_id: str) -> None:
     """Mark that the last turn ended in a recoverable max_tokens truncation.
 
@@ -2966,10 +3437,8 @@ async def set_truncated_turn(session_id: str, user_id: str) -> None:
         return
 
     try:
-        import boto3
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
         existing = await _get_session_by_gsi(session_id, user_id, table)
         if not existing:
@@ -2992,7 +3461,9 @@ async def set_truncated_turn(session_id: str, user_id: str) -> None:
         logger.error("Failed to persist truncated_turn: %s", e, exc_info=True)
 
 
-async def clear_truncated_turn(session_id: str, user_id: str) -> None:
+async def clear_truncated_turn(
+    session_id: str, user_id: str, snapshot: Optional["SessionMetaSnapshot"] = None
+) -> None:
     """Drop the truncated-turn marker.
 
     Called at the start of any new turn that isn't an interrupt-resume
@@ -3005,12 +3476,16 @@ async def clear_truncated_turn(session_id: str, user_id: str) -> None:
         return
 
     try:
-        import boto3
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
-        existing = await _get_session_by_gsi(session_id, user_id, table)
+        # The preamble reads this row once and shares it (PR-2); `None` keeps
+        # the original per-call read for every other caller.
+        existing = (
+            snapshot.row
+            if snapshot is not None
+            else await _get_session_by_gsi(session_id, user_id, table)
+        )
         if not existing:
             return
 
@@ -3085,12 +3560,10 @@ async def set_interrupted_turn(
         reason = "unknown"
 
     try:
-        import boto3
         from datetime import datetime, timezone
         from botocore.exceptions import ClientError
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
         existing = await _get_session_by_gsi(session_id, user_id, table)
         if not existing:
@@ -3152,7 +3625,9 @@ async def set_interrupted_turn(
         logger.error("Failed to persist interrupted_turn: %s", e, exc_info=True)
 
 
-async def clear_interrupted_turn(session_id: str, user_id: str) -> Optional[str]:
+async def clear_interrupted_turn(
+    session_id: str, user_id: str, snapshot: Optional["SessionMetaSnapshot"] = None
+) -> Optional[str]:
     """Pop the interrupted-turn marker, returning the reason it recorded.
 
     Called at the start of any new turn that isn't an interrupt-resume, so a
@@ -3172,12 +3647,16 @@ async def clear_interrupted_turn(session_id: str, user_id: str) -> Optional[str]
         return None
 
     try:
-        import boto3
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
-        existing = await _get_session_by_gsi(session_id, user_id, table)
+        # The preamble reads this row once and shares it (PR-2); `None` keeps
+        # the original per-call read for every other caller.
+        existing = (
+            snapshot.row
+            if snapshot is not None
+            else await _get_session_by_gsi(session_id, user_id, table)
+        )
         if not existing:
             return None
 
@@ -3260,11 +3739,9 @@ async def set_pending_attachments(
         return
 
     try:
-        import boto3
         from datetime import datetime, timezone
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
         existing = await _get_session_by_gsi(session_id, user_id, table)
         if not existing:
@@ -3312,10 +3789,8 @@ async def clear_pending_attachments(session_id: str, user_id: str) -> None:
         return
 
     try:
-        import boto3
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
         existing = await _get_session_by_gsi(session_id, user_id, table)
         if not existing:
@@ -3341,7 +3816,9 @@ async def clear_pending_attachments(session_id: str, user_id: str) -> None:
         logger.error("Failed to clear pending_attachments: %s", e, exc_info=True)
 
 
-async def pop_pending_attachments(session_id: str, user_id: str) -> List[str]:
+async def pop_pending_attachments(
+    session_id: str, user_id: str, snapshot: Optional["SessionMetaSnapshot"] = None
+) -> List[str]:
     """Atomically take the pending-attachment upload IDs, clearing the marker.
 
     Returns the IDs only when the marker is younger than
@@ -3358,13 +3835,17 @@ async def pop_pending_attachments(session_id: str, user_id: str) -> List[str]:
         return []
 
     try:
-        import boto3
         from datetime import datetime, timezone
 
-        dynamodb = boto3.resource("dynamodb")
-        table = dynamodb.Table(sessions_metadata_table)
+        table = get_dynamodb_table(sessions_metadata_table)
 
-        existing = await _get_session_by_gsi(session_id, user_id, table)
+        # The preamble reads this row once and shares it (PR-2); `None` keeps
+        # the original per-call read for every other caller.
+        existing = (
+            snapshot.row
+            if snapshot is not None
+            else await _get_session_by_gsi(session_id, user_id, table)
+        )
         if not existing:
             return []
 

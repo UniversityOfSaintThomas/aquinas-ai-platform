@@ -8,7 +8,7 @@ import json
 import logging
 import hashlib
 import os
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Callable, Dict, Optional, List, Tuple
 
 import boto3
 
@@ -61,9 +61,43 @@ def _create_cache_key(
     freshness_hash: str,
     agent_type: Optional[str],
     skills_hash: str = "",
+    document_tools: bool = False,
+    assistant_id: Optional[str] = None,
+    memory_binding: str = "",
+    memory_context: Optional[str] = None,
 ) -> Tuple:
     """
     Create a cache key for agent instances.
+
+    `memory_binding` is ``memory_binding_digest`` of what the turn's memory
+    tools close over, or "" when there are none. For an Agent's binding that is
+    the space id, name and access: the write tool exists only for
+    ``readwrite``, and the name is in the tools' result messages (their specs
+    are constant). For a project harness it is the project and its two space
+    ids (Shared Projects 2.4b). Either way the tools read the spaces live on
+    every call, so they are described once the key carries this. Empty string
+    without memory tools, so those turns key exactly as before apart from the
+    constant extra element.
+
+    `memory_context` is the rendered Memory-Space block sent after the system
+    prompt (Shared Projects 2.2). It used to be part of `system_prompt`, so it
+    is folded into the same prompt hash rather than adding an element; a turn
+    without memory hashes exactly as before.
+
+    `assistant_id` is the assistant (RAG corpus) the turn ran against. The
+    spreadsheet-analysis builders close over it, so without it in the key a
+    cached agent could answer a later turn against the wrong corpus — which
+    is why that family bypassed the cache until the key carried it. Empty
+    string when no assistant is attached, so keys for assistant-less turns are
+    byte-identical to the pre-field ones.
+
+    `document_tools` is whether the turn built the session-state-gated
+    ``document_read`` tool (the session has a readable attachment). It is not
+    in `enabled_tools`, so without this element an agent cached before the
+    first upload would be served — without the tool — to every turn after it.
+    The gate is monotonic in practice (files stay once uploaded), so the key
+    flips at most once per session, on the attach turn, when restored history
+    carries no document yet to lose.
 
     `freshness_hash` is a short digest of the enabled tools' current
     `updated_at` values (see `freshness.get_freshness_hash`). When an
@@ -81,8 +115,11 @@ def _create_cache_key(
 
     # Hash system prompt if provided (can be very long)
     prompt_hash = None
-    if system_prompt:
-        prompt_hash = hashlib.md5(system_prompt.encode()).hexdigest()[:8]
+    if system_prompt or memory_context:
+        prompt_material = system_prompt or ""
+        if memory_context:
+            prompt_material += "\x00memory\x00" + memory_context
+        prompt_hash = hashlib.md5(prompt_material.encode()).hexdigest()[:8]
 
     return (
         session_id,
@@ -95,8 +132,45 @@ def _create_cache_key(
         provider or "bedrock",
         freshness_hash,
         agent_type or "chat",
-        skills_hash,
+        memory_binding,  # ahead of the rest so their positions ([-1]..[-3]) stay put
+        bool(document_tools),
+        assistant_id or "",
+        skills_hash,  # stays the trailing element; tests index it as [-1]
     )
+
+
+def memory_binding_digest(binding: Optional[Dict[str, Any]]) -> str:
+    """Short digest of a turn's memory tools' closure for the agent cache key.
+
+    ``binding`` is the shape stamped on the construction snapshot and replayed
+    from ``PausedTurnSnapshot``, or None:
+
+    - an Agent's binding, ``{"spaceId", "spaceName", "access"}``;
+    - a project harness's scopes, ``{"projectId", "sharedSpaceId",
+      "personalSpaceId"}`` (Shared Projects 2.4b). Its payload starts with a
+      ``"project"`` tag, so it can never collide with a binding's.
+
+    Returns "" for None so keys without memory do not change. The binding
+    digest is unchanged from 2.1, so ordinary Agents keep their keys.
+    """
+    if not binding:
+        return ""
+    if "projectId" in binding:
+        payload = json.dumps(
+            [
+                "project",
+                binding.get("projectId"),
+                binding.get("sharedSpaceId"),
+                binding.get("personalSpaceId"),
+            ],
+            default=str,
+        )
+        return hashlib.md5(payload.encode()).hexdigest()[:8]
+    payload = json.dumps(
+        [binding.get("spaceId"), binding.get("spaceName"), binding.get("access")],
+        default=str,
+    )
+    return hashlib.md5(payload.encode()).hexdigest()[:8]
 
 
 # LRU cache for agent instances
@@ -153,7 +227,9 @@ def _adopt_session_conversation(agent: BaseAgent, session_id: str) -> None:
     ``agent.messages`` lives inside ``TurnBasedSessionManager.initialize()``
     (document stripping, content-block sanitizing, compaction slicing, pairing
     repair) and so runs before we get here; after construction the list is only
-    appended to. A future compaction that rebinds mid-life would silently break
+    appended to — or, for the pending-cut apply at the head of a turn, sliced
+    **in place** by slice assignment (``messages[:] = ...``), which keeps the
+    alias. A future compaction that rebinds mid-life would silently break
     the alias — ``test_second_cache_key_for_a_session_shares_the_conversation``
     is what catches that.
 
@@ -174,12 +250,14 @@ def _adopt_session_conversation(agent: BaseAgent, session_id: str) -> None:
         return
 
     live = None
+    live_wrapper = None
     for key, cached in _agent_cache.items():
         if key[0] != session_id:
             continue
         cached_inner = getattr(cached, "agent", None)
         if isinstance(getattr(cached_inner, "messages", None), list):
             live = cached_inner  # newest wins — dict preserves insertion order
+            live_wrapper = cached
 
     if live is None or live.messages is inner.messages:
         return
@@ -203,6 +281,18 @@ def _adopt_session_conversation(agent: BaseAgent, session_id: str) -> None:
     )
     inner.messages = live.messages
 
+    # The list's coordinate system travels with it. Compaction expresses its
+    # checkpoint as ``_live_offset + index into this list`` and the pending-cut
+    # apply slices the list in place at that offset, so an instance that adopts
+    # the list must adopt the offset too or it would slice at the wrong place.
+    try:
+        src_sm = getattr(live_wrapper, "session_manager", None)
+        dst_sm = getattr(agent, "session_manager", None)
+        if src_sm is not None and dst_sm is not None and hasattr(src_sm, "_live_offset"):
+            dst_sm._live_offset = src_sm._live_offset
+    except Exception:  # noqa: BLE001 - never let bookkeeping break a turn
+        logger.debug("Session %s: could not sync compaction live offset", scrub_log(session_id), exc_info=True)
+
 
 async def get_agent(
     session_id: str,
@@ -224,6 +314,11 @@ async def get_agent(
     accessible_skill_ids: Optional[List[str]] = None,
     extra_tools_key_described: bool = False,
     cache_write: bool = True,
+    has_document_tools: bool = False,
+    assistant_id: Optional[str] = None,
+    build_stage_recorder: Optional[Callable[[str], None]] = None,
+    memory_binding: Optional[Dict[str, Any]] = None,
+    memory_context: Optional[str] = None,
 ) -> BaseAgent:
     """
     Get or create agent instance with current configuration for session
@@ -252,6 +347,15 @@ async def get_agent(
             derive it with ``injected_tools_are_key_described``; the default
             (False) keeps the historical bypass, so any caller that has not
             reasoned about its closures gets the safe behavior.
+        memory_binding: The Agent's resolved Memory-Space binding as
+            ``{"spaceId", "spaceName", "access"}``, a project harness's
+            scopes as ``{"projectId", "sharedSpaceId", "personalSpaceId"}``,
+            or None. A key element (see ``memory_binding_digest``) and stamped
+            on the construction snapshot so a paused turn resumes into the
+            same slot.
+        memory_context: The rendered Memory-Space block, sent after the system
+            prompt behind its own cache point. Hashed with the prompt in the
+            key and snapshotted by ``BaseAgent`` for resume.
         cache_write: Whether this caller may *populate* the cache. Read stays
             allowed either way. Set False by callers that build a partial
             toolset for a session whose real turns build more — otherwise they
@@ -298,6 +402,10 @@ async def get_agent(
         freshness_hash=freshness_hash,
         agent_type=agent_type,
         skills_hash=skills_hash,
+        document_tools=has_document_tools,
+        assistant_id=assistant_id,
+        memory_binding=memory_binding_digest(memory_binding),
+        memory_context=memory_context,
     )
 
     # Whether this turn's injected tools (if any) let it use the cache at all.
@@ -365,13 +473,31 @@ async def get_agent(
         mantle_api_mode=mantle_api_mode,
         mantle_region=mantle_region,
     )
+    if memory_context:
+        create_kwargs["memory_context"] = memory_context
     # Skills v2: ChatAgent (now the target of both "chat" and "skill" types)
     # accepts accessible_skill_ids and conditionally adds the AgentSkills
     # plugin. Pass it through whenever resolved — VoiceAgent does not take the
     # kwarg, so keep it off that path.
     if resolved_agent_type != "voice":
         create_kwargs["accessible_skill_ids"] = accessible_skill_ids
-    agent = create_agent(**create_kwargs)
+    # Decompose the build into sub-stages, same move that opened the preamble
+    # (docs/specs/turn-latency-preamble.md). A contextvar rather than a kwarg:
+    # the explicit alternative threads a parameter through a type registry and
+    # three agent classes that do not share constructor signatures, and a
+    # mis-set timing mark costs a wrong number, not wrong behaviour. See
+    # `apis/shared/observability/build_stages.py` for why that asymmetry with
+    # PR-2's explicit snapshot is deliberate.
+    from apis.shared.observability.build_stages import (
+        reset_stage_recorder,
+        set_stage_recorder,
+    )
+
+    _stage_token = set_stage_recorder(build_stage_recorder)
+    try:
+        agent = create_agent(**create_kwargs)
+    finally:
+        reset_stage_recorder(_stage_token)
 
     # One session is one conversation, even when a turn runs under a different
     # configuration (an `@`-mention, a different toolset). Runs before the
@@ -392,6 +518,11 @@ async def get_agent(
         agent._construction_snapshot["agent_type"] = resolved_agent_type
         if resolved_agent_type != "voice" and accessible_skill_ids is not None:
             agent._construction_snapshot["enabled_skills"] = list(accessible_skill_ids)
+        # The assistant is a key element (spreadsheet tools close over it), so
+        # resume must replay it verbatim or the paused agent is orphaned.
+        agent._construction_snapshot["assistant_id"] = assistant_id
+        # Same for the memory binding (memory tools close over it).
+        agent._construction_snapshot["memory_binding"] = dict(memory_binding) if memory_binding else None
 
     # Don't cache agents whose context-bound extra_tools captured anything the
     # key doesn't describe — a cached agent holds the *old* closures, so reuse
@@ -511,10 +642,11 @@ async def generate_conversation_title(
                 }
             ],
             "system": [{"text": TITLE_GENERATION_SYSTEM_PROMPT}],
+            # Temperature only: Claude 4.5+ rejects `temperature` and `topP`
+            # together, so sending both would break titles on a model swap.
             "inferenceConfig": {
                 "temperature": 0.3,  # Low temperature for consistent, focused output
                 "maxTokens": 50,      # Title should be very short
-                "topP": 0.9
             }
         }
 

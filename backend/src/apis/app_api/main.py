@@ -17,7 +17,6 @@ env_path = Path(__file__).parent.parent.parent / '.env'
 load_dotenv(dotenv_path=env_path, override=True)
 
 from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
@@ -82,17 +81,6 @@ async def lifespan(app: FastAPI):
     _validate_skip_auth_or_raise()
     logger.info("=== AgentCore Public Stack API Starting ===")
     logger.info("Agent execution engine initialized")
-
-    # Create output directories if they don't exist
-    base_dir = Path(__file__).parent.parent
-    output_dir = os.path.join(base_dir, "output")
-    uploads_dir = os.path.join(base_dir, "uploads")
-    generated_images_dir = os.path.join(base_dir, "generated_images")
-
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(uploads_dir, exist_ok=True)
-    os.makedirs(generated_images_dir, exist_ok=True)
-    logger.info("Output directories ready")
 
     yield  # Application is running
 
@@ -160,8 +148,10 @@ logger.info("Added AgentCore context middleware")
 # Starlette `add_middleware` prepends, so the LAST-added middleware is
 # outermost. Request-side order is therefore the reverse of the call order
 # below:
-#   request:  SessionRefresh → CSRF → AgentCoreContext → CORS → router
-#   response: router → CORS → AgentCoreContext → CSRF → SessionRefresh
+#   request:  ProxiedRedirect → GZip → SessionRefresh → CSRF →
+#             AgentCoreContext → CORS → router
+#   response: router → CORS → AgentCoreContext → CSRF → SessionRefresh →
+#             GZip → ProxiedRedirect
 # This is the order we need: SessionRefresh has to populate
 # `state.bff_session` before CSRF reads it.
 from apis.shared.middleware.csrf import CSRFMiddleware
@@ -170,6 +160,29 @@ from apis.shared.middleware.session_refresh import SessionRefreshMiddleware
 app.add_middleware(CSRFMiddleware)
 app.add_middleware(SessionRefreshMiddleware)
 logger.info("Added BFF session-refresh + CSRF middlewares (dormant until cookie present)")
+
+# gzip the JSON surface. Nothing compressed app-api responses before this:
+# CloudFront's `/api/*` behaviour is deliberately `compress: false` so the
+# edge never buffers a `text/event-stream`, which leaves compression to the
+# origin — the only layer that knows a response's content type rather than
+# guessing from its path. Measured on this repo's own payload shapes at
+# `compresslevel=6`: ~3.0x on a conversation-history response, ~3.9x on a
+# 5,000-row spreadsheet-shaped one. Level 9 (Starlette's default) buys 3%
+# more for 4x the CPU on the large case, so 6 — zlib's own default — it is.
+#
+# `StreamSafeGZipMiddleware` passes `text/event-stream` and already-encoded
+# bodies through untouched *and un-buffered*; see its module docstring for
+# why the second half of that matters on the chat path.
+#
+# Sits one layer inside ProxiedRedirect so it compresses everything the app
+# emits — including the error bodies CSRF and SessionRefresh return — while
+# leaving ProxiedRedirect genuinely outermost. The two never collide:
+# ProxiedRedirect reads and rewrites only `Location`, on responses (3xx)
+# whose bodies are empty or below the compression threshold anyway.
+from apis.shared.middleware.compression import StreamSafeGZipMiddleware
+
+app.add_middleware(StreamSafeGZipMiddleware, minimum_size=500, compresslevel=6)
+logger.info("Added gzip compression middleware (SSE and pre-encoded bodies excluded)")
 
 # Outermost middleware: repair `Location` headers on redirects this app
 # generates for itself (Starlette's `redirect_slashes`, chiefly). Behind
@@ -198,6 +211,9 @@ from apis.app_api.chat.proxy_routes import router as bff_chat_proxy_router
 from apis.app_api.mcp_apps.routes import router as mcp_apps_router
 from apis.app_api.memory.routes import router as memory_router
 from apis.app_api.memory_spaces.routes import router as memory_spaces_router
+from apis.app_api.notifications.routes import router as notifications_router
+from apis.app_api.projects.knowledge_routes import router as project_knowledge_router
+from apis.app_api.projects.routes import router as projects_router
 from apis.app_api.tools.routes import router as tools_router
 from apis.app_api.files.routes import router as files_router
 from apis.app_api.assistants.routes import router as assistants_router
@@ -214,9 +230,11 @@ from apis.app_api.sync_policies.routes import router as sync_policies_router
 from apis.app_api.system.routes import router as system_router
 from apis.app_api.shares.routes import conversations_share_router, shares_router, shared_view_router
 from apis.app_api.voice import router as voice_router
+from apis.app_api.dictation import router as dictation_router
 from apis.app_api.user_menu_links.routes import router as user_menu_links_router
 from apis.app_api.announcements.routes import router as announcements_router
 from apis.app_api.system_prompts.routes import router as system_prompts_router
+from apis.app_api.agent_templates.routes import router as agent_templates_router
 from apis.app_api.runs.routes import router as runs_router
 from apis.app_api.schedules.routes import router as schedules_router
 
@@ -240,6 +258,9 @@ app.include_router(converse_router)  # API-key authenticated /chat/api-converse 
 app.include_router(bff_chat_proxy_router)  # Cookie-authenticated SSE proxy (Phase 4, dormant until SPA cutover)
 app.include_router(mcp_apps_router)  # MCP Apps app-initiated tools/call proxy (PR #5; inert until host flag on)
 app.include_router(memory_spaces_router)  # Memory Spaces user surface (A2); 404s while flag off
+app.include_router(projects_router)  # Shared Projects (PR-1.2); 404s while PROJECTS_ENABLED=false
+app.include_router(project_knowledge_router)  # A project's files (PR-1.5b), over its harness's documents
+app.include_router(notifications_router)  # In-app inbox (PR-1.7); first producer is Shared Projects
 app.include_router(memory_router)  # AgentCore Memory access endpoints
 app.include_router(tools_router)  # Tool discovery and permissions
 app.include_router(files_router)  # File upload via pre-signed URLs
@@ -253,9 +274,11 @@ app.include_router(conversations_share_router)  # Share conversations endpoints
 app.include_router(shares_router)  # Share management (update, revoke, export)
 app.include_router(shared_view_router)  # Shared conversation read-only view
 app.include_router(voice_router)  # Cookie-authenticated WS proxy for Nova Sonic voice mode (#211)
+app.include_router(dictation_router)  # Composer dictation: ticketed WS proxy to Transcribe Streaming; 404s while DICTATION_ENABLED off
 app.include_router(user_menu_links_router)  # Public read of admin-managed user-menu links
 app.include_router(announcements_router)  # Feature announcements feed + ack; 404s while ANNOUNCEMENTS_ENABLED off
 app.include_router(system_prompts_router)   # Public read of admin-managed system prompts
+app.include_router(agent_templates_router)  # Public read of admin-managed agent templates (create-agent picker)
 app.include_router(runs_router)  # Headless "Run now" + grant lifecycle (scheduled-runs PR-1; SCHEDULED_RUNS_ENABLED + RBAC gated at runtime)
 app.include_router(schedules_router)  # Schedule CRUD (scheduled-runs B1; inert — SCHEDULED_RUNS_ENABLED + RBAC gated, nothing fires yet)
 
@@ -288,26 +311,6 @@ if os.environ.get("ARTIFACTS_RENDER_TOKEN_SECRET_ARN"):
     app.include_router(artifact_shares_router)
     app.include_router(shared_artifacts_router)
     logger.info("Artifact render-token and sharing routes enabled")
-
-# Mount static file directories for serving generated content
-# These are created by tools (visualization, code interpreter, etc.)
-# Use parent directory (src/) as base
-base_dir = Path(__file__).parent.parent
-output_dir = os.path.join(base_dir, "output")
-uploads_dir = os.path.join(base_dir, "uploads")
-generated_images_dir = os.path.join(base_dir, "generated_images")
-
-if os.path.exists(output_dir):
-    app.mount("/output", StaticFiles(directory=output_dir), name="output")
-    logger.info(f"Mounted static files: /output -> {output_dir}")
-
-if os.path.exists(uploads_dir):
-    app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
-    logger.info(f"Mounted static files: /uploads -> {uploads_dir}")
-
-if os.path.exists(generated_images_dir):
-    app.mount("/generated_images", StaticFiles(directory=generated_images_dir), name="generated_images")
-    logger.info(f"Mounted static files: /generated_images -> {generated_images_dir}")
 
 if __name__ == "__main__":
     import uvicorn

@@ -438,6 +438,26 @@ DEFAULT_TOOLS: list[dict[str, Any]] = [
         "forwardAuthToken": False,
     },
     {
+        "toolId": "request_user_login",
+        "displayName": "Browser Sign-In",
+        "description": (
+            "Hand the browser to the user so they can sign in to a site the "
+            "agent cannot reach, then continue browsing the authenticated "
+            "session."
+        ),
+        "category": "browser",
+        # Deliberately off by default, and the most restrictive default in this
+        # file. While a takeover is live the user has a fully interactive
+        # Chromium running inside our AWS account with our egress — that is a
+        # capability to grant to named staff/evaluator roles, never a default.
+        # RBAC granularity is one tool_id, which is exactly why this is its own
+        # entry rather than an action on browse_web.
+        "enabledByDefault": False,
+        "protocol": "local",
+        "isPublic": False,
+        "forwardAuthToken": False,
+    },
+    {
         "toolId": "generate_diagram_and_validate",
         "displayName": "Code Interpreter",
         "description": "Generate diagrams, charts, and visualizations using Python code in a sandboxed environment.",
@@ -493,6 +513,44 @@ DEFAULT_TOOLS: list[dict[str, Any]] = [
         "forwardAuthToken": False,
     },
     {
+        # Spreadsheet ANALYSIS (read an uploaded .xlsx/.csv and answer questions
+        # about it via Code Interpreter) — distinct from the spreadsheet
+        # *authoring* tool below. Both ids are context-bound: enabling them
+        # injects the tools at runtime, see SPREADSHEET_TOOL_IDS and
+        # _build_spreadsheet_tools in apis/inference_api/chat/routes.py.
+        #
+        # These two rows were missing from this file until 1.23.0 while the
+        # Python TOOL_CATALOG carried them, so a freshly bootstrapped
+        # deployment got no catalog row and the tools could not be granted to
+        # any role — the live environments only have them because the rows
+        # were created by hand. test_seed_matches_tool_catalog now pins the
+        # two lists together so they cannot drift again.
+        #
+        # enabledByDefault mirrors the live deployments (True). Safe against
+        # the injected-tool cost trap because SPREADSHEET_TOOL_IDS is in
+        # KEY_DESCRIBED_INJECTED_TOOL_IDS: the factory closes over
+        # (session_id, user_id, assistant_id), all cache-key elements, so a
+        # default-on injected tool does NOT bypass the agent cache here.
+        "toolId": "list_spreadsheets",
+        "displayName": "List Spreadsheet Files",
+        "description": "List spreadsheet files available for analysis from the assistant's knowledge base or conversation attachments.",
+        "category": "data",
+        "protocol": "local",
+        "enabledByDefault": True,
+        "isPublic": True,
+        "forwardAuthToken": False,
+    },
+    {
+        "toolId": "analyze_spreadsheet",
+        "displayName": "Analyze Spreadsheet",
+        "description": "Analyze spreadsheet data with Python in a sandboxed Code Interpreter session: filter, aggregate, compute statistics and answer questions about the contents.",
+        "category": "data",
+        "protocol": "local",
+        "enabledByDefault": True,
+        "isPublic": True,
+        "forwardAuthToken": False,
+    },
+    {
         # Single catalog entry / toggle that provisions the whole Excel
         # spreadsheet toolset. Enabling this one id injects create/modify/list/
         # read at runtime — see EXCEL_SPREADSHEET_TOOL_IDS and
@@ -523,6 +581,62 @@ DEFAULT_TOOLS: list[dict[str, Any]] = [
         "enabledByDefault": False,
         "isPublic": True,
         "forwardAuthToken": False,
+    },
+    # --- Platform self-service (Account & Usage) system tools ---
+    # .kiro/specs/platform-self-service/. `system: True` force-injects the tool
+    # on every granted turn (bypassing the user picker); an admin's runtime
+    # off-switch is this row's status (set it to `disabled` in the Tools panel —
+    # no redeploy). `hidden: True` keeps it out of the user picker list while
+    # still showing it in the transcript when invoked. isPublic so every
+    # authenticated user has it (they only ever read their OWN account); the
+    # runtime tool objects are closure-bound (agents/local_tools/account_tools.py).
+    {
+        "toolId": "whoami",
+        "displayName": "Account Lookup",
+        "description": "Look up who the signed-in user is on this platform (name, roles, plan).",
+        "category": "account",
+        "protocol": "local",
+        "enabledByDefault": True,
+        "isPublic": True,
+        "forwardAuthToken": False,
+        "system": True,
+        "hidden": True,
+    },
+    {
+        "toolId": "get_my_quota",
+        "displayName": "Usage & Quota",
+        "description": "Report how much of the signed-in user's usage quota is left.",
+        "category": "account",
+        "protocol": "local",
+        "enabledByDefault": True,
+        "isPublic": True,
+        "forwardAuthToken": False,
+        "system": True,
+        "hidden": False,
+    },
+    {
+        "toolId": "get_my_settings",
+        "displayName": "My Settings",
+        "description": "Report the signed-in user's account settings, such as their default model.",
+        "category": "account",
+        "protocol": "local",
+        "enabledByDefault": True,
+        "isPublic": True,
+        "forwardAuthToken": False,
+        "system": True,
+        "hidden": False,
+    },
+    {
+        "toolId": "set_default_model",
+        "displayName": "Change My Default Model",
+        "description": "Change the signed-in user's default model, to one they are allowed to use. Confirmation-gated write.",
+        "category": "account",
+        "protocol": "local",
+        "enabledByDefault": True,
+        "isPublic": True,
+        "forwardAuthToken": False,
+        "system": True,
+        "hidden": False,
     },
 ]
 
@@ -841,6 +955,12 @@ def seed_default_tools(
             "enabledByDefault": tool_def["enabledByDefault"],
             "isPublic": tool_def["isPublic"],
             "forwardAuthToken": tool_def["forwardAuthToken"],
+            # Platform self-service tier (.kiro/specs/platform-self-service/).
+            # Default false so every existing entry is unchanged; the account
+            # tools set them true. `system` makes the tool force-injected on
+            # granted turns; `hidden` keeps it out of the user picker list.
+            "system": tool_def.get("system", False),
+            "hidden": tool_def.get("hidden", False),
             "createdAt": now,
             "updatedAt": now,
             "createdBy": "bootstrap-seed",

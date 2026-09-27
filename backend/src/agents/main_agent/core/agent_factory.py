@@ -5,13 +5,14 @@ import os
 import logging
 from typing import List, Optional, Any
 from strands import Agent
+from strands.agent.conversation_manager import SlidingWindowConversationManager
 from strands.models import BedrockModel
 from strands.models.openai import OpenAIModel
 from strands.models.gemini import GeminiModel
 from strands.tools.executors import SequentialToolExecutor
 from agents.main_agent.core.bedrock_count_tokens import CountTokensBedrockModel
 from agents.main_agent.core.model_config import ModelConfig, ModelProvider
-from agents.main_agent.config.constants import EnvVars
+from agents.main_agent.config.constants import EnvVars, Defaults
 from apis.shared.models.bedrock_responses import build_bedrock_responses_model
 from apis.shared.models.mantle import build_mantle_model
 from apis.shared.models.usage_normalization import usage_normalized
@@ -35,7 +36,10 @@ class AgentFactory:
             so native CountTokens works for inference-profile model ids).
         """
         bedrock_config = model_config.to_bedrock_config()
-        return CountTokensBedrockModel(**bedrock_config)
+        # Strands awaits count_tokens before every model call; keep that local.
+        # Native counts are taken off the critical path by the
+        # context-attribution hook (native_count_tokens in a background task).
+        return CountTokensBedrockModel(native_projection=False, **bedrock_config)
 
     @staticmethod
     def _create_openai_model(model_config: ModelConfig) -> OpenAIModel:
@@ -185,6 +189,7 @@ class AgentFactory:
         session_manager: Any,
         hooks: Optional[List[Any]] = None,
         plugins: Optional[List[Any]] = None,
+        memory_context: Optional[str] = None,
     ) -> Agent:
         """
         Create a Strands Agent instance with the appropriate model provider
@@ -198,6 +203,9 @@ class AgentFactory:
             plugins: Optional list of Strands plugins (e.g. AgentSkills). A
                 plugin auto-registers its hooks and tools with the agent, so
                 this is how skills disclosure is wired (Skills v2).
+            memory_context: Optional rendered Memory-Space block. Sent after
+                the system prompt, behind a cache point of its own when the
+                model supports cache points (see below).
 
         Returns:
             Agent: Configured Strands Agent instance
@@ -291,6 +299,13 @@ class AgentFactory:
         # on a NON-Anthropic model this block is passed through untouched and
         # Bedrock rejects the call with AccessDeniedException.
         #
+        # PR-5 (thresholds spec §3.6): the point is placed TTL-less on purpose.
+        # With AGENTCORE_PROMPT_CACHE_STATIC_PREFIX_TTL=1h, ModelConfig sets
+        # CacheConfig(system_prompt_ttl="1h", tools_ttl="1h") and upstream's
+        # _apply_system_cache_ttl rewrites THIS point's ttl ("an explicit
+        # system_prompt_ttl string is honored as written"); the tools point
+        # gets its own. Flag unset → no ttl key anywhere → today's bytes.
+        #
         # RE-VERIFY BEFORE ANY BUMP PAST 1.55.0. This is a statement about
         # upstream internals and it has already rotted once. Re-check
         # _should_cache_system's guard, CacheConfig.system_prompt_ttl's
@@ -302,25 +317,80 @@ class AgentFactory:
         # Agent.system_prompt remains the plain string (split_system_prompt
         # concatenates the text blocks), so hashing/attribution/voice consumers
         # are unaffected.
+        #
+        # Shared Projects 2.2: a bound Memory-Space block gets the FOURTH and
+        # last cache point (tools, system, memory, auto message = Bedrock's
+        # maximum of 4). The system point stays exactly where it was, so the
+        # static prefix (tools + platform floor + instructions) is still read
+        # from cache when members edit memory; only the memory block and what
+        # follows are rewritten. Turns without memory send today's bytes. With
+        # AGENTCORE_PROMPT_CACHE_STATIC_PREFIX_TTL=1h upstream gives BOTH
+        # TTL-less system points the same 1h, which keeps the non-increasing
+        # TTL order Bedrock requires. Skills XML is appended by the plugin
+        # after the last block, as it always was.
         agent_system_prompt: Any = system_prompt
         if system_prompt and model_config.bedrock_cache_points_supported():
             agent_system_prompt = [
                 {"text": system_prompt},
                 {"cachePoint": {"type": "default"}},
             ]
+            if memory_context:
+                agent_system_prompt += [
+                    {"text": memory_context},
+                    {"cachePoint": {"type": "default"}},
+                ]
+        elif memory_context:
+            agent_system_prompt = f"{system_prompt}\n\n{memory_context}" if system_prompt else memory_context
 
         # Create agent with session manager, hooks, and system prompt
         # Use SequentialToolExecutor to prevent concurrent browser operations
         # This prevents "Failed to start and initialize Playwright" errors with NovaAct
+        #
+        # callback_handler=None is load-bearing. Left unset, Strands installs
+        # PrintingCallbackHandler, which print()s every streamed text delta to
+        # stdout with end="". The runtime ships stdout to CloudWatch, so that
+        # put user conversation content in the logs and glued unterminated text
+        # onto the front of EMF lines. Nothing here consumes callback events:
+        # the stream processor reads agent.stream_async() directly.
         agent = Agent(
             model=model,
             system_prompt=agent_system_prompt,
             tools=tools,
             tool_executor=SequentialToolExecutor(),
             session_manager=session_manager,
+            conversation_manager=AgentFactory.build_conversation_manager(),
             hooks=hooks if hooks else None,
             plugins=plugins if plugins else None,
             retry_strategy=retry_strategy,
+            callback_handler=None,
         )
 
         return agent
+
+    @staticmethod
+    def build_conversation_manager() -> SlidingWindowConversationManager:
+        """The Strands conversation manager for the chat agent.
+
+        Left unset, Strands installs ``SlidingWindowConversationManager()`` with
+        a **40-message** window and runs it after every event-loop cycle. Past
+        40 messages that slides the front of ``agent.messages`` every turn,
+        which (a) re-writes the whole cached prefix each turn — the 2026-09-15
+        prod cost audit saw fingerprint ``messageCount`` pinned at 39–41 with
+        every turn reading only tools+system — and (b) moves the list our
+        compaction checkpoint is expressed in (spiral-spec D3, ANCHOR_MISMATCH
+        on 14 of 20 audited sessions). History size is ``TurnBasedSessionManager``'s
+        job (docs/specs/compaction-model-relative-thresholds.md), so the window
+        is set large enough never to trim on its own. The manager is kept
+        (rather than ``NullConversationManager``) because its ``reduce_context``
+        is the only ``ContextWindowOverflowException`` recovery in the stack,
+        and that path does not depend on the window size.
+
+        ``AGENTCORE_CONVERSATION_WINDOW_MESSAGES=40`` restores the SDK default.
+        """
+        raw = os.environ.get(EnvVars.CONVERSATION_WINDOW_MESSAGES, "").strip()
+        try:
+            window = int(raw) if raw else Defaults.CONVERSATION_WINDOW_MESSAGES
+        except ValueError:
+            window = Defaults.CONVERSATION_WINDOW_MESSAGES
+        window = max(2, window)
+        return SlidingWindowConversationManager(window_size=window, should_truncate_results=True)

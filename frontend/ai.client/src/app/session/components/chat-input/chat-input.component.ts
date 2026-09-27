@@ -9,7 +9,9 @@ import {
   effect,
   untracked,
   afterNextRender,
+  DestroyRef,
   ElementRef,
+  Injector,
 } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { v4 as uuidv4 } from 'uuid';
@@ -18,6 +20,7 @@ import { NgIcon, provideIcons } from '@ng-icons/core';
 import {
   heroPlus,
   heroArrowTurnDownRight,
+  heroCheck,
   heroClock,
   heroMicrophone,
   heroXMark,
@@ -26,12 +29,14 @@ import { heroArrowUpSolid, heroStopSolid } from '@ng-icons/heroicons/solid';
 import { ModelDropdownComponent } from '../../../components/model-dropdown/model-dropdown.component';
 import { AnnouncementBannerComponent } from '../../../components/announcement-banner/announcement-banner.component';
 import { QuotaWarningBannerComponent } from '../../../components/quota-warning-banner/quota-warning-banner.component';
+import { AgentNoticeBannerComponent } from '../agent-notice-banner/agent-notice-banner.component';
 import { TooltipDirective } from '../../../components/tooltip';
 import { FileCardComponent } from '../../../components/file-card';
 import { StorageQuotaBannerComponent } from '../../../components/storage-quota-banner';
 import { SpinnerComponent } from '../../../components/spinner/spinner.component';
 import {
   FileUploadService,
+  FileMetadata,
   PendingUpload,
   ALLOWED_EXTENSIONS,
   maxFileSizeFor,
@@ -41,6 +46,11 @@ import {
 import { ToastService } from '../../../services/toast/toast.service';
 import { ToolService } from '../../../services/tool/tool.service';
 import { VoiceChatService, type VoiceStatus } from '../../services/voice';
+import {
+  DictationService,
+  DictationUnavailableError,
+  type DictationEndReason,
+} from '../../services/dictation';
 import { SystemPromptsService } from '../../../services/system-prompts/system-prompts.service';
 import {
   AgentMentionService,
@@ -51,18 +61,65 @@ import {
   SkillCommand,
   SkillCommandService,
   findSkillCommands,
-  removeSkillCommand,
 } from '../../../services/skill/skill-command.service';
 import { SkillCommandMenuComponent } from './skill-command-menu.component';
 import { SteeringService } from '../../services/chat/steering.service';
+import { ComposerDraftService } from '../../services/session/composer-draft.service';
+import {
+  ComposerDraftStorageService,
+  EMPTY_DRAFT,
+  StoredAttachment,
+  StoredComposerDraft,
+} from '../../services/session/composer-draft-storage.service';
+import { ComposerHandoffService } from './composer-handoff.service';
+import { ComposerSegment, findHighlightRanges, toSegments } from './composer-highlights';
 
-// Must stay in sync with the inline min-height/max-height on the textarea in
-// chat-input.component.html.
+// Must stay in sync with the min-height/max-height classes on the textarea in
+// chat-input.component.html (`textareaClass`).
 const MIN_TEXTAREA_HEIGHT_PX = 60;
+const COMPACT_MIN_TEXTAREA_HEIGHT_PX = 40;
 const MAX_TEXTAREA_HEIGHT_PX = 200;
+
+/**
+ * A compact textarea taller than this has wrapped onto a second line: one
+ * 24px line plus 8px padding top and bottom is 40, and the slack absorbs
+ * sub-pixel rounding without admitting a second line.
+ */
+const COMPACT_SINGLE_LINE_MAX_PX = 44;
+
+/** How long the shell takes to change height when the composer folds, unfolds or docks. */
+const SHELL_RESIZE_MS = 200;
 
 /** The composer's resting placeholder, and the string the rotation settles back on. */
 const IDLE_PLACEHOLDER = 'How can I help you today?';
+
+/**
+ * Where dictated text goes: the composer's text either side of the caret (or
+ * selection, which dictation replaces) when the user pressed Dictate.
+ */
+export interface DictationAnchor {
+  before: string;
+  after: string;
+}
+
+/**
+ * Splice dictated text into the composer at its anchor, padding with a space
+ * only where the neighbouring text does not already supply whitespace.
+ * Returns the new value and where the caret belongs — just after the insert.
+ */
+export function spliceDictation(
+  anchor: DictationAnchor,
+  dictated: string,
+): { value: string; caret: number } {
+  const text = dictated.trim();
+  if (!text) {
+    return { value: anchor.before + anchor.after, caret: anchor.before.length };
+  }
+  const lead = anchor.before && !/\s$/.test(anchor.before) ? ' ' : '';
+  const trail = anchor.after && !/^\s/.test(anchor.after) ? ' ' : '';
+  const head = anchor.before + lead + text;
+  return { value: head + trail + anchor.after, caret: head.length };
+}
 
 /** Dwell per rotating hint. Long enough to read a short line without hurrying. */
 const HINT_ROTATION_MS = 4500;
@@ -110,6 +167,16 @@ interface QueuedMessage {
   id: string;
   content: string;
   fileUploadIds?: string[];
+  /**
+   * Display metadata for `fileUploadIds`, captured at queue time.
+   *
+   * Queueing releases the composer's attachments so the next follow-up can
+   * attach its own, which means the ids on this entry outlive the only two
+   * places their filename and size could be read from. Without this copy a
+   * queued question restored after a reload comes back without the file it
+   * was about.
+   */
+  attachments?: StoredAttachment[];
   mentionAgentId?: string;
   invokedSkillIds?: string[];
   /**
@@ -133,9 +200,54 @@ interface MentionToken {
   start: number;
 }
 
+/**
+ * A restored card back into the shape storage keeps.
+ *
+ * The composer holds restored attachments as `FileMetadata` — the card's own
+ * server-side shape — so the template binds them directly instead of mapping
+ * on every change detection pass. Only the four display fields are stored;
+ * `s3Uri`, `createdAt` and `status` come back from the reconcile, and nothing
+ * reads them before it lands.
+ */
+function toStoredAttachment(file: FileMetadata): StoredAttachment {
+  return {
+    uploadId: file.uploadId,
+    filename: file.filename,
+    mimeType: file.mimeType,
+    sizeBytes: file.sizeBytes,
+  };
+}
+
+/** The cached half of a `FileMetadata`, good enough to paint a card with. */
+function toFileMetadata(attachment: StoredAttachment, sessionId: string): FileMetadata {
+  return {
+    uploadId: attachment.uploadId,
+    filename: attachment.filename,
+    mimeType: attachment.mimeType,
+    sizeBytes: attachment.sizeBytes,
+    sessionId,
+    s3Uri: '',
+    status: 'ready',
+    createdAt: '',
+  };
+}
+
+/**
+ * First mention of each upload id wins, so an attachment held by both the
+ * composer and a queued follow-up is stored (and restored) once.
+ */
+function dedupeAttachments(attachments: StoredAttachment[]): StoredAttachment[] {
+  const seen = new Set<string>();
+  return attachments.filter(attachment => {
+    if (seen.has(attachment.uploadId)) return false;
+    seen.add(attachment.uploadId);
+    return true;
+  });
+}
+
 @Component({
   selector: 'app-chat-input',
-  imports: [AnnouncementBannerComponent, FormsModule, ModelDropdownComponent, NgIcon, QuotaWarningBannerComponent, StorageQuotaBannerComponent, TooltipDirective, FileCardComponent, AgentMentionMenuComponent, SkillCommandMenuComponent, SpinnerComponent],
+  imports: [AgentNoticeBannerComponent, AnnouncementBannerComponent, FormsModule, ModelDropdownComponent, NgIcon, QuotaWarningBannerComponent, StorageQuotaBannerComponent, TooltipDirective, FileCardComponent, AgentMentionMenuComponent, SkillCommandMenuComponent, SpinnerComponent],
   // `relative` is the anchor the announcement banner floats against — it sits
   // `bottom-full` of this host, above the quota tabs and clear of the composer.
   host: { class: 'relative block' },
@@ -143,6 +255,7 @@ interface MentionToken {
     provideIcons({
       heroPlus,
       heroArrowTurnDownRight,
+      heroCheck,
       heroClock,
       heroMicrophone,
       heroXMark,
@@ -158,10 +271,16 @@ export class ChatInputComponent {
   private readonly fileUploadService = inject(FileUploadService);
   private readonly toastService = inject(ToastService);
   private readonly steering = inject(SteeringService);
+  private readonly composerDraft = inject(ComposerDraftService);
+  private readonly draftStorage = inject(ComposerDraftStorageService);
   private readonly toolService = inject(ToolService);
   private readonly voiceChatService = inject(VoiceChatService);
+  private readonly dictation = inject(DictationService);
   protected readonly systemPromptsService = inject(SystemPromptsService);
   private readonly router = inject(Router);
+  private readonly handoff = inject(ComposerHandoffService);
+  private readonly injector = inject(Injector);
+  private readonly destroyRef = inject(DestroyRef);
 
   // Input: session ID for file uploads
   readonly sessionId = input<string | null>(null);
@@ -175,6 +294,11 @@ export class ChatInputComponent {
   // Input: show voice mode toggle (defaults to true). Disabled where voice
   // is not meaningful, e.g. the assistant editor preview.
   readonly showVoiceControl = input<boolean>(true);
+
+  // Input: show the Dictate (speech-to-text) button (defaults to true). Unlike
+  // voice, dictation only fills this composer, so it stays on in the preview
+  // panes; the input is here for an embedder that has no use for it.
+  readonly showDictationControl = input<boolean>(true);
 
   // Input: auto-focus the textarea on load and session change (defaults to true).
   // Disabled where the input sits beside an editable form (e.g. assistant preview).
@@ -209,7 +333,33 @@ export class ChatInputComponent {
    */
   readonly announcementPlacement = input<'above' | 'below'>('above');
 
+  /**
+   * Which conversation's unsent text this composer parks and takes back, or
+   * `null` (the default) to remember nothing.
+   *
+   * Deliberately not `sessionId`. That input is the id file uploads attach
+   * to, which a new conversation mints the moment a file is staged — keying
+   * drafts off it would blank the composer the instant someone attached a
+   * file to text they had already typed. The container passes the *route*
+   * conversation, or `NEW_CONVERSATION_DRAFT_KEY` for one not yet sent.
+   *
+   * Opt-in rather than opt-out, unlike the `show*` controls above: an
+   * embedded preview pane is a throwaway, and text left in one should not
+   * come back the next time it is opened.
+   */
+  readonly draftKey = input<string | null>(null);
+
+  /**
+   * The conversation layout: one row — attach, text, speech controls — with
+   * the model picker and the cost/context line moved beneath the shell. False
+   * (the default) is the roomy empty-state composer, which keeps the picker in
+   * its own bar. The container sets this once the conversation has messages.
+   */
+  readonly compact = input<boolean>(false);
+
   private readonly messageInput = viewChild<ElementRef<HTMLTextAreaElement>>('messageInput');
+  private readonly shell = viewChild<ElementRef<HTMLElement>>('shell');
+  private readonly highlightMirror = viewChild<ElementRef<HTMLElement>>('highlightMirror');
 
   // Use the input directly - parent controls loading state
   protected readonly isLoading = computed(() => this.isChatLoading());
@@ -240,6 +390,26 @@ export class ChatInputComponent {
   /** Whether a turn has been observed in flight since the last queue flush. */
   private turnInFlight = false;
 
+  /**
+   * The draft key this composer is currently mirroring, or `undefined` before
+   * it has adopted one.
+   *
+   * The three states are distinct and all load-bearing: `undefined` means
+   * there is no outgoing draft to park (first mount), `null` means
+   * persistence is off for this placement, and a string is a conversation
+   * whose text must be written back before the composer adopts another's.
+   */
+  private mirroredDraftKey: string | null | undefined = undefined;
+
+  /**
+   * An `@`-mention restored from a draft, waiting for the candidate list to
+   * load so it can be re-bound to a current row. Cleared on the first resolve
+   * attempt with a non-empty list — a hit binds, a miss drops it, and both are
+   * final so a later list change cannot resurrect a mention the user has since
+   * removed.
+   */
+  private readonly pendingMentionAgentId = signal<string | null>(null);
+
   // Output events
   fileAttached = output<File>();
   messageSubmitted = output<Message>();
@@ -250,8 +420,40 @@ export class ChatInputComponent {
   readonly hasActivePendingUploads = this.fileUploadService.hasActivePendingUploads;
   readonly readyUploadIds = this.fileUploadService.readyUploadIds;
 
+  /**
+   * Files attached in an earlier visit to this conversation, rebuilt from the
+   * stored draft.
+   *
+   * Metadata, not an upload: the bytes are already in S3 and the id is all the
+   * send needs, so there is nothing to re-upload and no `File` to hold. They
+   * render through `app-file-card`'s existing `[file]` input — the same shape
+   * the file browser passes it — which is why restoring one costs no changes
+   * to the card.
+   *
+   * Painted straight from storage so the cards are there on first frame, then
+   * reconciled against the server (see `reconcileRestoredAttachments`), which
+   * is what makes a stale or hand-edited id disappear instead of failing at
+   * send time.
+   */
+  readonly restoredAttachments = signal<FileMetadata[]>([]);
+
+  /**
+   * Every upload id this message would carry: restored first, then the ones
+   * uploaded in this sitting, so the order matches the order they were
+   * attached. Both send paths read this rather than `readyUploadIds`, or a
+   * restored attachment would show a card and then not travel.
+   */
+  readonly attachmentIds = computed(() => [
+    ...new Set([
+      ...this.restoredAttachments().map(attachment => attachment.uploadId),
+      ...this.readyUploadIds(),
+    ]),
+  ]);
+
   // Computed: show file attachments area
-  readonly showFileAttachments = computed(() => this.pendingUploads().length > 0);
+  readonly showFileAttachments = computed(
+    () => this.pendingUploads().length > 0 || this.restoredAttachments().length > 0,
+  );
 
   /**
    * Whether a follow-up typed right now could land *inside* the running turn.
@@ -274,6 +476,11 @@ export class ChatInputComponent {
    * ends, learns not to trust the affordance.
    */
   protected readonly placeholder = computed(() => {
+    // Shown only until the first words arrive; after that the transcript is
+    // the textarea's value.
+    if (this.isDictating()) {
+      return this.dictationStatus() === 'connecting' ? 'Starting dictation…' : 'Listening…';
+    }
     // A prompt awaiting an answer holds the queue, and the turn is NOT
     // streaming while it does — so the idle placeholder would be the most
     // wrong of the three: it promises immediate delivery on the one path that
@@ -295,6 +502,104 @@ export class ChatInputComponent {
   protected readonly queueHeld = computed(() =>
     this.steering.shouldHoldQueue(this.sessionId()),
   );
+
+  // =========================================================================
+  // Layout
+  //
+  // There is no send button: Enter sends, and a button nobody clicked was
+  // costing a row of height on every conversation page. What the button also
+  // did has to live somewhere else, and each piece has its own home:
+  //
+  // - **Stop** takes voice mode's slot while a response streams (and Escape
+  //   stops, when no menu or dictation is using the key).
+  // - **Send on touch.** A phone has no Enter a user thinks of as "send", so on
+  //   a coarse pointer return adds a line and a send button appears, in the
+  //   same slot, only once there is something to send.
+  // - **Why Enter did nothing** — an upload still in flight — is said in words
+  //   on the status line under the shell, where the disabled button used to
+  //   say it by being grey.
+  //
+  // Compact is one row while the draft fits on one line. Once it wraps, the
+  // text takes the full width and the buttons drop to a bar beneath it (the
+  // empty state's shape), so a long draft is not framed by two columns of dead
+  // space. It folds back only when the draft is empty again: folding at the
+  // wrap point would flip the layout back and forth on every keystroke that
+  // crossed it.
+  // =========================================================================
+
+  /** A compact draft that wrapped and took the full width. */
+  protected readonly unfolded = signal(false);
+
+  /** Text on top, controls in a bar beneath: the empty state, or a compact draft that wrapped. */
+  protected readonly stacked = computed(() => !this.compact() || this.unfolded());
+
+  /**
+   * Whether the primary pointer is a finger. Read live rather than once: a
+   * tablet that gains a trackpad, or devtools' device toggle, flips it.
+   */
+  protected readonly isCoarsePointer = signal(false);
+
+  /** There is something a send would carry. */
+  private readonly hasDraft = computed(
+    () => this.userInput().trim().length > 0 || this.attachmentIds().length > 0,
+  );
+
+  /** Stop, in voice mode's slot. Voice runs its own stop inside the overlay. */
+  protected readonly showStop = computed(
+    () => this.isLoading() && !this.isVoiceActive() && !this.isDictating(),
+  );
+
+  /**
+   * Send, for touch only. Makes the same decision Enter does (`onSubmit`), so
+   * mid-stream it queues a follow-up exactly as a keyboard user's Enter would.
+   */
+  protected readonly showTouchSend = computed(
+    () => this.isCoarsePointer() && this.hasDraft() && !this.isDictating(),
+  );
+
+  /** Voice mode keeps its slot unless Stop or touch Send needs it — or voice is live, to end it. */
+  protected readonly showVoiceSlot = computed(
+    () =>
+      this.showVoiceControl() &&
+      (this.isVoiceActive() || (!this.showStop() && !this.showTouchSend())),
+  );
+
+  /**
+   * One short line on the status side of the meta line, standing in for cost
+   * and context while it applies. Only for the states where the composer is
+   * doing something the user did not see coming — a queue held behind a prompt
+   * already explains itself in the shelf above the text.
+   */
+  protected readonly statusHint = computed<string | null>(() => {
+    if (this.isDictating()) {
+      return this.dictationStatus() === 'connecting'
+        ? 'Starting dictation…'
+        : 'Enter to insert · Esc to cancel';
+    }
+    if (this.hasActivePendingUploads()) return 'Enter sends once the upload finishes';
+    // Compact only: the empty state's composer streams for a frame or two at
+    // most — until the first send swaps it out — and a line flashing in under
+    // it for that long reads as a glitch, not a hint.
+    if (this.showStop() && this.compact() && !this.isCoarsePointer()) return 'Esc to stop';
+    return null;
+  });
+
+  /**
+   * Whether the line beneath the shell renders. Always in compact — it holds
+   * the model picker — and in the empty state only while there is a status to
+   * say, since the empty state has no cost yet and keeps its picker in the bar.
+   */
+  protected readonly showMetaLine = computed(() => this.compact() || this.statusHint() !== null);
+
+  /**
+   * Padding shared by the textarea, the highlight mirror behind it and the
+   * hint overlay in front of it. The three must wrap identically, or the
+   * highlight drifts off its token and the hint off the placeholder.
+   */
+  protected readonly fieldPadding = computed(() => {
+    if (!this.compact()) return 'px-2 py-4';
+    return this.unfolded() ? 'px-2 pt-2 pb-1' : 'px-2 py-2';
+  });
 
   // =========================================================================
   // Rotating discovery hints
@@ -368,10 +673,27 @@ export class ChatInputComponent {
     () =>
       !this.prefersReducedMotion &&
       this.userInput().length === 0 &&
+      !this.isDictating() &&
       !this.isLoading() &&
       !this.queueHeld() &&
       this.composerHints().length > 1,
   );
+
+  /**
+   * Placeholder colour follows the hint overlay (the two must never both show);
+   * text colour goes italic and a step lighter while a dictation preview is
+   * showing, so heard-but-not-inserted words read as provisional.
+   */
+  protected readonly textareaClass = computed(() => {
+    const placeholder = this.showHintOverlay()
+      ? 'placeholder:text-transparent'
+      : 'placeholder:text-gray-500 dark:placeholder:text-gray-400';
+    const text = this.isDictating()
+      ? 'italic text-gray-600 dark:text-gray-300'
+      : 'text-gray-900 dark:text-gray-100';
+    const minHeight = this.compact() ? 'min-h-10' : 'min-h-15';
+    return `${placeholder} ${text} ${minHeight} ${this.fieldPadding()}`;
+  });
 
   /** Whether the hint is still advancing, as opposed to resting on the idle line. */
   protected readonly rotateHints = computed(
@@ -406,7 +728,7 @@ export class ChatInputComponent {
   // Computed: can submit (has content or ready files)
   readonly canSubmit = computed(() => {
     const hasText = this.userInput().trim().length > 0;
-    const hasReadyFiles = this.readyUploadIds().length > 0;
+    const hasReadyFiles = this.attachmentIds().length > 0;
     const isUploading = this.hasActivePendingUploads();
     return (hasText || hasReadyFiles) && !isUploading;
   });
@@ -424,11 +746,11 @@ export class ChatInputComponent {
     const base = 'flex size-10 items-center justify-center rounded-lg transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-primary)]';
     switch (status) {
       case 'listening':
-        return `${base} bg-state-danger-100 text-state-danger-600 dark:bg-state-danger-900/30 dark:text-state-danger-400 animate-pulse`;
+        return `${base} bg-state-danger-100 text-state-danger-700 dark:bg-state-danger-900/30 dark:text-state-danger-400 animate-pulse`;
       case 'speaking':
-        return `${base} bg-state-success-100 text-state-success-600 dark:bg-state-success-900/30 dark:text-state-success-400`;
+        return `${base} bg-state-success-100 text-state-success-700 dark:bg-state-success-900/30 dark:text-state-success-400`;
       case 'connecting':
-        return `${base} bg-state-warning-100 text-state-warning-600 dark:bg-state-warning-900/30 dark:text-state-warning-400`;
+        return `${base} bg-state-warning-100 text-state-warning-700 dark:bg-state-warning-900/30 dark:text-state-warning-400`;
       default:
         return `${base} text-gray-500 dark:text-gray-400 hover:bg-gray-100 hover:text-gray-700 dark:hover:bg-white/5 dark:hover:text-gray-300`;
     }
@@ -453,6 +775,45 @@ export class ChatInputComponent {
       default: return 'Voice mode';
     }
   });
+
+  // =========================================================================
+  // Dictation
+  //
+  // Speech-to-text into this composer. While it runs the textarea shows the
+  // anchored text with the live transcript spliced in, read-only and in
+  // italics; `userInput` is not touched until Done, so a Cancel restores the
+  // composer exactly and a draft never captures a half-heard partial.
+  //
+  // `DictationService` is a root singleton; `ownsDictation` scopes its state
+  // to the composer that started it, so an embedded preview composer never
+  // renders another composer's dictation.
+  // =========================================================================
+
+  private readonly ownsDictation = signal(false);
+  private readonly dictationAnchor = signal<DictationAnchor | null>(null);
+
+  protected readonly isDictating = computed(
+    () => this.ownsDictation() && this.dictation.isActive(),
+  );
+  protected readonly dictationStatus = this.dictation.status;
+  protected readonly dictationLevels = this.dictation.levels;
+
+  protected readonly showDictateButton = computed(
+    () =>
+      this.showDictationControl() &&
+      this.dictation.isSupported() &&
+      !this.dictation.unavailable(),
+  );
+
+  /** The live composed text while dictating, or null when not. */
+  private readonly dictationPreview = computed(() => {
+    const anchor = this.dictationAnchor();
+    if (!anchor || !this.isDictating()) return null;
+    return spliceDictation(anchor, this.dictation.transcript()).value;
+  });
+
+  /** What the textarea shows: the dictation preview while it runs, else the user's text. */
+  protected readonly composerText = computed(() => this.dictationPreview() ?? this.userInput());
 
   // =========================================================================
   // `@`-mention (Marketplace D11)
@@ -493,8 +854,8 @@ export class ChatInputComponent {
    * **One mention per turn.** D11 hands *the* turn to *an* Agent, so a second mention has
    * nothing to mean. Suppressing the menu while one is pending also stops it re-opening
    * when the caret lands back inside the `@Name` text already committed — names contain
-   * spaces, so that would otherwise happen constantly. The chip's `✕` is how you change
-   * your mind.
+   * spaces, so that would otherwise happen constantly. Deleting the `@Name` is how you
+   * change your mind (`dropStaleMention`).
    */
   readonly isMentionMenuOpen = computed(
     () =>
@@ -567,6 +928,27 @@ export class ChatInputComponent {
   }
 
   /**
+   * The draft split into plain and live runs, for the mirror layer painted
+   * behind the textarea — or null when nothing in it is live, so the mirror is
+   * not rendered at all.
+   *
+   * This is the whole indicator for `@` and `/` now. A chip beside the input
+   * said the same thing as the token already in the text, and cost the compact
+   * row its width; a tint on the token itself says it in place. Off while
+   * dictating, when the textarea shows a preview rather than `userInput`.
+   */
+  protected readonly highlightSegments = computed<ComposerSegment[] | null>(() => {
+    if (this.isDictating()) return null;
+    const text = this.userInput();
+    const ranges = findHighlightRanges(
+      text,
+      this.mentionedAgent()?.name ?? null,
+      this.invokedSkills().map((command) => command.slug),
+    );
+    return toSegments(text, ranges);
+  });
+
+  /**
    * Only one of the two menus is ever open. `@` wins a tie because it is the narrower
    * token (a `@` cannot also be the start of a `/` command), and because both menus
    * claiming the arrow keys would make neither usable.
@@ -596,7 +978,35 @@ export class ChatInputComponent {
     });
 
     // Focus the textarea on first mount...
-    afterNextRender(() => this.focusInput());
+    // ...and size it, because a draft restored before the view existed set the
+    // signal but had no element to grow.
+    afterNextRender(() => {
+      this.focusInput();
+      this.sizeTextareaTo(untracked(this.userInput));
+      // A compact composer mounted by the first send: shrink from the empty
+      // state's composer rather than appearing at the final size.
+      if (untracked(this.compact)) {
+        const from = this.handoff.take();
+        const shell = this.shell()?.nativeElement;
+        if (from && shell) this.animateShellFrom(shell, from);
+      }
+    });
+
+    if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+      const pointer = window.matchMedia('(pointer: coarse)');
+      this.isCoarsePointer.set(pointer.matches);
+      const onPointerChange = (event: MediaQueryListEvent) => this.isCoarsePointer.set(event.matches);
+      pointer.addEventListener?.('change', onPointerChange);
+      this.destroyRef.onDestroy(() => pointer.removeEventListener?.('change', onPointerChange));
+    }
+
+    // Fold a wrapped compact draft back to one row once it is empty — after a
+    // send, a queue, or the user clearing it. Never earlier: see "Layout".
+    effect(() => {
+      if (this.unfolded() && this.userInput().length === 0 && !this.isDictating()) {
+        untracked(() => this.setUnfolded(false));
+      }
+    });
     // ...and whenever the session changes (new or existing). When switching
     // between sessions in the messages view the component instance is reused,
     // so afterNextRender alone would not refocus.
@@ -611,6 +1021,65 @@ export class ChatInputComponent {
       if (sessionId === null) {
         this.hintStep.set(0);
         this.hintsSettled.set(false);
+      }
+    });
+
+    // Park the composer's unsent text under its conversation, and take back
+    // whatever was parked when the user returns to one.
+    //
+    // A single effect over both signals, because the two cases have to be
+    // told apart: when only the text changed, mirror it; when the
+    // conversation changed, the text still belongs to the one being left, so
+    // it is written *there* before this composer adopts the new one's draft.
+    // Keying the write off the incoming conversation instead would file one
+    // thread's half-written question under another's.
+    //
+    // Every path that empties the composer — send, queue-as-follow-up, the
+    // user deleting it — flows through `userInput` and so forgets the draft
+    // without naming it. The one exception is send: it also writes at once
+    // (`persistDraftNow`), because the first send can destroy this instance
+    // before the effect runs again.
+    effect(() => {
+      const key = this.draftKey();
+      const draft = this.composerDraftSnapshot();
+      untracked(() => this.syncDraft(key, draft));
+    });
+
+    // Re-bind a restored `@`-mention once the candidate list arrives.
+    //
+    // The draft stores the Agent's id, not the row: a name, icon or tagline
+    // that changed since the draft was written must come back current, and an
+    // Agent that was deleted or unshared must come back not at all rather than
+    // as a stale row the send would reject. The list loads lazily, so this
+    // waits for it instead of resolving at adopt time — `pendingMentionAgentId`
+    // is what holds the intent across that gap.
+    effect(() => {
+      const candidates = this.mentionService.mentionable();
+      const wanted = this.pendingMentionAgentId();
+      if (!wanted || candidates.length === 0) return;
+      const match = candidates.find(agent => agent.agentId === wanted);
+      untracked(() => {
+        this.pendingMentionAgentId.set(null);
+        if (match) this.mentionedAgent.set(match);
+      });
+    });
+
+    // A feature (today: the feedback retry-with-correction) can hand this
+    // composer a draft for its session. Set it, size the textarea to it and
+    // focus so the user edits and sends; never submit on their behalf.
+    effect(() => {
+      const draft = this.composerDraft.pending();
+      const sessionId = untracked(this.sessionId);
+      if (!draft || draft.sessionId !== sessionId) return;
+      const taken = untracked(() => this.composerDraft.consume(sessionId));
+      if (!taken) return;
+      this.userInput.set(taken.text);
+      const textarea = this.messageInput()?.nativeElement;
+      if (textarea) {
+        textarea.value = taken.text;
+        this.autoResize(textarea);
+        textarea.focus();
+        textarea.setSelectionRange(taken.text.length, taken.text.length);
       }
     });
 
@@ -687,8 +1156,44 @@ export class ChatInputComponent {
       // stays visible and removable rather than being fired into a rejection.
       this.turnInFlight = false;
       this.queuedMessages.set(rest);
-      this.messageSubmitted.emit({ ...next, timestamp: new Date() });
+      // Built field by field rather than spread: the entry also carries queue
+      // bookkeeping (`id`, `armed`, cached attachment metadata) that is ours,
+      // not the conversation's.
+      this.messageSubmitted.emit({
+        content: next.content,
+        timestamp: new Date(),
+        fileUploadIds: next.fileUploadIds,
+        mentionAgentId: next.mentionAgentId,
+        invokedSkillIds: next.invokedSkillIds,
+      });
     });
+
+    // Keep the textarea's height tracking the transcript as it grows, and
+    // keep the newest words in view.
+    effect(() => {
+      const preview = this.dictationPreview();
+      if (preview === null) return;
+      const textarea = this.messageInput()?.nativeElement;
+      if (!textarea) return;
+      textarea.value = preview;
+      this.autoResize(textarea);
+      textarea.scrollTop = textarea.scrollHeight;
+    });
+
+    // The conversation changed under a running dictation (the route moving
+    // from a new chat to its id after a send, or the user switching threads).
+    // Re-anchor at the end of the composer that is now showing rather than
+    // cancel: the user is mid-sentence, and the old anchor's text has already
+    // been parked with its own conversation by the draft effect above.
+    effect(() => {
+      this.draftKey();
+      untracked(() => {
+        if (!this.ownsDictation()) return;
+        this.dictationAnchor.set({ before: this.userInput(), after: '' });
+      });
+    });
+
+    inject(DestroyRef).onDestroy(() => this.cancelDictation());
   }
 
   private focusInput(): void {
@@ -698,12 +1203,189 @@ export class ChatInputComponent {
   }
 
   /**
-   * Enter (and the send affordance when idle). While a response is streaming
-   * this **queues** rather than stopping: Enter always means "say this".
+   * Everything about the composer worth coming back to, as one value the
+   * persistence effect can depend on.
    *
-   * Stopping stays on the button, deliberately. Making Enter ambiguous — send
-   * when idle, abort when busy — is what let a reflex keystroke kill a run the
-   * user was waiting on, and stopping is the rarer, more destructive of the two.
+   * **Only unarmed follow-ups are captured.** An armed entry is one the
+   * backend has confirmed it holds against the running turn, so the user's
+   * words are already delivered and restoring them would be the duplicate;
+   * an unarmed one has no such confirmation and dies with this component, so
+   * it is the one actually at risk. Between those two the ambiguous case —
+   * armed while the arm request was still in flight — resolves as a visible
+   * duplicate rather than a silent loss, which is the same trade the queue
+   * itself makes (see `QueuedMessage.armed`).
+   */
+  private composerDraftSnapshot(): StoredComposerDraft {
+    const queuedEntries = this.queuedMessages().filter(entry => !entry.armed);
+    const attachments = [
+      ...this.attachmentMetadata(),
+      // A queued follow-up carries its own attachments; they are just as unsent
+      // as the composer's, and folding the text back without them would send
+      // the question without the file it was about.
+      ...queuedEntries.flatMap(entry => entry.attachments ?? []),
+    ];
+    return {
+      text: this.userInput(),
+      mentionAgentId: this.mentionedAgent()?.agentId ?? this.pendingMentionAgentId() ?? undefined,
+      queued: queuedEntries.map(entry => entry.content).filter(content => !!content),
+      attachments: dedupeAttachments(attachments),
+      attachmentSessionId: this.sessionId() ?? undefined,
+    };
+  }
+
+  /** Every attachment currently on the composer, in the order it will be sent. */
+  private attachmentMetadata(): StoredAttachment[] {
+    return dedupeAttachments([
+      ...this.restoredAttachments().map(toStoredAttachment),
+      ...this.fileUploadService.readyUploads().map(upload => ({
+        uploadId: upload.uploadId,
+        filename: upload.file.name,
+        mimeType: upload.file.type || 'application/octet-stream',
+        sizeBytes: upload.file.size,
+      })),
+    ]);
+  }
+
+  /**
+   * Mirror the composer into storage, or swap drafts when the conversation
+   * changed. See the effect in the constructor.
+   */
+  private syncDraft(key: string | null, draft: StoredComposerDraft): void {
+    if (key === this.mirroredDraftKey) {
+      if (key !== null) this.draftStorage.write(key, draft);
+      return;
+    }
+    // `draft` is the outgoing conversation's — park it there first. `undefined`
+    // is first mount, where there is nothing to park.
+    if (this.mirroredDraftKey) {
+      this.draftStorage.write(this.mirroredDraftKey, draft);
+      // `FileUploadService` is application-wide, so its pending list is not
+      // scoped to a conversation by itself. The line above just filed these
+      // under the conversation being left; releasing them here is what stops
+      // them following the user into the next one.
+      this.fileUploadService.clearReadyUploads();
+    }
+    this.mirroredDraftKey = key;
+    this.adoptDraft(key === null ? EMPTY_DRAFT : this.draftStorage.read(key));
+    // Write the adopted state straight back, rather than waiting for the next
+    // change. On first mount there is nothing to wait for, and a file staged
+    // from the empty-state page before this composer rendered would otherwise
+    // never be filed against the conversation at all.
+    if (key !== null) this.draftStorage.write(key, this.composerDraftSnapshot());
+  }
+
+  /**
+   * Write the composer's state under its conversation now, instead of on the
+   * draft effect's next run.
+   *
+   * The first send from the empty state swaps this composer for the compact
+   * one, and the swap destroys this instance before its effect runs again. The
+   * mirrored draft would then still hold the message just sent, and every later
+   * New Session would open with it in the composer.
+   */
+  private persistDraftNow(): void {
+    if (this.mirroredDraftKey) {
+      this.draftStorage.write(this.mirroredDraftKey, this.composerDraftSnapshot());
+    }
+  }
+
+  /**
+   * Replace the composer's contents with a conversation's remembered draft
+   * (or empty it, when that conversation has none).
+   *
+   * **Queued follow-ups come back as composer text, not as queued chips.** A
+   * chip promises the follow-up goes out when the turn ends, and after a
+   * reload there is no turn left to hang that promise on: the flush is
+   * edge-triggered on a stream this component never saw start, so a restored
+   * chip would sit there forever. Text makes no promise and loses nothing —
+   * the user presses Enter and it queues again. They land ahead of the live
+   * text because that is the order they were written in.
+   *
+   * The textarea is written directly as well as through the signal: the
+   * `[value]` binding only lands on the next change detection, and the resize
+   * below has to measure the new text, not the old.
+   */
+  private adoptDraft(draft: StoredComposerDraft): void {
+    const text = [...(draft.queued ?? []), draft.text]
+      .map(part => part.trim())
+      .filter(part => !!part)
+      .join('\n\n');
+
+    this.userInput.set(text);
+    this.mentionedAgent.set(null);
+    this.pendingMentionAgentId.set(draft.mentionAgentId ?? null);
+    if (draft.mentionAgentId) void this.mentionService.load();
+    this.closeMentionMenu();
+    this.closeSkillMenu();
+
+    this.restoredAttachments.set(
+      (draft.attachments ?? []).map(attachment =>
+        toFileMetadata(attachment, draft.attachmentSessionId ?? ''),
+      ),
+    );
+    void this.reconcileRestoredAttachments(draft.attachmentSessionId);
+
+    const textarea = this.messageInput()?.nativeElement;
+    if (textarea) textarea.value = text;
+    this.sizeTextareaTo(text);
+  }
+
+  /**
+   * Check restored attachments against the server and drop what it does not
+   * confirm.
+   *
+   * The cards are already on screen by the time this runs, which is the point:
+   * storage is a display cache so the composer paints in one frame, and this
+   * is what stops that cache outliving the truth. A file deleted from the file
+   * browser, an id left over from another account, a hand-edited entry — all
+   * resolve to nothing here and the card goes away, rather than travelling
+   * with the send and silently resolving to no file server-side.
+   *
+   * Failure is deliberately a no-op: the listing is owner-scoped and the send
+   * re-checks ownership anyway, so a network blip should leave the user's
+   * attachments on screen rather than quietly stripping them.
+   */
+  private async reconcileRestoredAttachments(sessionId: string | undefined): Promise<void> {
+    const wanted = new Set(untracked(this.restoredAttachments).map(a => a.uploadId));
+    if (!sessionId || wanted.size === 0) return;
+    const adoptedFor = this.mirroredDraftKey;
+    try {
+      const files = await this.fileUploadService.listSessionFiles(sessionId);
+      // The conversation moved on while the request was in flight; whatever
+      // this answers is about a composer that no longer exists.
+      if (this.mirroredDraftKey !== adoptedFor) return;
+      const confirmed = files.filter(file => wanted.has(file.uploadId));
+      const byId = new Map(confirmed.map(file => [file.uploadId, file]));
+      this.restoredAttachments.update(list =>
+        list.flatMap(attachment => {
+          const server = byId.get(attachment.uploadId);
+          return server ? [server] : [];
+        }),
+      );
+    } catch {
+      // Leave the cached cards alone — see the note above.
+    }
+  }
+
+  /** Grow the textarea to `text`, or collapse it to one row when empty. */
+  private sizeTextareaTo(text: string): void {
+    const textarea = this.messageInput()?.nativeElement;
+    if (!textarea) return;
+    if (!text) {
+      this.resetTextareaHeight();
+      return;
+    }
+    this.autoResize(textarea);
+  }
+
+  /**
+   * Enter (and the touch Send button). While a response is streaming this
+   * **queues** rather than stopping: Enter always means "say this".
+   *
+   * Stopping has its own controls — the Stop button in voice mode's slot, and
+   * Escape — deliberately. Making Enter ambiguous (send when idle, abort when
+   * busy) is what let a reflex keystroke kill a run the user was waiting on,
+   * and stopping is the rarer, more destructive of the two.
    *
    * `queueHeld()` is the second reason to queue, and it is NOT covered by
    * `isLoading()`: a turn paused for consent or approval has already closed its
@@ -722,28 +1404,13 @@ export class ChatInputComponent {
   }
 
   /**
-   * The round button on the right. Unlike Enter it keeps its old meaning while
-   * streaming — it is the only Stop affordance, and taking that away to make
-   * room for a second Send would leave a user with text typed unable to stop.
-   */
-  onPrimaryButtonClick() {
-    if (this.isLoading()) {
-      this.cancelChatRequest();
-    } else {
-      // Not streaming, so this is Send — but it must make the same decision
-      // Enter does, or the two disagree while a prompt is holding the queue.
-      this.onSubmit();
-    }
-  }
-
-  /**
    * Capture the composer's contents as a pending follow-up and clear it, so the
    * user can keep typing. Mirrors `submitChatRequest`'s validation exactly —
    * anything that would not have been sendable is not queueable either.
    */
   private queueChatRequest(): void {
     const content = this.userInput().trim();
-    const fileUploadIds = this.readyUploadIds();
+    const fileUploadIds = this.attachmentIds();
 
     if (!content && fileUploadIds.length === 0) {
       return;
@@ -758,6 +1425,7 @@ export class ChatInputComponent {
       id: uuidv4(),
       content,
       fileUploadIds: fileUploadIds.length > 0 ? [...fileUploadIds] : undefined,
+      attachments: fileUploadIds.length > 0 ? this.attachmentMetadata() : undefined,
       mentionAgentId: this.mentionedAgent()?.agentId,
       invokedSkillIds: this.invokedSkillIds(),
     };
@@ -777,7 +1445,7 @@ export class ChatInputComponent {
     this.closeMentionMenu();
     this.closeSkillMenu();
     this.resetTextareaHeight();
-    this.fileUploadService.clearReadyUploads();
+    this.clearAttachments();
   }
 
   /**
@@ -829,7 +1497,7 @@ export class ChatInputComponent {
 
   submitChatRequest() {
     const content = this.userInput().trim();
-    const fileUploadIds = this.readyUploadIds();
+    const fileUploadIds = this.attachmentIds();
 
     // Must have content or files to submit
     if (!content && fileUploadIds.length === 0) {
@@ -840,6 +1508,13 @@ export class ChatInputComponent {
     if (this.hasActivePendingUploads()) {
       this.toastService.warning('Upload in Progress', 'Please wait for file uploads to complete.');
       return;
+    }
+
+    // The empty state's composer is about to be replaced by a compact one (the
+    // first send navigates to the new conversation); leave it our height so the
+    // replacement shrinks from here instead of popping in.
+    if (!this.compact()) {
+      this.handoff.leave(this.shell()?.nativeElement.getBoundingClientRect().height ?? 0);
     }
 
     // Emit the message - parent is responsible for managing loading state
@@ -859,11 +1534,96 @@ export class ChatInputComponent {
     this.closeMentionMenu();
     this.closeSkillMenu();
     this.resetTextareaHeight();
-    this.fileUploadService.clearReadyUploads();
+    this.clearAttachments();
+    this.persistDraftNow();
   }
 
   cancelChatRequest() {
     this.messageCancelled.emit();
+  }
+
+  async startDictation(): Promise<void> {
+    if (this.isDictating() || this.isVoiceActive()) return;
+    const textarea = this.messageInput()?.nativeElement;
+    const text = this.userInput();
+    const start = textarea?.selectionStart ?? text.length;
+    const end = textarea?.selectionEnd ?? text.length;
+    this.dictationAnchor.set({ before: text.slice(0, start), after: text.slice(end) });
+    this.ownsDictation.set(true);
+    this.settleHints();
+    this.closeMentionMenu();
+    this.closeSkillMenu();
+    // The Dictate button is about to be replaced; keep focus in the composer so
+    // Enter (done) and Escape (cancel) work straight from the keyboard.
+    textarea?.focus();
+
+    try {
+      await this.dictation.start({
+        onEnd: (dictated, reason) => this.commitDictation(dictated, reason),
+        onError: message => {
+          this.releaseDictation();
+          this.toastService.error('Dictation', message);
+        },
+      });
+    } catch (err) {
+      this.releaseDictation();
+      if (err instanceof DictationUnavailableError) {
+        this.toastService.info('Dictation', 'Dictation is not available here.');
+        return;
+      }
+      const message = err instanceof Error ? err.message : 'Could not start dictation.';
+      this.toastService.error('Dictation', message);
+    }
+  }
+
+  /** Done: stop listening; the text lands via `commitDictation` once the tail is in. */
+  finishDictation(): void {
+    if (!this.isDictating()) return;
+    this.dictation.finish();
+  }
+
+  /** Throw the dictation away and put the composer back exactly as it was. */
+  cancelDictation(): void {
+    if (!this.ownsDictation()) return;
+    this.dictation.cancel();
+    this.releaseDictation();
+  }
+
+  private commitDictation(dictated: string, reason: DictationEndReason): void {
+    const anchor = this.dictationAnchor();
+    this.ownsDictation.set(false);
+    this.dictationAnchor.set(null);
+    if (anchor && dictated.trim()) {
+      const { value, caret } = spliceDictation(anchor, dictated);
+      this.userInput.set(value);
+      const textarea = this.messageInput()?.nativeElement;
+      if (textarea) {
+        textarea.value = value;
+        this.autoResize(textarea);
+        textarea.focus();
+        textarea.setSelectionRange(caret, caret);
+      }
+    } else {
+      this.restoreComposerAfterDictation();
+    }
+    if (reason === 'limit') {
+      this.toastService.info('Dictation', 'Dictation stopped at its time limit.');
+    }
+  }
+
+  private releaseDictation(): void {
+    this.ownsDictation.set(false);
+    this.dictationAnchor.set(null);
+    this.restoreComposerAfterDictation();
+  }
+
+  /** The textarea was showing the preview; put the user's own text back in it. */
+  private restoreComposerAfterDictation(): void {
+    const textarea = this.messageInput()?.nativeElement;
+    if (!textarea) return;
+    textarea.value = this.userInput();
+    this.sizeTextareaTo(this.userInput());
+    textarea.focus();
   }
 
   async toggleVoice() {
@@ -895,7 +1655,19 @@ export class ChatInputComponent {
    * Handle file removal from pending uploads
    */
   onFileRemove(uploadId: string): void {
+    // A restored card has no live upload behind it, so it comes off this list
+    // instead. Removing from both is safe and saves the caller knowing which
+    // kind of card it clicked.
+    this.restoredAttachments.update(list =>
+      list.filter(attachment => attachment.uploadId !== uploadId),
+    );
     this.fileUploadService.clearPendingUpload(uploadId);
+  }
+
+  /** Release every attachment on the composer — what a send or a queue clears. */
+  private clearAttachments(): void {
+    this.restoredAttachments.set([]);
+    this.fileUploadService.clearReadyUploads();
   }
 
   /**
@@ -923,9 +1695,33 @@ export class ChatInputComponent {
     this.settleHints();
     const textarea = event.target as HTMLTextAreaElement;
     this.userInput.set(textarea.value);
+    this.dropStaleMention(textarea.value);
     this.autoResize(textarea);
     this.syncMentionToken(textarea);
     this.syncSkillToken(textarea);
+  }
+
+  /**
+   * Keep the mention bound to the `@Name` in the text: once the user deletes or
+   * edits the name, the turn goes back to plain chat.
+   *
+   * The binding is still a separate pick (a hand-typed `@Name` binds nothing),
+   * but with no chip beside the input the highlighted name is the only thing
+   * saying the turn is handed off — so removing it has to un-hand it. Otherwise
+   * a user who deleted the name would send to an Agent with nothing on screen
+   * saying so.
+   */
+  private dropStaleMention(text: string): void {
+    const agent = this.mentionedAgent();
+    if (agent && !text.includes(`@${agent.name}`)) {
+      this.mentionedAgent.set(null);
+    }
+  }
+
+  /** The mirror behind the textarea has to scroll with it, or the tint slides off its token. */
+  onTextareaScroll(event: Event): void {
+    const mirror = this.highlightMirror()?.nativeElement;
+    if (mirror) mirror.scrollTop = (event.target as HTMLTextAreaElement).scrollTop;
   }
 
   // ---------------------------------------------------------------- mentions (D11)
@@ -1004,12 +1800,6 @@ export class ChatInputComponent {
     textarea.setSelectionRange(caretAfter, caretAfter);
     textarea.focus();
     this.autoResize(textarea);
-  }
-
-  /** Clear the pending mention; the turn goes back to plain chat. */
-  clearMention(): void {
-    this.mentionedAgent.set(null);
-    this.focusInput();
   }
 
   private closeMentionMenu(): void {
@@ -1105,24 +1895,6 @@ export class ChatInputComponent {
     this.autoResize(textarea);
   }
 
-  /**
-   * Clear one invoked skill.
-   *
-   * The command lives in the text, so un-invoking edits the text — there is no separate
-   * binding to drop. That is the point of deriving the set from the message: the chip and
-   * what gets sent cannot disagree.
-   */
-  clearSkillCommand(command: SkillCommand): void {
-    const textarea = this.messageInput()?.nativeElement;
-    const next = removeSkillCommand(this.userInput(), command.slug);
-    this.userInput.set(next);
-    if (textarea) {
-      textarea.value = next;
-      this.autoResize(textarea);
-    }
-    this.focusInput();
-  }
-
   private closeSkillMenu(): void {
     this.skillToken.set(null);
   }
@@ -1156,8 +1928,67 @@ export class ChatInputComponent {
    */
   private autoResize(textarea: HTMLTextAreaElement): void {
     textarea.style.height = 'auto';
+    if (this.needsUnfold(textarea)) {
+      // Sized again once the wider, stacked layout has rendered.
+      this.setUnfolded(true);
+      return;
+    }
     const height = Math.min(textarea.scrollHeight, MAX_TEXTAREA_HEIGHT_PX);
     textarea.style.height = `${height}px`;
+  }
+
+  /** A compact draft that no longer fits on its one line. */
+  private needsUnfold(textarea: HTMLTextAreaElement): boolean {
+    return (
+      this.compact() &&
+      !this.unfolded() &&
+      textarea.value.length > 0 &&
+      (textarea.value.includes('\n') || textarea.scrollHeight > COMPACT_SINGLE_LINE_MAX_PX)
+    );
+  }
+
+  /**
+   * Switch between the one-row and stacked compact layouts, animating the
+   * shell's height across the change. The textarea is re-sized after the new
+   * layout renders, because its width — and so its wrapping — just changed.
+   */
+  private setUnfolded(next: boolean): void {
+    if (untracked(this.unfolded) === next) return;
+    const shell = this.shell()?.nativeElement;
+    const from = shell?.getBoundingClientRect().height ?? 0;
+    this.unfolded.set(next);
+    afterNextRender(
+      {
+        write: () => {
+          const textarea = this.messageInput()?.nativeElement;
+          if (textarea) this.sizeTextareaTo(textarea.value);
+          if (shell) this.animateShellFrom(shell, from);
+        },
+      },
+      { injector: this.injector },
+    );
+  }
+
+  /**
+   * Ease the shell from `from` to wherever layout has just put it.
+   *
+   * A Web Animation on `height` rather than a CSS transition: the natural
+   * height is `auto`, which does not transition, and the change is a layout
+   * swap rather than a property the stylesheet could interpolate. Overflow is
+   * clipped only for the length of the animation, so the `@` / `/` menus the
+   * shell anchors are never cut off at rest.
+   */
+  private animateShellFrom(shell: HTMLElement, from: number): void {
+    if (this.prefersReducedMotion || typeof shell.animate !== 'function' || from <= 0) return;
+    const to = shell.getBoundingClientRect().height;
+    if (Math.abs(to - from) < 1) return;
+    shell.animate(
+      [
+        { height: `${from}px`, overflow: 'hidden' },
+        { height: `${to}px`, overflow: 'hidden' },
+      ],
+      { duration: SHELL_RESIZE_MS, easing: 'cubic-bezier(0.2, 0, 0, 1)' },
+    );
   }
 
   /** Collapse the textarea back to a single row (after submit or clear). */
@@ -1166,11 +1997,24 @@ export class ChatInputComponent {
     if (!textarea) {
       return;
     }
-    textarea.style.height = `${MIN_TEXTAREA_HEIGHT_PX}px`;
+    textarea.style.height = `${this.compact() ? COMPACT_MIN_TEXTAREA_HEIGHT_PX : MIN_TEXTAREA_HEIGHT_PX}px`;
     textarea.scrollTop = 0;
   }
 
   onKeyDown(event: KeyboardEvent) {
+    // While dictating the textarea is read-only and the keyboard drives the
+    // dictation: Enter inserts what was heard, Escape throws it away.
+    if (this.isDictating()) {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        this.finishDictation();
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        this.cancelDictation();
+      }
+      return;
+    }
+
     // Any key at all — including the arrows and Escape a menu consumes below —
     // means the user is working, not reading hints.
     this.settleHints();
@@ -1230,8 +2074,17 @@ export class ChatInputComponent {
       }
     }
 
-    // Submit on Enter (without Shift)
-    if (event.key === 'Enter' && !event.shiftKey) {
+    // Escape stops a streaming response — only down here, after every menu has
+    // had its chance at the key, so closing a menu never also kills the run.
+    if (event.key === 'Escape' && this.showStop()) {
+      event.preventDefault();
+      this.cancelChatRequest();
+      return;
+    }
+
+    // Submit on Enter (without Shift). On touch, return is the newline key a
+    // phone keyboard offers, and sending is the Send button's job.
+    if (event.key === 'Enter' && !event.shiftKey && !this.isCoarsePointer()) {
       event.preventDefault();
       this.onSubmit();
     }
@@ -1382,7 +2235,7 @@ export class ChatInputComponent {
         if (!enabled) {
           this.toastService.info(
             'Enable Spreadsheet Analysis',
-            'To analyze spreadsheets, enable "Spreadsheet Analysis" in the Tools section of the settings panel.'
+            'To analyze spreadsheets, enable "Spreadsheet Analysis" under Customize → Tools in the sidebar.'
           );
           tabularNudgeShown = true;
         }

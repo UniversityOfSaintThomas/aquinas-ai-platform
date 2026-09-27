@@ -9,6 +9,7 @@ import {
   signal,
   viewChild,
 } from '@angular/core';
+import { NgTemplateOutlet } from '@angular/common';
 import { Message } from '../../services/models/message.model';
 import { MessageListComponent } from '../message-list/message-list.component';
 import { ChatInputComponent } from '../chat-input/chat-input.component';
@@ -16,7 +17,7 @@ import { AnimatedTextComponent } from '../../../components/animated-text';
 import { ParagraphSkeletonComponent } from '../../../components/paragraph-skeleton';
 import { Topnav } from '../../../components/topnav/topnav';
 import { SidenavService } from '../../../services/sidenav/sidenav.service';
-import { ArtifactStateService } from '../../services/artifacts/artifact-state.service';
+import { DockedPaneService } from '../../services/docked-pane/docked-pane.service';
 import { BrandingService } from '../../../../branding/branding.service';
 import { Assistant } from '../../../assistants/models/assistant.model';
 import { Agent, AgentRunnability } from '../../../agents/models/agent.model';
@@ -27,13 +28,14 @@ import {
 } from '../../../agents/components/agent-launch-card.component';
 import {
   AgentGovernance,
-  AssistantIndicatorComponent,
-} from '../assistant-indicator/assistant-indicator.component';
+  AgentIndicatorComponent,
+} from '../agent-indicator/agent-indicator.component';
 import { ModelService } from '../../services/model/model.service';
-import { SessionCostBadgeComponent } from '../session-cost-badge/session-cost-badge.component';
+import { ContextMeterComponent } from '../context-meter/context-meter.component';
 import { VoiceOverlayComponent } from '../voice-overlay';
 import { VoiceChatService } from '../../services/voice';
 import { ChatStateService } from '../../services/chat/chat-state.service';
+import { ProjectsService } from '../../../projects/services/projects.service';
 
 /**
  * Configuration options for ChatContainerComponent.
@@ -68,14 +70,15 @@ export interface ChatContainerConfig {
   selector: 'app-chat-container',
   standalone: true,
   imports: [
+    NgTemplateOutlet,
     MessageListComponent,
     ChatInputComponent,
     AnimatedTextComponent,
     ParagraphSkeletonComponent,
     Topnav,
     AgentLaunchCardComponent,
-    AssistantIndicatorComponent,
-    SessionCostBadgeComponent,
+    AgentIndicatorComponent,
+    ContextMeterComponent,
     VoiceOverlayComponent,
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -85,7 +88,7 @@ export interface ChatContainerConfig {
 export class ChatContainerComponent {
   // Inject sidenav service for full-page mode positioning
   protected sidenavService = inject(SidenavService);
-  private artifactState = inject(ArtifactStateService);
+  private dockedPane = inject(DockedPaneService);
   private voiceChatService = inject(VoiceChatService);
   protected readonly isVoiceActive = this.voiceChatService.isVoiceActive;
   protected branding = inject(BrandingService);
@@ -98,6 +101,7 @@ export class ChatContainerComponent {
 
   private readonly chatState = inject(ChatStateService);
   private readonly modelService = inject(ModelService);
+  private readonly projectsService = inject(ProjectsService);
 
   /**
    * What the bound Agent fixes for this conversation, for the indicator.
@@ -150,6 +154,15 @@ export class ChatContainerComponent {
   sessionId = input<string | null>(null);
 
   // Optional inputs
+
+  /**
+   * Conversation key for composer draft persistence, forwarded to
+   * `app-chat-input` untouched. Null (the default) means this placement
+   * remembers nothing — see the input's own note for why it is not
+   * `sessionId`.
+   */
+  draftKey = input<string | null>(null);
+
   assistant = input<Assistant | null>(null);
 
   /**
@@ -243,6 +256,15 @@ export class ChatContainerComponent {
 
   // Computed signals
   protected readonly hasMessages = computed(() => this.messages().length > 0);
+  /**
+   * #111: whether the active agent permits source-document download from citations.
+   * Read from the Agent shape first (the Designer surface), falling back to the legacy
+   * Assistant shape, defaulting true so existing agents behave exactly as before.
+   * Passed to <app-message-list> → the citation card to hide its download button.
+   */
+  protected readonly citationsDownloadAllowed = computed(
+    () => this.agent()?.allowDocumentDownload ?? this.assistant()?.allowDocumentDownload ?? true,
+  );
   protected readonly showSkeleton = computed(
     () => this.isLoadingSession() && !this.hasMessages()
   );
@@ -298,11 +320,22 @@ export class ChatContainerComponent {
   protected readonly isSidenavCollapsed = computed(() =>
     this.sidenavService.isCollapsed()
   );
-  /** True while the docked artifact pane is open — the fixed footer /
-   *  topnav reserve right-side space so the pane doesn't cover them. */
-  protected readonly artifactPanelOpen = computed(
-    () => this.artifactState.openArtifact() !== null
-  );
+  /** True while any pane is docked (artifact or .docx preview) — the
+   *  fixed footer / topnav reserve right-side space so the pane doesn't
+   *  cover them. */
+  protected readonly artifactPanelOpen = this.dockedPane.isOpen;
+  /**
+   * The crumb's name. A project's harness keeps the name the project was created
+   * with, so a renamed project reads from the project list when the sidebar has
+   * loaded it, and from the harness when it has not.
+   */
+  protected readonly indicatorName = computed(() => {
+    const a = this.assistant();
+    if (!a) return '';
+    if (!a.projectId) return a.name;
+    return this.projectsService.projects$().find(p => p.projectId === a.projectId)?.name ?? a.name;
+  });
+
   protected readonly isAssistantOwner = computed(() => {
     const a = this.assistant();
     if (!a) return false;

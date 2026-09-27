@@ -86,6 +86,7 @@ export interface PlatformComputeRefs {
   userMenuLinksTable: dynamodb.ITable;
   announcementsTable: dynamodb.ITable;
   systemPromptsTable: dynamodb.ITable;
+  agentTemplatesTable: dynamodb.ITable;
   sharedConversationsTable: dynamodb.ITable;
   sharedConversationsBucket: s3.IBucket;
   fileUploadBucket: s3.IBucket;
@@ -118,6 +119,9 @@ export interface PlatformComputeRefs {
   memorySpacesBucket: s3.IBucket;
   memorySpacesTable: dynamodb.ITable;
 
+  // ── Shared Projects — single-table (META, MEMBER#, pointers, COST#, NOTIF#)
+  projectsTable: dynamodb.ITable;
+
   // ── Fine-tuning
   fineTuningJobsTable: dynamodb.ITable;
   fineTuningAccessTable: dynamodb.ITable;
@@ -130,6 +134,15 @@ export interface PlatformComputeRefs {
   agentCoreCodeInterpreterId: string;
   agentCoreBrowserArn: string;
   agentCoreBrowserId: string;
+  /**
+   * S3 location of the Chromium MANAGED policy every browser session is
+   * started with (docs/specs/authenticated-web-assessment.md D6). Passed to
+   * `StartBrowserSession` rather than attached to the browser resource: the
+   * resource is immutable (no UpdateBrowser) and CfnBrowserCustom does not
+   * expose enterprisePolicies.
+   */
+  browserPolicyBucketName: string;
+  browserPolicyKey: string;
 
   // ── MCP sandbox edge
   mcpSandboxProxyOrigin: string;
