@@ -7,15 +7,35 @@ This is the default agent type for standard chat interactions.
 
 import logging
 import os
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
 
 from agents.main_agent.base_agent import BaseAgent
 from agents.main_agent.core import AgentFactory
 from agents.main_agent.skills.strands_mapping import build_skills_runtime
+from agents.main_agent.tools.tool_name_conflicts import skipped_tools_note
 
 from apis.shared.observability.build_stages import mark_stage
 
 logger = logging.getLogger(__name__)
+
+
+def unconnected_tools_note(gated: List[Any]) -> str:
+    """The system-prompt note for servers left out for missing consent.
+
+    ``gated`` arrives sorted (``load_external_tools``), and names are
+    de-duplicated in order, so one set of servers always renders the same
+    bytes.
+    """
+    names = list(dict.fromkeys(g.display_name for g in gated))
+    return (
+        "## Tools waiting on a connection\n"
+        "These tools are set up for this conversation but are not available "
+        "because the user has not connected the account they need: "
+        f"{', '.join(names)}. They are not in your tool list. Do not call, "
+        "guess or invent tools for them. If the request needs one, say so and "
+        "ask the user to connect the account with the Connect button in this "
+        "conversation, or under Customize → Connectors, and then ask again."
+    )
 
 
 class ChatAgent(BaseAgent):
@@ -53,10 +73,9 @@ class ChatAgent(BaseAgent):
     def _create_agent(self) -> None:
         """Create Strands Agent with filtered tools, hooks, and skills plugin."""
         try:
+            # Closes its own `tools.*` sub-stages, external MCP pre-flight
+            # included; `groups` sums them into `agent_build.tools`.
             tools = self._build_filtered_tools()
-            # External MCP pre-flight lives in here — the spec's standing
-            # (and unverified) hypothesis for the cold build.
-            mark_stage("tools")
             hooks = self._create_hooks()
             mark_stage("hooks")
 
@@ -141,14 +160,42 @@ class ChatAgent(BaseAgent):
 
         Cost: ~70 tokens, constant per configuration, inside the cacheable
         prefix — it is written once per session, never re-written per turn.
+
+        Also adds a note naming any enabled server this build left out because
+        the user has not connected its provider (``consent_gated_tools``).
+        Without it the model sees no trace of a tool the user asked for and
+        invents one (prod, 2026-10-16: ``search_issues`` → "Unknown tool").
+        The note changes only when the set of unconnected servers does, and
+        that set changing means ``toolConfig`` changed too, which already
+        re-writes the cached prefix; so it adds no cache writes of its own.
+
+        Likewise a note naming tools left out because another source already
+        holds their name (``skipped_tool_names``), on the same cache terms.
+
+        Last, an assistant's whole knowledge base in full-context mode
+        (``knowledge_context``). Inside the system segment, so it is read from
+        the system cache point; it changes only when a document does. Not part
+        of ``self.system_prompt`` for the same snapshot reason as the notes, and
+        because it can be ~200 KB.
         """
         from agents.builtin_tools.ask_user_question import SYSTEM_PROMPT_GUIDANCE
 
+        prompt = self.system_prompt
         for tool in tools:
             spec = getattr(tool, "tool_spec", None)
             if isinstance(spec, dict) and spec.get("name") == "ask_user_question":
-                return f"{self.system_prompt}\n\n{SYSTEM_PROMPT_GUIDANCE}"
-        return self.system_prompt
+                prompt = f"{prompt}\n\n{SYSTEM_PROMPT_GUIDANCE}"
+                break
+        gated = getattr(self, "consent_gated_tools", None)
+        if gated:
+            prompt = f"{prompt}\n\n{unconnected_tools_note(gated)}"
+        skipped = getattr(self, "skipped_tool_names", None)
+        if skipped:
+            prompt = f"{prompt}\n\n{skipped_tools_note(skipped)}"
+        knowledge = getattr(self, "knowledge_context", None)
+        if knowledge:
+            prompt = f"{prompt}\n\n{knowledge}"
+        return prompt
 
     async def stream_async(
         self,
@@ -164,6 +211,9 @@ class ChatAgent(BaseAgent):
         turn_project_id: Optional[str] = None,
         turn_lease: Any = None,
         turn_started_at: Optional[float] = None,
+        poll_side_frame: Optional[Callable[[], Optional[str]]] = None,
+        turn_clock: Any = None,
+        invocation_state: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[str, None]:
         """
         Stream agent responses.
@@ -198,6 +248,16 @@ class ChatAgent(BaseAgent):
                 off the agent for the same reason as `turn_agent_id`: the agent
                 instance is cached across turns, so per-turn state must never
                 live on it (#741/#751).
+            poll_side_frame: Non-blocking check for a frame produced outside the
+                agent stream (the first turn's `session_title`), polled by the
+                coordinator's live status merge. Per turn, like `turn_lease`.
+            turn_clock: The turn's latency clock, continued by the coordinator
+                to the first model output (`turn_first_token`). Per turn, like
+                `turn_lease`; None disables it.
+            invocation_state: Per-request client data for tools, handed to
+                Strands as its `invocation_state` (tools read it from
+                `ToolContext`; the model never sees it). Per turn, like
+                `turn_lease`. None passes nothing.
 
         Yields:
             str: SSE formatted events
@@ -234,5 +294,8 @@ class ChatAgent(BaseAgent):
             turn_project_id=turn_project_id,
             turn_lease=turn_lease,
             turn_started_at=turn_started_at,
+            poll_side_frame=poll_side_frame,
+            turn_clock=turn_clock,
+            invocation_state=invocation_state,
         ):
             yield event

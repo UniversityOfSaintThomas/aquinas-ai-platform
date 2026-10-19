@@ -42,21 +42,6 @@ def _assistant(model_settings=None, bindings=None) -> Assistant:
     )
 
 
-def _patch_memory(monkeypatch, *, enabled=True, space=None, role=None):
-    monkeypatch.setattr(f"{MODULE}.memory_spaces_enabled", lambda: enabled)
-    svc = MagicMock()
-    svc.resolve_permission = MagicMock(return_value=(space, role))
-    monkeypatch.setattr(f"{MODULE}.MemorySpaceService", lambda: svc)
-    return svc
-
-
-def _mem_binding(access="read", ref="spc_1", always_load=None):
-    config = {"access": access}
-    if always_load is not None:
-        config["alwaysLoad"] = always_load
-    return AgentBinding(kind="memory_space", ref=ref, config=config)
-
-
 def _patch_access(monkeypatch, allowed: bool) -> MagicMock:
     svc = MagicMock()
     svc.can_access_model = AsyncMock(return_value=allowed)
@@ -225,88 +210,36 @@ class TestModelResolution:
         assert plan.model_override is None
 
 
-class TestMemoryResolution:
-    _SPACE = SimpleNamespace(name="Oliver's Brain", space_id="spc_1", is_project_space=False)
-
-    @pytest.mark.asyncio
-    async def test_no_binding_is_none(self, monkeypatch):
-        svc = _patch_memory(monkeypatch)
-        plan = await resolve_agent_invocation(_assistant(bindings=[]), _user())
-        assert plan.memory is None
-        svc.resolve_permission.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_flag_off_blocks(self, monkeypatch):
-        _patch_memory(monkeypatch, enabled=False)
-        with pytest.raises(AgentBindingBlockedError):
-            await resolve_agent_invocation(_assistant(bindings=[_mem_binding()]), _user())
-
-    @pytest.mark.asyncio
-    async def test_missing_space_blocks(self, monkeypatch):
-        _patch_memory(monkeypatch, space=None, role=None)
-        with pytest.raises(AgentBindingBlockedError) as ei:
-            await resolve_agent_invocation(_assistant(bindings=[_mem_binding()]), _user())
-        assert "no longer exists" in ei.value.message
-
-    @pytest.mark.asyncio
-    async def test_a_project_space_never_serves_an_agent_binding(self, monkeypatch):
-        """Defense in depth behind design-time validation: even a member who resolves
-        editor on a project's space gets no memory from an ordinary agent's binding."""
-        project_space = SimpleNamespace(name="Project notes", space_id="spc_p", is_project_space=True)
-        _patch_memory(monkeypatch, space=project_space, role="editor")
-        with pytest.raises(AgentBindingBlockedError):
-            await resolve_agent_invocation(_assistant(bindings=[_mem_binding(access="readwrite")]), _user())
-        plan = await resolve_agent_invocation(
-            _assistant(bindings=[_mem_binding(access="readwrite")]), _user(), degrade=True
-        )
-        assert plan.memory is None and plan.unavailable.memory == "memory"
-
-    @pytest.mark.asyncio
-    async def test_read_viewer_resolves(self, monkeypatch):
-        _patch_memory(monkeypatch, space=self._SPACE, role="viewer")
-        plan = await resolve_agent_invocation(
-            _assistant(bindings=[_mem_binding(access="read", always_load=["MEMORY.md"])]), _user()
-        )
-        assert plan.memory.space_id == "spc_1"
-        assert plan.memory.space_name == "Oliver's Brain"
-        assert plan.memory.access == "read" and plan.memory.role == "viewer"
-        assert plan.memory.always_load == ["MEMORY.md"]
-
-    @pytest.mark.asyncio
-    async def test_readwrite_requires_editor(self, monkeypatch):
-        _patch_memory(monkeypatch, space=self._SPACE, role="viewer")
-        with pytest.raises(AgentBindingBlockedError) as ei:
-            await resolve_agent_invocation(
-                _assistant(bindings=[_mem_binding(access="readwrite")]), _user()
-            )
-        assert "editor" in ei.value.message
-
-    @pytest.mark.asyncio
-    async def test_readwrite_editor_resolves(self, monkeypatch):
-        _patch_memory(monkeypatch, space=self._SPACE, role="editor")
-        plan = await resolve_agent_invocation(
-            _assistant(bindings=[_mem_binding(access="readwrite")]), _user()
-        )
-        assert plan.memory.access == "readwrite" and plan.memory.role == "editor"
-
-    @pytest.mark.asyncio
-    async def test_permission_checked_against_invoker(self, monkeypatch):
-        svc = _patch_memory(monkeypatch, space=self._SPACE, role="viewer")
-        await resolve_agent_invocation(_assistant(bindings=[_mem_binding()]), _user())
-        # resolve_permission(space_id, user_id, user_email) — invoker's identity.
-        args = svc.resolve_permission.call_args.args
-        assert args[0] == "spc_1" and args[1] == "u-bob" and args[2] == "bob@x.edu"
-
-
 class TestToolResolution:
     @pytest.mark.asyncio
-    async def test_no_tool_binding_is_none(self, monkeypatch):
-        # No tool binding ⇒ plan.tools is None (request's enabled_tools stay in force) and
-        # we never even consult tool RBAC — the service is fetched lazily.
+    async def test_no_tool_binding_is_an_empty_toolset_not_the_picker(self, monkeypatch):
+        # No tool binding ⇒ an empty toolset, never None: None would leave the viewer's
+        # picker (the request's enabled_tools) in force, so the Agent's tools would change
+        # with whoever is chatting. owns_toolset is False, so the admin's always-on floor
+        # still applies (always-on §7 D4). Tool RBAC is never consulted — the service is
+        # fetched lazily.
         svc = _patch_tool_access(monkeypatch, True)
         plan = await resolve_agent_invocation(_assistant(bindings=[]), _user())
-        assert plan.tools is None
+        assert plan.tools is not None
+        assert plan.tools.tool_ids == []
+        assert plan.tools.owns_toolset is False
         svc.can_access_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_kb_only_agent_gets_an_empty_toolset(self, monkeypatch):
+        # The course-assistant shape: a knowledge base and nothing else.
+        _patch_tool_access(monkeypatch, True)
+        kb = AgentBinding(kind="knowledge_base", ref="kb-1", config={})
+        plan = await resolve_agent_invocation(_assistant(bindings=[kb]), _user())
+        assert plan.tools.tool_ids == [] and plan.tools.owns_toolset is False
+
+    @pytest.mark.asyncio
+    async def test_bound_tools_still_own_the_toolset(self, monkeypatch):
+        _patch_tool_access(monkeypatch, True)
+        plan = await resolve_agent_invocation(
+            _assistant(bindings=[_tool_binding("web_search")]), _user()
+        )
+        assert plan.tools.owns_toolset is True
 
     @pytest.mark.asyncio
     async def test_accessible_tools_become_override(self, monkeypatch):
@@ -328,6 +261,21 @@ class TestToolResolution:
             _assistant(bindings=[_tool_binding("web_search")]), _user()
         )
         assert plan.tools is not None and plan.tools.tool_ids == ["web_search"]
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_binding_runs_as_its_version(self, monkeypatch):
+        # shared-projects 3.1: access is judged on the catalog id, and the pin rides
+        # the run-time id (skill_id@n) to the cache key, the snapshot and the build.
+        predicate = _patch_skill_access(monkeypatch, True)
+        plan = await resolve_agent_invocation(
+            _assistant(bindings=[
+                AgentBinding(kind="skill", ref="research", config={"version": 3}),
+                _skill_binding("writing"),
+            ]),
+            _user(),
+        )
+        assert plan.skills.skill_ids == ["research@3", "writing"]
+        assert predicate.await_args.args[1] == ["research", "writing"]
 
     @pytest.mark.asyncio
     async def test_duplicate_refs_deduped(self, monkeypatch):
@@ -431,12 +379,33 @@ class TestToolResolution:
 
 class TestSkillResolution:
     @pytest.mark.asyncio
-    async def test_no_skill_binding_is_none(self, monkeypatch):
-        # No skill binding ⇒ plan.skills is None and we never consult the flag or RBAC.
+    async def test_no_skill_binding_runs_with_no_skills(self, monkeypatch):
+        # An Agent that binds no skills owns an empty set: empty, never None, because
+        # None would hand the turn the viewer's enabled_skills. Nothing is bound, so
+        # the access predicate is never consulted.
         predicate = _patch_skill_access(monkeypatch, True)
         plan = await resolve_agent_invocation(_assistant(bindings=[]), _user())
-        assert plan.skills is None
+        assert plan.skills is not None and plan.skills.skill_ids == []
+        assert not plan.unavailable
         predicate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_skill_binding_with_the_flag_off_is_empty_not_blocked(self, monkeypatch):
+        # Nothing bound means nothing to block on, whatever the environment's flag says.
+        _patch_skill_access(monkeypatch, True, enabled=False)
+        plan = await resolve_agent_invocation(_assistant(bindings=[]), _user())
+        assert plan.skills.skill_ids == []
+
+    @pytest.mark.asyncio
+    async def test_tool_bindings_alone_still_own_an_empty_skill_set(self, monkeypatch):
+        # Binding tools says nothing about skills; the Agent still runs with none.
+        _patch_tool_access(monkeypatch, True)
+        _patch_skill_access(monkeypatch, True)
+        plan = await resolve_agent_invocation(
+            _assistant(bindings=[_tool_binding("calculator")]), _user()
+        )
+        assert plan.tools.tool_ids == ["calculator"]
+        assert plan.skills.skill_ids == []
 
     @pytest.mark.asyncio
     async def test_accessible_skills_become_override(self, monkeypatch):
@@ -502,3 +471,17 @@ class TestSkillResolution:
         )
         assert predicate.await_count == 1
         assert predicate.await_args.args[1] == ["writing", "research"]
+
+
+class TestRetiredMemoryBinding:
+    @pytest.mark.asyncio
+    async def test_a_stored_memory_space_binding_is_ignored(self):
+        # Agents saved before memory moved to Projects still carry the binding; it
+        # resolves to nothing and neither blocks nor degrades the turn.
+        legacy = AgentBinding(kind="memory_space", ref="spc_1", config={"access": "read"})
+        plan = await resolve_agent_invocation(_assistant(bindings=[legacy]), _user())
+        assert not plan.unavailable
+        # Binding nothing else, it owns an empty toolset and skill set like any
+        # unbound Agent.
+        assert plan.skills.skill_ids == []
+        assert plan.tools.tool_ids == [] and plan.tools.owns_toolset is False

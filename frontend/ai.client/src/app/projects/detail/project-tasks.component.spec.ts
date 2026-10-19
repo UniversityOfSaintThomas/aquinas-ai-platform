@@ -16,6 +16,7 @@ const PROJECT: Project = {
   name: 'Enrollment Sync',
   description: '',
   ownerEmail: 'o@x.edu',
+  ownerName: null,
   role: 'viewer',
   status: 'active',
   editorsManageMembers: true,
@@ -33,8 +34,8 @@ function session(id: string, title: string): SessionMetadata {
   };
 }
 
-const MINE: SharedTask = { shareId: 'sh_1', title: 'Roster diff', sharedByEmail: 'me@x.edu', sharedAt: '2026-09-23T00:00:00Z', shareUrl: '/shared/sh_1', isMine: true };
-const THEIRS: SharedTask = { shareId: 'sh_2', title: 'Term dates', sharedByEmail: 'ann@x.edu', sharedAt: '2026-09-22T00:00:00Z', shareUrl: '/shared/sh_2', isMine: false };
+const MINE: SharedTask = { shareId: 'sh_1', title: 'Roster diff', sharedByEmail: 'me@x.edu', sharedByName: null, sharedAt: '2026-09-23T00:00:00Z', shareUrl: '/shared/sh_1', isMine: true };
+const THEIRS: SharedTask = { shareId: 'sh_2', title: 'Term dates', sharedByEmail: 'ann@x.edu', sharedByName: 'Ann Lee', sharedAt: '2026-09-22T00:00:00Z', shareUrl: '/shared/sh_2', isMine: false };
 
 describe('ProjectTasksComponent', () => {
   const api = { tasks: vi.fn(), sharedTasks: vi.fn() };
@@ -68,12 +69,13 @@ describe('ProjectTasksComponent', () => {
     return { fixture, el: fixture.nativeElement as HTMLElement };
   }
 
-  it('lists the caller’s tasks, each opening on the project’s agent', async () => {
+  it('lists the caller’s tasks, each opening in the project', async () => {
     const { el } = await render();
     expect(api.tasks).toHaveBeenCalledWith('prj_1', 20, null);
     const link = el.querySelector<HTMLAnchorElement>('a[href^="/s/"]');
     expect(link?.textContent).toContain('Draft the memo');
-    expect(link?.getAttribute('href')).toBe('/s/s1?assistantId=ast-1');
+    // The project, not its hidden harness Agent: the session page resolves one to the other.
+    expect(link?.getAttribute('href')).toBe('/s/s1?project=prj_1');
   });
 
   it('pages with the value cursor and appends', async () => {
@@ -93,23 +95,45 @@ describe('ProjectTasksComponent', () => {
     const { el } = await render();
     expect(el.querySelector('a[href="/shared/sh_1"]')?.textContent).toContain('Roster diff');
     expect(el.textContent).toContain('Shared by you');
-    expect(el.textContent).toContain('Shared by ann@x.edu');
+    expect(el.textContent?.replace(/\s+/g, ' ')).toContain('Shared by Ann Lee');
     const revokes = el.querySelectorAll('button[aria-label^="Stop sharing"]');
     expect(revokes.length).toBe(1);
     expect(revokes[0].getAttribute('aria-label')).toBe('Stop sharing Roster diff');
   });
 
-  it('continues a shared task as a fork on the project’s agent', async () => {
+  it('shows the sharer’s note under a shared task', async () => {
+    api.sharedTasks.mockReturnValue(of({ tasks: [{ ...THEIRS, note: 'Can you check the spring dates?' }, MINE] }));
+    const { el } = await render();
+    const rows = el.querySelectorAll('li');
+    const theirs = Array.from(rows).find(r => r.textContent?.includes('Term dates'))!;
+    expect(theirs.textContent).toContain('Can you check the spring dates?');
+    expect(Array.from(rows).find(r => r.textContent?.includes('Roster diff'))!.querySelector('p.border-l-2')).toBeNull();
+  });
+
+  it('tags a run a schedule delivered, naming the schedule in the byline instead of as a note', async () => {
+    api.sharedTasks.mockReturnValue(of({
+      tasks: [{ ...THEIRS, title: 'Weekly digest', sharedAt: '2026-09-22T12:00:00Z', scheduleId: 'sc_1', note: 'Scheduled: Weekly digest' }, MINE],
+    }));
+    const { el } = await render();
+    const rows = Array.from(el.querySelectorAll('li'));
+    const run = rows.find(r => r.textContent?.includes('Weekly digest'))!;
+    expect(run.querySelector('[data-testid="scheduled-tag"]')?.textContent?.trim()).toBe('Scheduled');
+    expect(run.textContent?.replace(/\s+/g, ' ')).toContain('Shared by Ann Lee · Sep 22 · from the schedule “Weekly digest”');
+    expect(run.querySelector('p.border-l-2')).toBeNull();
+    expect(rows.find(r => r.textContent?.includes('Roster diff'))!.querySelector('[data-testid="scheduled-tag"]')).toBeNull();
+  });
+
+  it('continues a shared task as a fork in the project', async () => {
     shares.exportSharedConversation.mockResolvedValue({ sessionId: 'fork_1', title: 'Term dates (shared)' });
     const router = TestBed.inject(Router);
     const navigate = vi.spyOn(router, 'navigate').mockResolvedValue(true);
     const { fixture, el } = await render();
-    const buttons = Array.from(el.querySelectorAll('button')).filter(b => b.textContent?.includes('Continue in my own task'));
+    const buttons = Array.from(el.querySelectorAll('button')).filter(b => b.textContent?.includes('Continue in my own conversation'));
     buttons[1].click();
     await fixture.whenStable();
     expect(shares.exportSharedConversation).toHaveBeenCalledWith('sh_2', { suppressErrorToast: true });
     expect(sessions.refreshSessions).toHaveBeenCalled();
-    expect(navigate).toHaveBeenCalledWith(['/s', 'fork_1'], { queryParams: { assistantId: 'ast-1' } });
+    expect(navigate).toHaveBeenCalledWith(['/s', 'fork_1'], { queryParams: { project: 'prj_1' } });
   });
 
   it('forks from an archived project without the agent (the backend returns a plain session)', async () => {
@@ -153,7 +177,7 @@ describe('ProjectTasksComponent', () => {
     api.tasks.mockReturnValue(of({ sessions: [], nextToken: null }));
     api.sharedTasks.mockReturnValue(of({ tasks: [] }));
     const { el } = await render();
-    expect(el.textContent).toContain('You haven’t started a task in this project yet.');
-    expect(el.textContent).toContain('No one has shared a task with the project yet.');
+    expect(el.textContent).toContain('You haven’t started a conversation in this project yet.');
+    expect(el.textContent).toContain('No one has shared a conversation with the project yet.');
   });
 });

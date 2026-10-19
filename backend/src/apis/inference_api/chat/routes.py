@@ -8,10 +8,12 @@ These endpoints are at the root level to comply with AWS Bedrock AgentCore Runti
 """
 
 import asyncio
+import time
 import json
 import logging
 from collections import OrderedDict
-from typing import TYPE_CHECKING, AsyncGenerator, Optional, Tuple, Union
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Tuple, Union
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -20,6 +22,7 @@ from agents.main_agent.core.model_config import KNOWN_CANONICAL_PARAMS
 from agents.main_agent.session.session_factory import SessionFactory
 from apis.shared.auth.dependencies import get_current_user_trusted
 from apis.shared.auth.models import User
+from apis.shared.browser_takeover import FRAME_HEIGHT_STATE_KEY
 from apis.shared.errors import (
     ConversationalErrorEvent,
     ErrorCode,
@@ -27,18 +30,39 @@ from apis.shared.errors import (
 )
 from apis.inference_api.runtime_health import ping_payload
 from apis.shared.feature_flags import (
+    agent_build_shared_session_enabled,
     agent_preparing_phase_enabled,
+    kb_search_ahead_enabled,
     agents_enabled,
+    assistant_kb_full_context_enabled,
+    attachment_kb_enabled,
     attachment_turn_guard_enabled,
+    folder_attachments_enabled,
+    inline_attachment_persist_enabled,
     memory_spaces_enabled,
     mid_turn_steering_enabled,
     skills_enabled,
 )
 from apis.shared.files.document_read import is_document_class
 from apis.shared.files.file_resolver import get_file_resolver
+from apis.shared.files.inline_persist import get_inline_attachment_persister
 from apis.shared.files.models import (
     INLINE_ATTACHMENTS_MAX_TOTAL_BYTES,
     MAX_FILES_PER_MESSAGE,
+    TEXT_ONLY_DOCUMENTS_MAX_CHARS,
+    is_tabular_file,
+)
+from apis.shared.files.folder_attachments import FOLDERS_PER_MESSAGE, FolderAttachment
+from apis.shared.files.folder_manifest import (
+    attached_entries,
+    record_folder_manifests,
+    render_folders_section,
+)
+from apis.shared.files.reference_attachments import (
+    ReferenceAttachment,
+    format_size,
+    record_reference_attachments,
+    render_references_section,
 )
 from apis.shared.models.managed_models import get_default_managed_model, list_managed_models
 from apis.shared.models.retirement import resolve_effective_model, retired_model_message
@@ -52,11 +76,14 @@ from apis.shared.quota import (
     is_quota_enforcement_enabled,
 )
 
+from apis.shared.rbac.model_access import model_access_denied_message
 from apis.shared.rbac.service import get_app_role_service
 from apis.shared.skills.bundle import slugify_skill_name
+from apis.shared.skills.pins import base_skill_id
 from apis.inference_api.chat.agent_binding_resolver import (
     AgentBindingBlockedError,
     AgentNoticeEvent,
+    ResolvedSkills,
     resolve_agent_invocation,
 )
 from apis.shared.sessions.metadata import (
@@ -72,6 +99,7 @@ from apis.shared.tools.injected import (
     ARTIFACT_TOOL_IDS,
     EXCEL_SPREADSHEET_TOOL_IDS,
     POWERPOINT_PRESENTATION_TOOL_IDS,
+    SKILL_AUTHORING_TOOL_IDS,
     SPREADSHEET_TOOL_IDS,
     WORD_DOCUMENT_TOOL_IDS,
     WORKSPACE_TOOL_IDS,
@@ -87,10 +115,15 @@ from .app_context_dispatch import (
 )
 from apis.shared.mcp_apps.error_envelope import app_tool_error_response
 
-from .app_tool_dispatch import AppToolCallError, dispatch_app_tool_call
+from .app_tool_dispatch import AppToolCallError, agent_carries_tool_client, dispatch_app_tool_call
 from .agent_binding_policy import binds_conversation
 from .models import FileContent, InvocationRequest
-from .service import generate_conversation_title, get_agent
+from .service import (
+    generate_conversation_title,
+    get_agent,
+    live_conversation_agents,
+    process_build_count,
+)
 from .turn_timing import TurnPrelude
 from .system_prompt_resolver import (
     append_active_prompt,
@@ -224,13 +257,14 @@ async def _session_has_messages(*, session_id: str, user_id: str) -> bool:
     has no history, because history produced under other instructions, tools and
     skills is exactly what a binding would misrepresent.
 
-    Deliberately `limit=1` — the question is existence, not count, and this runs on
-    the invocation path.
+    An existence check, priced like one (`session_has_messages`: one filtered
+    `ListEvents`, no payloads). It used to be `get_messages(limit=1)`, which read the
+    whole history and its metadata to return one message — this runs on the
+    invocation path, before the stream opens.
     """
-    from apis.shared.sessions.messages import get_messages
+    from apis.shared.sessions.messages import session_has_messages
 
-    response = await get_messages(session_id=session_id, user_id=user_id, limit=1)
-    return bool(response.messages)
+    return await session_has_messages(session_id, user_id)
 
 
 def is_preview_session(session_id: str) -> bool:
@@ -293,16 +327,40 @@ async def _find_managed_model(model_id: str | None):
     return None
 
 
+# A project harness's guidance on where teammates' work lives (shared-projects 2.5c).
+# Without it Haiku 4.5 answered "every open escalation" from project memory alone and
+# never listed the shared conversations (0 of 6 first responses on the simulation project);
+# with it, 6 of 6. The last sentence is the 2026-10-15 QA pass: asked mid-conversation to
+# remember a preference "just for me", Haiku 4.5 said it had saved or noted it without
+# calling `memory_save` (2 of 10 on dev before; the tool spec alone left 1 of 10). An empty
+# personal space renders no memory block, so this is the one place always in the prompt.
+# Constant text, so it costs one cache write per harness, on deploy.
+PROJECT_WORKSPACE_GUIDANCE = (
+    "## Project Workspace\n\n"
+    "Teammates' work reaches you three ways: the project's files, project memory, and "
+    "conversations members have shared with the project. Before answering about the team's status, open "
+    "items, decisions or who owns what, check all three: call `shared_conversations_list` and read the "
+    "relevant shared conversations, not only memory.\n\n"
+    "When a member asks you to remember something, for the team or just for them, call `memory_save` "
+    "in that same turn. Nothing carries into a later conversation until it succeeds, so never say "
+    "you've saved, noted or recorded something you haven't saved."
+)
+
+
 def compose_agent_system_prompt(base_prompt: str, instructions: str, *, project_harness: bool) -> str:
     """The agent's system text: platform base prompt, then the agent's instructions.
 
-    A project's harness gets its own heading (shared-projects §4.5); every other agent keeps
-    ``Assistant-Specific Instructions`` byte for byte, so no existing agent's cached prefix
-    moves. Deliberately takes nothing about the invoking user: this text is the head of the
+    A project's harness gets its own heading (shared-projects §4.5), preceded by
+    :data:`PROJECT_WORKSPACE_GUIDANCE`; every other agent keeps ``Assistant-Specific
+    Instructions`` byte for byte, so no existing agent's cached prefix moves. The guidance
+    sits before the project's instructions so they stay the section directly above any
+    personal instructions, and context itemization counts it as platform text.
+    Deliberately takes nothing about the invoking user: this text is the head of the
     cacheable system block, and two members of one project must render it identically or
     each member pays a cache write for the same project (the prompt-cache contract).
     """
-    return f"{base_prompt}\n\n## {_instructions_heading(project_harness)}\n\n{instructions}"
+    guidance = f"\n\n{PROJECT_WORKSPACE_GUIDANCE}" if project_harness else ""
+    return f"{base_prompt}{guidance}\n\n## {_instructions_heading(project_harness)}\n\n{instructions}"
 
 
 def _instructions_heading(project_harness: bool) -> str:
@@ -368,8 +426,14 @@ async def _plain_turn_prompt(input_data, user_id: Optional[str]) -> Optional[str
 
 
 PROJECTS_DISABLED_MESSAGE = (
-    "Projects are turned off here, so this project task can't continue. "
-    "Your conversation history is still here, and nothing in the project was deleted."
+    "Projects are turned off here, so this project conversation can't continue. "
+    "Its history is still here, and nothing in the project was deleted."
+)
+
+#: One answer for an agent (or a project's harness) that is gone and for one the
+#: caller may not use: a 404 beside a 403 told anyone whether an id existed.
+AGENT_UNAVAILABLE_MESSAGE = (
+    "This agent or project isn't available to you. It may have been deleted, or you may no longer have access to it."
 )
 
 
@@ -391,7 +455,7 @@ async def _project_turn_gate(project_id: Optional[str]) -> Tuple[Optional[str], 
         return "This project no longer exists.", None
     if project.status != "active":
         return (
-            f'The project "{project.name}" is archived, so it can\'t start new conversations. '
+            f'The project "{project.name}" is archived, so it\'s read-only: its conversations can be read but not started or continued. '
             "Ask the project owner to restore it."
         ), project
     return None, project
@@ -647,11 +711,14 @@ async def _resolve_model_settings(
     model_id: str | None,
     explicit_caching_enabled: bool | None,
     request_inference_params: dict | None,
-) -> tuple[bool | None, dict, str | None, str | None, str | None]:
+) -> tuple[bool | None, dict, str | None, str | None, str | None, list[str] | None]:
     """Resolve runtime model knobs from the managed-model registry.
 
     Returns ``(caching_enabled, inference_params, mantle_api_mode,
-    mantle_region, provider)``. A single registry lookup drives all of them.
+    mantle_region, provider, input_modalities)``. A single registry lookup
+    drives all of them. ``input_modalities`` is the row's declared input
+    (``["TEXT"]``, ``["TEXT", "IMAGE"]`` …), or ``None`` with no row — an
+    unknown model is never treated as text-only.
     The API-surface fields are server-authoritative (recorded on the model):
     ``mantle_api_mode`` selects Chat Completions vs the Responses API and
     ``mantle_region`` optionally pins inference to a specific region. Both are
@@ -666,7 +733,7 @@ async def _resolve_model_settings(
     request_params = dict(request_inference_params or {})
 
     if not model_id:
-        return explicit_caching_enabled, request_params, None, None, None
+        return explicit_caching_enabled, request_params, None, None, None, None
 
     managed_model = await _find_managed_model(model_id)
 
@@ -693,13 +760,19 @@ async def _resolve_model_settings(
         else None
     )
 
+    input_modalities = (
+        list(getattr(managed_model, "input_modalities", None) or []) or None
+        if managed_model is not None
+        else None
+    )
+
     inference_params = _merge_inference_params(managed_model, request_params)
-    return caching, inference_params, mantle_api_mode, mantle_region, provider
+    return caching, inference_params, mantle_api_mode, mantle_region, provider, input_modalities
 
 
 async def _resolve_caching_enabled(model_id: str | None, explicit_caching_enabled: bool | None) -> bool | None:
     """Backward-compat wrapper around :func:`_resolve_model_settings`."""
-    caching, _, _, _, _ = await _resolve_model_settings(model_id, explicit_caching_enabled, None)
+    caching, *_ = await _resolve_model_settings(model_id, explicit_caching_enabled, None)
     return caching
 
 
@@ -833,11 +906,15 @@ def _build_word_document_tools(
     enabled_tools: list | None,
     session_id: str,
     user_id: str,
+    user_name: Optional[str] = None,
 ) -> list:
     """Create context-bound Word document tools if enabled by the user.
 
     Identity is captured by closure (same pattern as the artifact and
     spreadsheet tools) since the runtime does not populate ToolContext.
+    ``redline_word_document`` joins the family only while the in-development
+    ``WORD_TRACKED_CHANGES_ENABLED`` is on; off, its spec never reaches
+    ``toolConfig``. ``user_name`` is its default revision author.
     """
     if not enabled_tools or not WORD_DOCUMENT_TOOL_IDS.intersection(enabled_tools):
         return []
@@ -852,14 +929,59 @@ def _build_word_document_tools(
         make_read_word_document_tool,
     )
 
+    from apis.shared.feature_flags import word_tracked_changes_enabled
+
     tools = [
         make_create_word_document_tool(session_id, user_id),
         make_modify_word_document_tool(session_id, user_id),
         make_list_word_documents_tool(session_id, user_id),
         make_read_word_document_tool(session_id, user_id),
     ]
+    if word_tracked_changes_enabled():
+        from agents.builtin_tools.word_document_tool import make_redline_word_document_tool
+
+        tools.append(make_redline_word_document_tool(session_id, user_id, user_name))
 
     logger.info(f"Created {len(tools)} word document tools")
+    return tools
+
+
+# ============================================================
+# Skill Authoring Tool Injection
+# ============================================================
+
+def _build_skill_authoring_tools(
+    enabled_tools: list | None,
+    session_id: str,
+    user_id: str,
+    user_email: Optional[str],
+) -> list:
+    """Create the context-bound ``my_skill_*`` tools if enabled (skill-creator spec).
+
+    A single toggle: ``my_skill_create`` in the turn's tools provisions all
+    seven (list / read / read_file / create / update / write_file /
+    delete_file). Also gated on ``SKILL_AUTHORING_ENABLED`` (default on)
+    and on ``SKILLS_ENABLED``. No IO. A turn without the id returns after one
+    set intersection. With it, building the seven tools costs ~9 ms on a
+    session's first turn and a memo lookup after that (see
+    ``build_skill_authoring_tools``).
+
+    Closes over ``(session_id, user_id, user_email)`` only, which is why the
+    family is in ``KEY_DESCRIBED_INJECTED_TOOL_IDS``. The binding-reach lookup
+    for the approval card runs per call, never here (spec D9).
+    """
+    if not enabled_tools or not SKILL_AUTHORING_TOOL_IDS.intersection(enabled_tools):
+        return []
+
+    from apis.shared.feature_flags import skill_authoring_enabled, skills_enabled
+
+    if not (skill_authoring_enabled() and skills_enabled()):
+        return []
+
+    from agents.builtin_tools.skill_authoring.tools import build_skill_authoring_tools
+
+    tools = build_skill_authoring_tools(session_id, user_id, user_email)
+    logger.info(f"Created {len(tools)} skill authoring tools")
     return tools
 
 
@@ -983,36 +1105,6 @@ def _build_powerpoint_presentation_tools(
     return tools
 
 
-def _build_memory_tools(agent_memory, user_id: str, user_email: str) -> list:
-    """Context-bound Memory-Space tools for an Agent's resolved memory binding.
-
-    ``agent_memory`` is the resolver's ``ResolvedMemoryBinding`` (or ``None``). No binding
-    → no tools. Read tools (list + read) are always exposed; the write tool only when the
-    binding grants ``readwrite`` — and the service re-checks ``editor+`` on every call, so
-    this is a UX gate, not the security boundary. Not gated on ``enabled_tools``: the
-    governing capability is the Agent's binding, not the user's tool picker.
-    """
-    if agent_memory is None:
-        return []
-
-    from agents.builtin_tools.memory_spaces import (
-        make_memory_list_tool,
-        make_memory_read_tool,
-        make_memory_write_tool,
-    )
-
-    space_id, space_name = agent_memory.space_id, agent_memory.space_name
-    tools = [
-        make_memory_list_tool(space_id, space_name, user_id, user_email),
-        make_memory_read_tool(space_id, space_name, user_id, user_email),
-    ]
-    if agent_memory.access == "readwrite":
-        tools.append(make_memory_write_tool(space_id, space_name, user_id, user_email))
-
-    logger.info(f"Created {len(tools)} memory-space tools for bound space")
-    return tools
-
-
 # ============================================================
 # Document Read Tool Injection (docs/specs/document-context-offload.md §4B)
 # ============================================================
@@ -1127,6 +1219,7 @@ async def _build_document_tools(
     session_id: str,
     user_id: str,
     turn_has_document: bool = False,
+    text_only: bool = False,
 ) -> list:
     """Context-bound ``document_read`` for a session that has a readable attachment.
 
@@ -1140,14 +1233,16 @@ async def _build_document_tools(
     ``turn_has_document`` is this turn's *classified* answer — see
     ``_session_has_documents``. Passing "did this turn attach anything"
     injects the tool for image, spreadsheet and deck attachments, which it
-    cannot read.
+    cannot read. ``text_only`` (the turn's model reads TEXT only) makes its
+    page-range reads return text; the model is in the cache key, so the flag
+    needs no key element of its own.
     """
     if not await _document_tools_gate(session_id, user_id, turn_has_document):
         return []
 
     from agents.builtin_tools.document_read_tool import make_document_read_tool
 
-    tools = [make_document_read_tool(session_id, user_id)]
+    tools = [make_document_read_tool(session_id, user_id, text_only=text_only)]
     logger.info("Created document_read tool (session has a readable document)")
     return tools
 
@@ -1180,15 +1275,19 @@ async def _session_has_tabular(
     session_id: str,
     user_id: str,
     turn_has_tabular: bool = False,
+    kb_assistant_id: Optional[str] = None,
 ) -> bool:
     """Whether this session's turns need the Spreadsheet Analysis tools.
 
     True when this turn attaches a CSV/XLSX (already partitioned, no query),
     when the session was seen holding one earlier in this process, or when
-    the session's READY uploads include one. Sticky by design: the answer
-    feeds ``enabled_tools`` and therefore the agent-cache key, so it must
-    not flip between the attach turn and the follow-up. Fail-closed on
-    error: a turn without the tools is today's behavior, never a broken turn.
+    the session's READY uploads include one. With ``kb_assistant_id`` (an
+    Agent that binds no tools), also when that assistant's knowledge base
+    holds one: the picker used to be the only way those tools reached such an
+    Agent, and it no longer does. Sticky by design: the answer feeds
+    ``enabled_tools`` and therefore the agent-cache key, so it must not flip
+    between the attach turn and the follow-up. Fail-closed on error: a turn
+    without the tools is today's behavior, never a broken turn.
     """
     if turn_has_tabular:
         _remember_tabular_session(session_id)
@@ -1200,7 +1299,18 @@ async def _session_has_tabular(
     try:
         from apis.shared.files.document_read import session_has_tabular_files
 
-        present = await session_has_tabular_files(user_id, session_id)
+        if kb_assistant_id:
+            from apis.shared.assistants.kb_tabular import assistant_kb_has_tabular_documents
+
+            # Both reads at once: neither waits on the other, and the gate sits on the
+            # path to the first token.
+            in_session, in_kb = await asyncio.gather(
+                session_has_tabular_files(user_id, session_id),
+                assistant_kb_has_tabular_documents(kb_assistant_id),
+            )
+            present = in_session or in_kb
+        else:
+            present = await session_has_tabular_files(user_id, session_id)
     except Exception:  # noqa: BLE001 - the gate must never fail a turn
         logger.warning("spreadsheet auto-enable lookup failed; tools not injected this turn", exc_info=True)
         return False
@@ -1225,10 +1335,12 @@ async def _auto_enabled_attachment_tool_ids(
     session_id: str,
     user_id: str,
     turn_has_tabular: bool = False,
+    kb_assistant_id: Optional[str] = None,
 ) -> list[str]:
     """The Spreadsheet Analysis ids this turn should carry regardless of the
     picker, in a fixed order: every id in ``SPREADSHEET_TOOL_IDS`` the
-    caller's RBAC grant admits, when the session holds a spreadsheet.
+    caller's RBAC grant admits, when the session holds a spreadsheet (or,
+    given ``kb_assistant_id``, when that assistant's knowledge base does).
 
     Enables, never grants: ``can_access_tool`` is the same predicate the
     picker and Agent bindings answer to (role grant ∪ public tools). A user
@@ -1239,7 +1351,7 @@ async def _auto_enabled_attachment_tool_ids(
 
     if not attachment_tool_autoenable_enabled():
         return []
-    if not await _session_has_tabular(session_id, user_id, turn_has_tabular):
+    if not await _session_has_tabular(session_id, user_id, turn_has_tabular, kb_assistant_id):
         return []
     role_service = get_app_role_service()
     allowed: list[str] = []
@@ -1263,16 +1375,19 @@ async def _apply_attachment_tool_autoenable(
     session_id: str,
     user_id: str,
     turn_has_tabular: bool = False,
+    kb_assistant_id: Optional[str] = None,
 ) -> list | None:
     """``enabled_tools`` for this turn with the attachment auto-enable applied.
 
     The single seam every ``get_agent`` caller on the invocation path goes
     through, so the main turn and the MCP App dispatch paths compute the same
     effective list — and therefore the same agent-cache slot — for a session
-    holding a spreadsheet.
+    holding a spreadsheet. ``kb_assistant_id`` extends the gate to that
+    assistant's knowledge base; only an Agent that binds no tools passes it.
     """
     auto_ids = await _auto_enabled_attachment_tool_ids(
-        current_user, session_id, user_id, turn_has_tabular=turn_has_tabular
+        current_user, session_id, user_id, turn_has_tabular=turn_has_tabular,
+        kb_assistant_id=kb_assistant_id,
     )
     return _with_auto_enabled_tools(enabled_tools, auto_ids)
 
@@ -1295,13 +1410,14 @@ async def _apply_admin_always_on_tools(
     it would override the author's explicit scoping.
 
     ⚠️ The exemption is "the Agent binds its own toolset", NOT "the turn ran an
-    Agent". ``_resolve_tools`` returns ``None`` — so ``agent_bound_tools`` is
-    False — for an Agent with no ``tool`` bindings, and such a turn falls
-    through to the user's picker and **does** get the pinned set. That is
-    deliberate: a template-derived Agent starts with empty ``bindings``
-    (``agent_templates/seed.py``), and exempting it would make always-on
-    opt-out-by-construction — anyone could shed a pinned tool with a trivial
-    unbound Agent. See docs/specs/admin-always-on-tools.md §7 D4.
+    Agent". An Agent with no ``tool`` bindings (a project harness included)
+    resolves to an empty toolset with ``owns_toolset`` False — so
+    ``agent_bound_tools`` is False — and **does** get the pinned set, though
+    never the user's picker. That is deliberate: a template-derived Agent
+    starts with empty ``bindings`` (``agent_templates/seed.py``), and exempting
+    it would make always-on opt-out-by-construction — anyone could shed a
+    pinned tool with a trivial unbound Agent. See
+    docs/specs/admin-always-on-tools.md §7 D4.
 
     This is a deliberate divergence from the attachment auto-enable above,
     which applies to the effective list and so does reach Agent-bound turns:
@@ -1340,10 +1456,16 @@ def _estimate_decoded_size(file: "FileContent") -> int:
 
 def _partition_attachments(
     all_files: list,
-) -> tuple[list, list, list, list]:
+) -> tuple[list, list, list, list, list]:
     """Split attachments into
-    (inline_for_bedrock, tabular, presentations, oversized_non_tabular).
+    (inline_for_bedrock, tabular, presentations, oversized_non_tabular, reference).
 
+    - Reference files (``ReferenceAttachment``: a reference-class upload the
+      resolver returned without its bytes, large-document spec §4B.2) are
+      never inline. They carry no bytes, so they add nothing to the inline
+      byte budget, and they reach the model as a digest or a stub in the user
+      message. Only an upload row can be one: direct ``files`` bytes over the
+      inline limit stay oversized (§4B.6).
     - Tabular files (csv/xlsx) are never sent inline — they route through
       the spreadsheet analysis tools. Keeps Bedrock's 4.5MB document limit
       from exploding on XLSX files that expand during internal parsing.
@@ -1369,8 +1491,12 @@ def _partition_attachments(
     tabular: list = []
     presentations: list = []
     oversized: list = []
+    reference: list = []
 
     for file in all_files:
+        if isinstance(file, ReferenceAttachment):
+            reference.append(file)
+            continue
         if is_tabular_file(file.filename, file.content_type):
             tabular.append(file)
             continue
@@ -1387,7 +1513,7 @@ def _partition_attachments(
             continue
         inline.append(file)
 
-    return inline, tabular, presentations, oversized
+    return inline, tabular, presentations, oversized, reference
 
 
 def _apply_message_file_cap(
@@ -1520,6 +1646,15 @@ def _attachment_marker_names(all_files: list, oversized_inline: list) -> list:
     return [f.filename for f in all_files if f.filename not in oversized_names]
 
 
+def _reference_search_available(document_read_available: bool) -> bool:
+    """Whether this turn's ``document_read`` has its ``query`` argument.
+
+    Read from the same switch ``make_document_read_tool`` reads, so the
+    attachment guidance never names a mode the tool lacks.
+    """
+    return document_read_available and attachment_kb_enabled()
+
+
 def _build_attachment_guidance(
     diverted_tabular: list,
     diverted_presentations: list,
@@ -1529,6 +1664,12 @@ def _build_attachment_guidance(
     dropped_over_count_names: list[str] | None = None,
     dropped_over_count_total: int = 0,
     max_files: int = 0,
+    unpersisted: list | None = None,
+    unreadable_images: list | None = None,
+    unreadable_documents: list | None = None,
+    references: list | None = None,
+    document_read_available: bool = True,
+    search_available: bool = False,
 ) -> str:
     """Return a short markdown addendum describing how attachments will be
     handled, to append to the user's message so the agent (and the user)
@@ -1540,8 +1681,53 @@ def _build_attachment_guidance(
     follow-up message). They get separate sentences because the remedy
     differs. ``dropped_over_count_*`` describe files beyond the per-message
     count cap: names where known (direct ``files``), a count otherwise.
+    ``unpersisted`` are inline spreadsheets/decks that could not be stored as
+    session files (``PersistFailure`` entries); they are not diverted and the
+    tools cannot see them, so the note must say so instead of the usual
+    "available through the tool" line. ``unreadable_images`` /
+    ``unreadable_documents`` were dropped because the turn's model reads text
+    only (`_adapt_attachments_for_model`); the remedy is a different model.
+    ``references`` are large documents attached by reference (large-document
+    spec §4B.4): not skipped, but readable only in parts, through
+    ``document_read`` when this turn has it (``document_read_available``).
+    ``search_available`` is whether that tool has its ``query`` argument (the
+    deployment's attachments KB, §4F); the sentence then names search first.
     """
     parts: list[str] = []
+
+    # Directive on purpose: measured on dev, Haiku 4.5 answered "I don't see a
+    # file called X attached" for a non-inline document even with the tool
+    # injected, and used it only when told to call it. So the sentence names
+    # the tool, the call and the id.
+    for ref in references or ():
+        lead = (
+            f"_`{ref.filename}` ({format_size(ref.size_bytes)}) is attached but too large "
+            f"to include in full, so its content is not in this message."
+        )
+        if not document_read_available:
+            parts.append(f"{lead} Reading parts of it is not available in this conversation._")
+            continue
+        call = f"call `document_read` with `upload_id` `{ref.upload_id}`"
+        # Search named first when the tool has it. Measured with the quality
+        # harness (spec §6, second readout): with "first with `pattern`" the
+        # model opened with pattern in 93 of 93 turns and reached a scanned
+        # page by paging through images; naming search made it open with query
+        # in 93 of 93, at the same accuracy and 38% less cost per turn.
+        find = (
+            "first with `query` (a plain-language search, which also covers scanned pages) or `pattern`"
+            if search_available
+            else "first with `pattern`"
+        )
+        if ref.format == "pdf":
+            parts.append(
+                f"{lead} To answer from it, {call}: {find} to find the "
+                f"relevant pages, then with `page_range` to read them._"
+            )
+        else:
+            parts.append(
+                f"{lead} To answer from it, {call}: {find} to find the "
+                f"relevant passages, then read on from there._"
+            )
 
     if diverted_tabular:
         names = ", ".join(f"`{f.filename}`" for f in diverted_tabular)
@@ -1604,6 +1790,31 @@ def _build_attachment_guidance(
             f"single message. Send them in a follow-up message._"
         )
 
+    if unreadable_images:
+        names = ", ".join(f"`{f.filename}`" for f in unreadable_images)
+        parts.append(
+            f"_Attached image(s) {names} were skipped because the selected model "
+            f"reads text only. To work with them, switch to a model that "
+            f"supports images._"
+        )
+
+    if unreadable_documents:
+        names = ", ".join(f"`{f.filename}`" for f in unreadable_documents)
+        parts.append(
+            f"_Attached file(s) {names} were skipped: the selected model reads "
+            f"text only, and no text could be extracted from them (a scanned "
+            f"document has none). To work with them, switch to a model that "
+            f"supports documents._"
+        )
+
+    if unpersisted:
+        described = "; ".join(f"`{x.file.filename}` ({x.reason})" for x in unpersisted)
+        parts.append(
+            f"_Attached file(s) {described} could not be stored for this "
+            f"conversation and were not attached. Upload them through the "
+            f"Files panel and re-send your message._"
+        )
+
     if dropped_over_count_total > 0:
         limit = f"{max_files} file" + ("s" if max_files != 1 else "")
         if dropped_over_count_names:
@@ -1623,6 +1834,49 @@ def _build_attachment_guidance(
             )
 
     return "\n\n".join(parts)
+
+
+_PROJECT_ROLE_PHRASES = {
+    "owner": "the owner of this project",
+    "editor": "an editor in this project",
+    "viewer": "a viewer in this project, who can read but not change its files or shared memory",
+}
+
+
+def _plain_attr(value: Optional[str]) -> str:
+    """A claim's value on one line, unable to open or close a tag."""
+    return " ".join(str(value or "").split()).replace("<", "").replace(">", "")[:200]
+
+
+def _build_project_member_note(user: User, role: Optional[str]) -> str:
+    """Who is speaking, prepended to every message of a project harness turn.
+
+    All of a project's members share one harness, and its system prompt and tools
+    must render identically for each of them: a per-member system prompt would make
+    every member pay a cache write for the same project (the prompt-cache contract).
+    So the speaker rides the user message, like the interruption note: persisted in
+    history, which only appends, so no cached prefix moves, and kept out of the UI
+    by the displayText split. It is sent every turn rather than once, because a
+    forked or shared task's history names a different member. About 100 tokens, read
+    from cache on every later call. Without it the harness told a member to "send
+    this to" her own name (the 2026-10 team simulation, G18); the second sentence is
+    there because, told only who was speaking, Haiku 4.5 then answered in that
+    member's voice ("send it to me") when the instructions named them.
+    """
+    name, email = _plain_attr(user.name), _plain_attr(user.email)
+    if name and email and name.casefold() != email.casefold():
+        who = f"{name} ({email})"
+    else:
+        who = email or name
+    role_phrase = _PROJECT_ROLE_PHRASES.get(role or "", "a member of this project")
+    return (
+        "<project_member>\n"
+        f"The person writing to you is {who}, {role_phrase}. They are not you: you are the "
+        "project's assistant. Where the instructions, memory or files name this person (as "
+        "someone to send or escalate something to, say), that step is theirs: tell them so, "
+        "in the second person, instead of asking them to send it to themselves.\n"
+        "</project_member>"
+    )
 
 
 def _build_interruption_note(reason: str) -> str:
@@ -1818,6 +2072,8 @@ async def stream_conversational_message(
     session_id: str,
     user_id: str,
     user_input: str,
+    persist: bool = True,
+    long_term_memory: bool = True,
 ) -> AsyncGenerator[str, None]:
     """Stream a message as an assistant response with optional metadata event.
 
@@ -1831,6 +2087,9 @@ async def stream_conversational_message(
         session_id: Session ID for persistence
         user_id: User ID for persistence
         user_input: The user's original message to save
+        persist: False streams the message without writing either turn to history
+        long_term_memory: False in an Agent conversation, whose writes skip
+            long-term memory extraction (``SessionFactory.create_session_manager``)
     """
     # Emit message_start event (assistant response)
     yield f"event: message_start\ndata: {json.dumps({'role': 'assistant'})}\n\n"
@@ -1854,6 +2113,9 @@ async def stream_conversational_message(
     # Emit done event
     yield "event: done\ndata: {}\n\n"
 
+    if not persist:
+        return
+
     # Skip persistence for preview sessions
     if is_preview_session(session_id):
         logger.info("Preview session - skipping message persistence")
@@ -1867,7 +2129,12 @@ async def stream_conversational_message(
     try:
         from agents.main_agent.session.persistence import persist_synthetic_messages
 
-        session_manager = SessionFactory.create_session_manager(session_id=session_id, user_id=user_id, caching_enabled=False)
+        session_manager = SessionFactory.create_session_manager(
+            session_id=session_id,
+            user_id=user_id,
+            caching_enabled=False,
+            long_term_memory=long_term_memory,
+        )
         persist_synthetic_messages(
             session_manager,
             session_id,
@@ -1937,6 +2204,25 @@ def _apply_enabled_skills_filter(
     return [sid for sid in accessible_skill_ids if sid in requested]
 
 
+def _apply_agent_skills_override(
+    agent_type: str,
+    skill_ids: Optional[list[str]],
+    override: Optional[ResolvedSkills],
+) -> tuple[str, Optional[list[str]]]:
+    """The turn's ``(agent_type, skill ids)`` once an Agent's skills are known.
+
+    An Agent's skills replace the request's for the turn, so ChatAgent's AgentSkills
+    plugin discloses exactly what the Agent was given (D5, resolved per invoker). That
+    includes an empty set: an Agent that binds no skills runs with none, never the
+    viewer's ``enabled_skills``. With no skills ``build_skills_runtime`` mounts nothing
+    and the turn behaves as a plain chat. ``override`` is ``None`` only when no Agent ran
+    (plain chat, or the agents feature off); the request then drives skills and type.
+    """
+    if override is None:
+        return agent_type, skill_ids
+    return "skill", list(override.skill_ids)
+
+
 def _resolve_invoked_skill_slugs(
     effective_skill_ids: Optional[list[str]], invoked_skills: Optional[list[str]]
 ) -> list[str]:
@@ -1958,8 +2244,13 @@ def _resolve_invoked_skill_slugs(
     requested = set(invoked_skills)
     # Ordered by the effective set, not by the request: the directive is part of
     # the persisted message, and a list whose order followed client input would
-    # differ between two turns that named the same skills.
-    return [slugify_skill_name(sid) for sid in effective_skill_ids if sid in requested]
+    # differ between two turns that named the same skills. A pinned id
+    # (``skill_id@3``) matches the catalog id the client names.
+    return [
+        slugify_skill_name(base_skill_id(sid))
+        for sid in effective_skill_ids
+        if base_skill_id(sid) in requested
+    ]
 
 
 def _build_skill_invocation_note(skill_slugs: list[str]) -> str:
@@ -1986,283 +2277,353 @@ def _build_skill_invocation_note(skill_slugs: list[str]) -> str:
     )
 
 
-@router.post("/invocations")
-async def invocations(request: InvocationRequest, current_user: User = Depends(get_current_user_trusted)):
+
+# ============================================================
+# Turn phases
+# ============================================================
+#
+# `invocations` runs a turn as the sequence docs/specs/turn-path-ttft.md §2B
+# lays out. Each function below is one contiguous stretch of that sequence,
+# named for what it settles and for the `turn_prelude` mark that times it. A
+# phase takes what it reads and returns what it produces; none closes over the
+# handler's locals. That is what lets the handler read as the map, and lets a
+# change to one phase be reasoned about — and tested — without the rest.
+
+
+def _sse_headers(session_id: str) -> dict:
+    """Response headers for every SSE stream this route returns.
+
+    ``X-Accel-Buffering: no`` defeats proxy buffering so events after
+    ``message_stop`` (``oauth_required`` and friends) reach the browser at once.
     """
-    AgentCore Runtime standard invocation endpoint (required)
+    return {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Session-ID": session_id}
 
-    Supports user-specific tool filtering and SSE streaming.
-    Creates/caches agent instance per session + tool configuration.
-    Uses the authenticated user's ID from the JWT token.
 
-    Quota enforcement (when enabled via ENABLE_QUOTA_ENFORCEMENT=true):
-    - Checks user quota before processing
-    - Streams quota_exceeded as assistant message if quota exceeded (better UX)
-    - Injects quota_warning event into stream if approaching limit
+def _refuse_turn(
+    input_data: InvocationRequest,
+    user_id: str,
+    *,
+    message: str,
+    stop_reason: str,
+    metadata_event: Union[QuotaExceededEvent, ConversationalErrorEvent, None],
+    persist: bool = True,
+) -> StreamingResponse:
+    """End the turn before any model call, as one short assistant message.
+
+    Errors stream as assistant messages (CLAUDE.md): a quota block, a retired
+    model, a blocked Agent binding or an archived project each become a
+    persisted assistant turn carrying its metadata event, rather than an HTTP
+    status the SPA would render as a generic failure.
     """
-    input_data = request
-    user_id = current_user.user_id
-    auth_token = current_user.raw_token
-
-    # Where the pre-stream time goes. Everything between here and the
-    # `StreamingResponse` return happens with NO channel open to the client —
-    # measured at 3.75s on a warm turn — so this is the only way to see which
-    # stage owns it. Pure timing: nothing reaches the model.
-    # See `turn_timing.py` and docs/specs/agent-state-feedback.md.
-    prelude = TurnPrelude()
-    # Whether this turn's agent is built inside the stream (PR-3). Recorded on
-    # the `turn_prelude` line so the two shapes stay distinguishable in the
-    # logs once the flag has been on for a while.
-    deferred_build = False
-
-    # Refuse a turn against a session id another user already owns.
-    #
-    # Session ids travel in shareable URLs (`/s/{sessionId}`). Opening someone
-    # else's link 404s on the metadata read, but the SPA then treats the
-    # session as new and lets the user send — which used to fork the id: a
-    # SECOND metadata row under the requester, on the same session, invisible
-    # to both parties. In prod on 2026-08-31 that also left the original
-    # owner's session resolving non-deterministically between the two rows.
-    #
-    # Not a confidentiality fix — conversation content is keyed by actor id in
-    # AgentCore Memory, so the second user only ever saw an empty thread. This
-    # stops the id from being forked at all. 404 rather than 403 so the
-    # response says nothing about whether the session exists, matching what
-    # `GET /sessions/{id}/metadata` already returns for the same case.
-    #
-    # ONE read of the session's META row, shared by everything in the preamble
-    # that used to fetch it again (PR-2, docs/specs/turn-latency-preamble.md).
-    # Measured on dev: eight separate reads of this item cost ~445ms of a
-    # ~455ms stage, because a GSI query from an AgentCore Runtime container is
-    # ~53ms rather than the ~12ms an in-region figure would suggest.
-    #
-    # Deliberately explicit rather than a per-request memo inside
-    # `_get_session_by_gsi`: CLAUDE.md's "never cache session state" rule has
-    # been paid for twice (#741, #751), and a snapshot callers opt into cannot
-    # leak into one that needs a fresh read.
-    session_meta = await load_session_meta(input_data.session_id, user_id)
-    if session_meta.owned_by_other:
-        logger.warning(
-            "Rejected invocation for session %s — owned by a different user",
-            _sanitize_log(input_data.session_id),
-        )
-        raise HTTPException(status_code=404, detail="Session not found")
-    # First of the preamble's five sub-stages (docs/specs/turn-latency-preamble.md).
-    # The coarse `preamble` number survives as `groups.preamble` in the emitted
-    # line, so the four-turn baseline in the agent-state-feedback spec stays
-    # comparable across this split.
-    prelude.mark("preamble.ownership")
-    # Resume requests reuse the cached agent and its paused interrupt state;
-    # they bypass quota, file resolution, and RAG augmentation because those
-    # already ran on the original turn that got paused.
-    is_resume = bool(input_data.interrupt_responses)
-    # Resolve the effective agent type: the client's explicit choice, else the
-    # compiled-in default ("chat"). Used for the skill resolution below and the
-    # non-resume get_agent calls (resume reuses the snapshot's type). An Agent
-    # that binds skills is coerced to "skill" later by the agent-binding
-    # resolver.
-    effective_agent_type = input_data.agent_type or DEFAULT_AGENT_TYPE
-    # Skills feature deferred for this environment: neutralize the legacy
-    # "skill" agent type, which is a ChatAgent alias since v2 PR-2. Voice and
-    # other agent types pass through untouched.
-    if not skills_enabled() and effective_agent_type == "skill":
-        effective_agent_type = "chat"
-    # Resolve the user's *effective* skills once for the whole request: the
-    # accessible set (catalog ∪ own), narrowed by the client's per-turn
-    # enabled_skills selection. Threaded into every get_agent call below so they
-    # share one skills_hash cache key (otherwise the app-tool-call / resume paths
-    # would miss the main turn's cached agent).
-    #
-    # Skills v2: this is no longer gated on agent_type == "skill". Skills are a
-    # plain-chat capability now — the picker in model settings sends
-    # enabled_skills on an ordinary turn and ChatAgent mounts the AgentSkills
-    # plugin. The opt-in default (D6) is what keeps this cheap: an absent or
-    # empty selection short-circuits to [] without touching RBAC or the skill
-    # table, so every turn that doesn't ask for skills costs exactly what it did
-    # before. An Agent's skill bindings override this further down.
-    effective_skill_ids = None
-    if skills_enabled() and input_data.enabled_skills:
-        effective_skill_ids = _apply_enabled_skills_filter(
-            await _resolve_accessible_skill_ids(current_user),
-            input_data.enabled_skills,
-        )
-    # Near-zero on a turn that selects no skills — the opt-in default (D6)
-    # short-circuits before touching RBAC or the skill table. A non-trivial
-    # number here means the RBAC cache missed or the owner-index query is slow.
-    prelude.mark("preamble.skills")
-    # A "Continue" after a max_tokens truncation. Like resume, it bypasses
-    # quota / RAG / file resolution and does NOT clear the turn state; unlike
-    # resume there is no interrupt to validate — the agent is rebuilt from the
-    # resent params and re-entered with an empty prompt (assistant-prefill).
-    is_continuation = bool(input_data.continue_truncated)
-    # Marketplace D11: the Agent was `@`-mentioned in the composer, so it runs
-    # this turn only — it does not bind the conversation. Only meaningful
-    # alongside `rag_assistant_id`; on its own it does nothing.
-    is_agent_mention = bool(input_data.agent_mention) and bool(input_data.rag_assistant_id)
-    logger.info(
-        "Invocation request received (resume=%s, continue_truncated=%s, agent_mention=%s)"
-        % (is_resume, is_continuation, is_agent_mention)
+    return StreamingResponse(
+        stream_conversational_message(
+            message=message,
+            stop_reason=stop_reason,
+            metadata_event=metadata_event,
+            session_id=input_data.session_id,
+            user_id=user_id,
+            user_input=input_data.message,
+            persist=persist,
+            long_term_memory=not input_data.rag_assistant_id,
+        ),
+        media_type="text/event-stream",
+        headers=_sse_headers(input_data.session_id),
     )
-    logger.info("Message received")
 
-    # Model retirement (docs/specs/model-retirement.md §7). Resolved before anything
-    # builds an agent from ``input_data.model_id``, so the App tool-call / context /
-    # continuation paths land in the same agent-cache slot as the turn itself. A
-    # redirect swaps the provider as well: the request's described the retired
-    # model, and a successor on another transport misroutes with it. A denial is
-    # streamed at the access check below, once there is a turn to answer.
-    retired_model_denial: Optional[str] = None
-    requested_model = await resolve_effective_model(input_data.model_id)
-    if requested_model is not None:
-        if requested_model.denied:
-            retired_model_denial = retired_model_message(requested_model.retired)
-        elif requested_model.redirected:
-            input_data.model_id = requested_model.model_id
-            input_data.provider = requested_model.provider
 
-    # App-initiated tools/call (MCP Apps PR #5). Like resume/continuation it
-    # bypasses quota / RAG / file resolution / title — there is no model
-    # turn. We rebuild the conversation agent (so the MCP client session +
-    # auth are wired exactly as for a model-driven call), dispatch the one
-    # named tool, publish synthesized tool_use/tool_result into the thread
-    # via the per-session broker, and return the CallToolResult as JSON for
-    # app-api to relay back to the iframe. Inert behind the host flag (the
-    # UIToolCatalog is empty, so dispatch rejects every call as not
-    # app-visible).
-    if input_data.app_tool_call is not None:
-        atc = input_data.app_tool_call
-        try:
-            request_inference_params = dict(input_data.inference_params or {})
-            dispatch_model_id, dispatch_provider = input_data.model_id, input_data.provider
-            if not dispatch_model_id:
-                dispatch_model_id, dispatch_provider = await _resolve_fallback_model(
-                    user_id, current_user, dispatch_provider
-                )
-            caching_enabled, inference_params, mantle_api_mode, mantle_region, registry_provider = await _resolve_model_settings(
-                model_id=dispatch_model_id,
-                explicit_caching_enabled=input_data.caching_enabled,
-                request_inference_params=request_inference_params,
-            )
-            agent = await get_agent(
-                session_id=input_data.session_id,
-                user_id=user_id,
-                auth_token=auth_token,
-                # Same auto-enable seam as the main turn, so a spreadsheet
-                # session's dispatch reads the slot the real turns fill — and
-                # the same always-on union, or the dispatch would compute a
-                # different effective list and miss into its own agent-cache
-                # slot on every App call.
-                enabled_tools=await _apply_admin_always_on_tools(
-                    await _apply_attachment_tool_autoenable(
-                        input_data.enabled_tools, current_user, input_data.session_id, user_id
-                    ),
-                    current_user,
-                ),
-                model_id=dispatch_model_id,
-                system_prompt=await _plain_turn_prompt(input_data, user_id),
-                caching_enabled=caching_enabled,
-                provider=dispatch_provider or registry_provider,
-                inference_params=inference_params,
-                mantle_api_mode=mantle_api_mode,
-                mantle_region=mantle_region,
-                agent_type=effective_agent_type,
-                is_resume=False,
-                accessible_skill_ids=effective_skill_ids,
-                # This path builds no injected tools, but shares a cache slot
-                # with the real turns that do. Read the slot; never seed it.
-                cache_write=False,
-                assistant_id=input_data.rag_assistant_id,
-            )
-            payload = await dispatch_app_tool_call(
-                agent,
-                session_id=input_data.session_id,
-                user_id=user_id,
-                tool_use_id=atc.tool_use_id,
-                tool_name=atc.tool_name,
-                arguments=atc.arguments,
-            )
-            return JSONResponse(payload)
-        except AppToolCallError as e:
-            # 200 + envelope, not `status_code=e.code`: AgentCore Runtime
-            # rewrites any non-2xx to a generic 424 and discards the
-            # message, so a deliberate 409 ("connect the account") reached
-            # the SPA as "check your CloudWatch logs". app-api restores the
-            # real status. See `mcp_apps.error_envelope`.
-            return app_tool_error_response(e.message, e.code)
-        except HTTPException:
-            raise
-        except Exception:
-            logger.error("app tools/call invocation failed", exc_info=True)
-            return JSONResponse({"error": "Internal error"}, status_code=500)
+def _forbidden_turn(
+    input_data: InvocationRequest, user_id: str, message: str, *, persist: bool = True
+) -> StreamingResponse:
+    """A refusal the user cannot recover by retrying (``recoverable=False``)."""
+    return _refuse_turn(
+        input_data,
+        user_id,
+        message=message,
+        stop_reason="error",
+        metadata_event=ConversationalErrorEvent(
+            code=ErrorCode.FORBIDDEN, message=message, recoverable=False
+        ),
+        persist=persist,
+    )
 
-    # App-pushed model context (MCP Apps PR #6, `ui/update-model-context`).
-    # Like app_tool_call it bypasses quota / RAG / file resolution / title
-    # and runs NO model turn — we rebuild the conversation agent (so the
-    # same cached `agent.state` is reused) and stash the payload under
-    # `mcp_apps.context[resource_uri]`. The next real user turn merges and
-    # clears it. Inert behind the host flag (no live App ever calls this).
-    if input_data.app_context_update is not None:
-        acu = input_data.app_context_update
-        try:
-            request_inference_params = dict(input_data.inference_params or {})
-            dispatch_model_id, dispatch_provider = input_data.model_id, input_data.provider
-            if not dispatch_model_id:
-                dispatch_model_id, dispatch_provider = await _resolve_fallback_model(
-                    user_id, current_user, dispatch_provider
-                )
-            caching_enabled, inference_params, mantle_api_mode, mantle_region, registry_provider = await _resolve_model_settings(
-                model_id=dispatch_model_id,
-                explicit_caching_enabled=input_data.caching_enabled,
-                request_inference_params=request_inference_params,
-            )
-            agent = await get_agent(
-                session_id=input_data.session_id,
-                user_id=user_id,
-                auth_token=auth_token,
-                # Same auto-enable seam as the main turn, so a spreadsheet
-                # session's dispatch reads the slot the real turns fill — and
-                # the same always-on union, or the dispatch would compute a
-                # different effective list and miss into its own agent-cache
-                # slot on every App call.
-                enabled_tools=await _apply_admin_always_on_tools(
-                    await _apply_attachment_tool_autoenable(
-                        input_data.enabled_tools, current_user, input_data.session_id, user_id
-                    ),
-                    current_user,
-                ),
-                model_id=dispatch_model_id,
-                system_prompt=await _plain_turn_prompt(input_data, user_id),
-                caching_enabled=caching_enabled,
-                provider=dispatch_provider or registry_provider,
-                inference_params=inference_params,
-                mantle_api_mode=mantle_api_mode,
-                mantle_region=mantle_region,
-                agent_type=effective_agent_type,
-                is_resume=False,
-                accessible_skill_ids=effective_skill_ids,
-                # Same partial-toolset hazard as app_tool_call above.
-                cache_write=False,
-                assistant_id=input_data.rag_assistant_id,
-            )
-            payload = dispatch_app_context_update(
-                agent,
-                resource_uri=acu.resource_uri,
-                content=acu.content,
-                structured_content=acu.structured_content,
-            )
-            return JSONResponse(payload)
-        except AppContextUpdateError as e:
-            # Same AgentCore flattening as the app_tool_call path above.
-            return app_tool_error_response(e.message, e.code)
-        except HTTPException:
-            raise
-        except Exception:
-            logger.error("app context update invocation failed", exc_info=True)
-            return JSONResponse({"error": "Internal error"}, status_code=500)
 
-    if input_data.enabled_tools:
-        logger.info(f"Enabled tools ({len(input_data.enabled_tools)})")
+def _with_pending_app_context(message: str, session_id: str, user_id: str) -> str:
+    """Prepend what this conversation's MCP Apps pushed since its last turn.
 
+    One dict lookup on the turn path (``merge_and_clear_pending_context``
+    drains a process-level store keyed by ``(session, user)``). The block
+    rides in the new user message, after the cached prefix.
+    """
+    block = merge_and_clear_pending_context(session_id, user_id)
+    return f"{block}\n\n{message}" if block else message
+
+
+async def _agent_for_app_dispatch(
+    input_data: InvocationRequest,
+    current_user: User,
+    user_id: str,
+    auth_token: Optional[str],
+    *,
+    agent_type: str,
+    accessible_skill_ids: Optional[list],
+):
+    """The conversation's agent for an MCP App dispatch (map stage B3).
+
+    An App's ``tools/call`` runs no model turn, but it needs the same ``Agent``
+    the real turns use: the MCP client session and its auth. (``ui/update-model-
+    context`` needs no agent; it is held per conversation in
+    ``app_context_dispatch``.) So the model, its
+    settings and the effective tool list are resolved exactly as the main turn
+    resolves them, and ``get_agent`` reads the same cache slot with
+    ``cache_write=False`` — this path builds no injected tools, so an agent it
+    built must never seed a slot the real turns would then hit.
+    """
+    request_inference_params = dict(input_data.inference_params or {})
+    dispatch_model_id, dispatch_provider = input_data.model_id, input_data.provider
+    if not dispatch_model_id:
+        dispatch_model_id, dispatch_provider = await _resolve_fallback_model(
+            user_id, current_user, dispatch_provider
+        )
+    caching_enabled, inference_params, mantle_api_mode, mantle_region, registry_provider, input_modalities = await _resolve_model_settings(
+        model_id=dispatch_model_id,
+        explicit_caching_enabled=input_data.caching_enabled,
+        request_inference_params=request_inference_params,
+    )
+    return await get_agent(
+        session_id=input_data.session_id,
+        user_id=user_id,
+        auth_token=auth_token,
+        # Same auto-enable seam as the main turn, so a spreadsheet
+        # session's dispatch reads the slot the real turns fill — and
+        # the same always-on union, or the dispatch would compute a
+        # different effective list and miss into its own agent-cache
+        # slot on every App call.
+        enabled_tools=await _apply_admin_always_on_tools(
+            await _apply_attachment_tool_autoenable(
+                input_data.enabled_tools, current_user, input_data.session_id, user_id
+            ),
+            current_user,
+        ),
+        model_id=dispatch_model_id,
+        system_prompt=await _plain_turn_prompt(input_data, user_id),
+        caching_enabled=caching_enabled,
+        provider=dispatch_provider or registry_provider,
+        inference_params=inference_params,
+        mantle_api_mode=mantle_api_mode,
+        mantle_region=mantle_region,
+        agent_type=agent_type,
+        is_resume=False,
+        accessible_skill_ids=accessible_skill_ids,
+        # This path builds no injected tools, but shares a cache slot
+        # with the real turns that do. Read the slot; never seed it.
+        cache_write=False,
+        assistant_id=input_data.rag_assistant_id,
+        text_only_model=is_text_only_model(input_modalities),
+    )
+
+
+async def _agent_for_app_tool_call(
+    input_data: InvocationRequest,
+    current_user: User,
+    user_id: str,
+    auth_token: Optional[str],
+    *,
+    agent_type: str,
+    accessible_skill_ids: Optional[list],
+):
+    """The agent an App's ``tools/call`` dispatches against.
+
+    ``_agent_for_app_dispatch`` cannot rebuild the turn's cache key: the turn's
+    system prompt, memory context, injected tools and memory binding are all
+    resolved later in the route, so its key missed on every press and paid a
+    full build and a memory restore (~1.5 s cold on dev). The conversation's
+    turns have already built an agent over the tool's MCP client, so the
+    newest one that carries it is used as is. Nothing on the agent is read or
+    written here: the dispatch calls the catalog's client, and the build only
+    ever served to wire and start it. The walk matches ``(session, user)``, so
+    another user's agent under the same session id is never a candidate.
+    """
+    session_id = input_data.session_id
+    tool_name = input_data.app_tool_call.tool_name
+    for live in live_conversation_agents(session_id, user_id):
+        if agent_carries_tool_client(live, tool_name):
+            logger.info("agent_cache outcome=app_reuse session=%s", scrub_log(session_id))
+            return live
+    return await _agent_for_app_dispatch(
+        input_data,
+        current_user,
+        user_id,
+        auth_token,
+        agent_type=agent_type,
+        accessible_skill_ids=accessible_skill_ids,
+    )
+
+
+@dataclass
+class TurnAttachments:
+    """What this turn's attachments resolved to (map stage B4, ``preamble.files``).
+
+    ``files_to_send`` is the inline set the model receives as document/image
+    blocks. The three diverted lists never go inline (spreadsheets and decks
+    route through their tools; oversized and over-budget files are dropped with
+    a note), and neither does ``reference_documents`` (large documents carried
+    as a digest or stub). ``marker_names`` is every filename that still exists in the
+    session, in attachment order, for the ``[Attached files: …]`` marker the
+    SPA replays on reload. ``turn_has_document`` is the *classified* answer to
+    "did this turn attach something ``document_read`` can read", which feeds
+    the tool-injection gate and therefore ``toolConfig``.
+    """
+
+    recovered_upload_ids: list = field(default_factory=list)
+    files_to_send: list = field(default_factory=list)
+    diverted_tabular: list = field(default_factory=list)
+    diverted_presentations: list = field(default_factory=list)
+    oversized_inline: list = field(default_factory=list)
+    over_budget_inline: list = field(default_factory=list)
+    dropped_over_count_names: list = field(default_factory=list)
+    dropped_over_count_total: int = 0
+    turn_has_document: bool = False
+    marker_names: list = field(default_factory=list)
+    # Reference-class uploads (``ReferenceAttachment``, large-document spec
+    # §4B): never inline, no bytes. Each reaches the model as its digest or a
+    # stub in the user message, stays in the marker, and counts toward the
+    # per-message file cap (applied to the ids before they were resolved).
+    reference_documents: list = field(default_factory=list)
+    # Attached Drive folders (``FolderAttachment`` rows, drive-folder spec
+    # §4.4): each counted ONE against the per-message cap, read by one
+    # ``GetItem``, never by S3. Each reaches the model as a manifest in the
+    # user message; its files are already session files.
+    folders: list = field(default_factory=list)
+    # Inline (base64 ``files``) spreadsheets/decks that could not be stored as
+    # session files — ``PersistFailure`` entries (file + user-facing reason).
+    # Dropped from the turn: not diverted, not in the marker, named in the note.
+    unpersisted_inline: list = field(default_factory=list)
+    # Set by `_adapt_attachments_for_model` once the model is known, and only
+    # for a model whose row declares TEXT input only: the documents converted
+    # to text (`ExtractedDocument`), and the images and documents it could not
+    # read at all. Neither of the last two is in the marker.
+    extracted_documents: list = field(default_factory=list)
+    unreadable_images: list = field(default_factory=list)
+    unreadable_documents: list = field(default_factory=list)
+
+
+async def _persist_inline_diverted(
+    input_data: InvocationRequest,
+    user_id: str,
+    diverted_tabular: list,
+    diverted_presentations: list,
+) -> tuple[list, list, list]:
+    """Give inline bytes of a diverted class the S3 object + row an upload has.
+
+    Diverted files are dropped from the prompt on the promise that the
+    Spreadsheet Analysis / PowerPoint tools can reach them — and those tools
+    find session files only through ``FileUploadRepository.list_session_files``.
+    Uploads (``file_upload_ids``) are already there; base64 ``files`` are not,
+    so until this ran the note was a lie for every headless caller. Identity,
+    not filename, picks the inline ones: a resolved upload may share a name.
+
+    Returns the two diverted lists with the failures removed, plus the failures.
+    Never raises; a failure is reported to the user and the turn continues.
+    """
+    inline_identity = {id(f) for f in (input_data.files or [])}
+    inline_diverted = [f for f in diverted_tabular + diverted_presentations if id(f) in inline_identity]
+    if not inline_diverted or not inline_attachment_persist_enabled():
+        return diverted_tabular, diverted_presentations, []
+
+    started = time.perf_counter()
+    persisted, failures = await get_inline_attachment_persister().persist(
+        user_id=user_id, session_id=input_data.session_id, files=inline_diverted
+    )
+    logger.info(
+        "Persisted %d/%d inline diverted attachment(s) as session files in %.0fms",
+        len(persisted),
+        len(inline_diverted),
+        (time.perf_counter() - started) * 1000,
+    )
+    if not failures:
+        return diverted_tabular, diverted_presentations, []
+    failed = {id(x.file) for x in failures}
+    return (
+        [f for f in diverted_tabular if id(f) not in failed],
+        [f for f in diverted_presentations if id(f) not in failed],
+        failures,
+    )
+
+
+#: A folder attach id is ``{ms_hex}_{uuid16}`` (``new_folder_attach_id``). Anything
+#: longer is not one, and never reaches a key.
+_FOLDER_ATTACH_ID_MAX_LEN = 64
+
+
+def _requested_folder_ids(input_data: InvocationRequest) -> tuple[list[str], int]:
+    """The turn's folder ids, deduped in order, held to ``FOLDERS_PER_MESSAGE``.
+
+    Returns ``(kept, dropped)``. Empty while ``FOLDER_ATTACHMENTS_ENABLED`` is
+    off: the field is ignored, exactly as before it existed.
+    """
+    raw = input_data.folder_attachment_ids or []
+    if not raw or not folder_attachments_enabled():
+        return [], 0
+    seen: set[str] = set()
+    ids: list[str] = []
+    for value in raw:
+        if not isinstance(value, str) or not value or len(value) > _FOLDER_ATTACH_ID_MAX_LEN or value in seen:
+            continue
+        seen.add(value)
+        ids.append(value)
+    cap = max(0, FOLDERS_PER_MESSAGE)
+    return ids[:cap], max(0, len(ids) - cap)
+
+
+async def _resolve_turn_folders(user_id: str, session_id: str, folder_ids: list[str]) -> list:
+    """This turn's folder rows: one ``GetItem`` each, in parallel worker threads.
+
+    Owner-scoped by the key (``USER#{user_id}``), and a row from another
+    conversation is dropped: its files are that conversation's, which this
+    turn's ``document_read`` cannot list. A missing row (the user removed the
+    folder) is dropped too. Never raises: a folder that cannot be read costs the
+    turn its manifest, not the turn.
+    """
+    if not folder_ids:
+        return []
+    from apis.shared.files.folder_repository import get_folder_attachment_repository
+
+    repository = get_folder_attachment_repository()
+    results = await asyncio.gather(
+        *(asyncio.to_thread(repository.get_sync, user_id, fid) for fid in folder_ids),
+        return_exceptions=True,
+    )
+    folders: list = []
+    for result in results:
+        if isinstance(result, BaseException):
+            logger.warning("Folder attachment row could not be read; manifest skipped", exc_info=result)
+            continue
+        if result is None or result.session_id != session_id:
+            logger.info("Folder attachment not found in this conversation; manifest skipped")
+            continue
+        folders.append(result)
+    return folders
+
+
+def _folders_have(folders: list, predicate) -> bool:
+    """Whether any attached entry of any folder satisfies ``predicate(name, mime)``."""
+    return any(predicate(e.name, e.mime_type) for f in folders for e in attached_entries(f))
+
+
+async def _resolve_turn_attachments(
+    input_data: InvocationRequest,
+    user_id: str,
+    session_meta,
+    *,
+    is_resume: bool,
+    is_continuation: bool,
+) -> TurnAttachments:
+    """Map stage B4 (``preamble.files``): recover, fetch, dedupe, partition, budget.
+
+    Mutates ``input_data.file_upload_ids`` when it re-attaches a previous
+    turn's unanswered uploads, because the write-ahead marker recorded in the
+    session-state phase reads the ids off the request.
+    """
     # Recover attachments the PREVIOUS turn sent but never got an answer for.
     #
     # Inline document bytes are one-shot: they are stripped out of restored
@@ -2344,12 +2705,30 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             dropped_over_count_names,
             dropped_over_count_total,
         ) = _apply_message_file_cap(all_files, upload_ids_to_resolve, MAX_FILES_PER_MESSAGE)
-        if dropped_over_count_total:
-            logger.warning(
-                "Dropped %d attachment(s) over the %d-per-message cap",
-                dropped_over_count_total,
-                MAX_FILES_PER_MESSAGE,
-            )
+
+    # Folders (drive-folder spec §4.4, §9 D1): each one counts ONE against the
+    # same cap, after the files, whatever its file count. Never on a resume or
+    # a continuation: those replay a turn whose message was already built.
+    folder_ids: list[str] = []
+    if not is_resume and not is_continuation:
+        folder_ids, dropped_folders = _requested_folder_ids(input_data)
+        dropped_over_count_total += dropped_folders
+        if turn_guard_on and MAX_FILES_PER_MESSAGE > 0:
+            budget = max(0, MAX_FILES_PER_MESSAGE - len(all_files) - len(upload_ids_to_resolve))
+            dropped_over_count_total += max(0, len(folder_ids) - budget)
+            folder_ids = folder_ids[:budget]
+    if turn_guard_on and dropped_over_count_total:
+        logger.warning(
+            "Dropped %d attachment(s) over the %d-per-message cap",
+            dropped_over_count_total,
+            MAX_FILES_PER_MESSAGE,
+        )
+    # Started now so its GetItems overlap the uploads' S3 reads below.
+    folders_task = (
+        asyncio.create_task(_resolve_turn_folders(user_id, input_data.session_id, folder_ids))
+        if folder_ids
+        else None
+    )
 
     # Whether THIS turn attached something `document_read` can actually read.
     # Classified here, from the resolved uploads, rather than inferred from
@@ -2368,6 +2747,10 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 max_files=None if turn_guard_on else 5,
             )
             for rf in resolved_files:
+                reference_meta = getattr(rf, "reference", None)
+                if reference_meta is not None:
+                    all_files.append(ReferenceAttachment(meta=reference_meta))
+                    continue
                 all_files.append(
                     FileContent(filename=rf.filename, content_type=rf.content_type, bytes=rf.bytes)
                 )
@@ -2376,6 +2759,15 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
         except Exception:
             logger.warning("Failed to resolve file upload IDs", exc_info=True)
             # Continue without files rather than failing the request
+
+    folders: list = await folders_task if folders_task is not None else []
+    if folders:
+        logger.info("Attached %d folder(s) by manifest (no S3 read on the turn path)", len(folders))
+        # A folder holding a readable document needs `document_read` on this
+        # turn, classified from the row exactly as an upload is.
+        turn_has_document = turn_has_document or _folders_have(
+            folders, lambda name, mime: is_document_class(mime, name)
+        )
 
     # Deduplicate files by (filename, content_type) before partitioning.
     # The same file can arrive via both `files` (direct base64) and
@@ -2411,7 +2803,14 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
         diverted_tabular,
         diverted_presentations,
         oversized_inline,
+        reference_documents,
     ) = _partition_attachments(all_files)
+    if reference_documents:
+        logger.info(
+            "Attached %d large document(s) by reference (no S3 read on the turn path)",
+            len(reference_documents),
+        )
+        record_reference_attachments(reference_documents)
     if diverted_tabular:
         logger.info(
             f"Diverted {len(diverted_tabular)} tabular file(s) from inline document blocks; "
@@ -2428,6 +2827,10 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             f"Skipped {len(oversized_inline)} oversized file(s) (> inline limit): "
             f"{[(f.filename, _estimate_decoded_size(f)) for f in oversized_inline]}"
         )
+
+    diverted_tabular, diverted_presentations, unpersisted_inline = await _persist_inline_diverted(
+        input_data, user_id, diverted_tabular, diverted_presentations
+    )
 
     # Aggregate budget for the turn (spec §4E / PR-6): the inline set is one
     # persisted message, and a message over ~7.5 MB raw fails the AgentCore
@@ -2454,18 +2857,243 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 dropped_count=len(over_budget_inline),
             )
 
-    # Both classes were dropped from the turn entirely; the marker must not
-    # promise a card for either.
+    # All three classes were dropped from the turn entirely; the marker must
+    # not promise a card for any of them.
     attachment_marker_names = _attachment_marker_names(
-        all_files, oversized_inline + over_budget_inline
+        all_files, oversized_inline + over_budget_inline + [x.file for x in unpersisted_inline]
     )
 
-    # Covers the unconsumed-attachment recovery read, the S3 fetch behind
-    # `resolve_files`, and the inline/tabular/oversized partitioning. Expected
-    # to be ~0 on a turn with no attachments; if it is not, the hypothesis in
-    # docs/specs/turn-latency-preamble.md is wrong about where the time is.
-    prelude.mark("preamble.files")
+    files_to_send = await _write_out_tracked_changes(files_to_send)
 
+    return TurnAttachments(
+        recovered_upload_ids=recovered_upload_ids,
+        files_to_send=files_to_send,
+        diverted_tabular=diverted_tabular,
+        diverted_presentations=diverted_presentations,
+        oversized_inline=oversized_inline,
+        over_budget_inline=over_budget_inline,
+        dropped_over_count_names=dropped_over_count_names,
+        dropped_over_count_total=dropped_over_count_total,
+        turn_has_document=turn_has_document,
+        marker_names=attachment_marker_names,
+        unpersisted_inline=unpersisted_inline,
+        reference_documents=reference_documents,
+        folders=folders,
+    )
+
+
+def _annotated_inline_docx(file):
+    """``file`` with its tracked changes written out, or ``file`` itself if it has none."""
+    import base64
+
+    from apis.shared.kb_backend.docx_revisions import annotate_tracked_changes
+
+    annotated = annotate_tracked_changes(base64.b64decode(file.bytes or ""))
+    if annotated is None:
+        return file
+    return file.model_copy(update={"bytes": base64.b64encode(annotated).decode("ascii")})
+
+
+async def _write_out_tracked_changes(files_to_send: list) -> list:
+    """Give the model each inline ``.docx``'s tracked changes as text (map stage B4).
+
+    Bedrock's document parser keeps every run and drops the revision markup, so
+    a redline reaches the model as both sides merged: "State of IdahoDelaware"
+    (measured on dev, 2026-10-12). The annotated package comes through verbatim
+    as ``[deleted: Idaho][inserted: Delaware]`` and stays a ``docx`` block, so the
+    block's name and format do not change (``docs/specs/word-tracked-changes.md``
+    §2, R3).
+
+    Inline document bytes are stripped from restored history, so this shapes
+    only the turn that attaches the file, and it is a pure function of the
+    bytes. Returns the list unchanged while ``WORD_TRACKED_CHANGES_ENABLED`` is
+    off or no ``.docx`` is attached. Otherwise the rewrite runs off the event
+    loop, and a file that fails to rewrite is sent as it was.
+    """
+    from apis.shared.feature_flags import word_tracked_changes_enabled
+
+    if not files_to_send or not word_tracked_changes_enabled():
+        return files_to_send
+    positions = [i for i, f in enumerate(files_to_send) if (f.filename or "").lower().endswith(".docx")]
+    if not positions:
+        return files_to_send
+
+    results = await asyncio.gather(
+        *(asyncio.to_thread(_annotated_inline_docx, files_to_send[i]) for i in positions),
+        return_exceptions=True,
+    )
+    out = list(files_to_send)
+    for i, result in zip(positions, results):
+        if isinstance(result, BaseException):
+            logger.warning("Could not write out tracked changes for a docx attachment: %s", result)
+            continue
+        out[i] = result
+    annotated = sum(1 for i in positions if out[i] is not files_to_send[i])
+    if annotated:
+        logger.info("Wrote out tracked changes for %d docx attachment(s)", annotated)
+    return out
+
+
+@dataclass
+class ExtractedDocument:
+    """One attached document's text layer, for a model that reads text only."""
+
+    filename: str
+    text: str
+    truncated: bool
+    unit: str
+    count: int
+
+
+#: Floor on one document's share of ``TEXT_ONLY_DOCUMENTS_MAX_CHARS``, so five
+#: attachments still get a useful excerpt each.
+_TEXT_ONLY_DOCUMENT_MIN_CHARS = 4_000
+
+
+def _extract_document_text(file, fmt: str, limit: int) -> Optional[ExtractedDocument]:
+    """Decode one inline file and pull its text layer. Blocking (PDF parsing)."""
+    import base64
+
+    from apis.shared.files.document_digest import document_text
+
+    extracted = document_text(fmt, base64.b64decode(file.bytes or ""), limit)
+    if not extracted.text.strip():
+        return None
+    return ExtractedDocument(
+        filename=file.filename,
+        text=extracted.text,
+        truncated=extracted.truncated,
+        unit=extracted.unit,
+        count=extracted.count,
+    )
+
+
+async def _adapt_attachments_for_model(attachments: TurnAttachments, turn_model: "TurnModel") -> None:
+    """Fit the inline set to what the turn's model can read (map stage B11).
+
+    A model whose catalog row declares TEXT input only (``zai.glm-5``, and the
+    text-only Mantle rows) rejects every document and image block with a
+    ValidationException — measured on dev 2026-10-06, "This model doesn't
+    support documents." for pdf *and* txt — so a turn that inlined one failed
+    outright. Runs after `_resolve_turn_model` because `_resolve_turn_attachments`
+    runs before the model is known. For such a model only:
+
+    - documents become text (``ExtractedDocument``), bounded by
+      ``TEXT_ONLY_DOCUMENTS_MAX_CHARS`` across the turn and rendered into the
+      user message by `_build_extracted_documents_section`;
+    - images, and documents with no text layer to extract (a scan, legacy
+      ``.doc``), are dropped and named in the attachment guidance, exactly like
+      oversized files, and leave the marker for the same reason.
+
+    Mutates ``attachments`` in place. Every other turn returns on the first
+    line, so it costs nothing before the first token there; the extraction
+    itself runs off the event loop, and only on a turn that used to fail.
+    """
+    if not attachments.files_to_send or not turn_model.text_only:
+        return
+
+    from apis.shared.files.document_read import document_format_for
+
+    images: list = []
+    documents: list = []
+    unreadable: list = []
+    for file in attachments.files_to_send:
+        if (file.content_type or "").lower().startswith("image/"):
+            images.append(file)
+            continue
+        fmt = document_format_for(file.content_type or "", file.filename or "")
+        if fmt is None:
+            unreadable.append(file)
+            continue
+        documents.append((file, fmt))
+
+    extracted: list = []
+    if documents:
+        limit = max(_TEXT_ONLY_DOCUMENT_MIN_CHARS, TEXT_ONLY_DOCUMENTS_MAX_CHARS // len(documents))
+        results = await asyncio.gather(
+            *(asyncio.to_thread(_extract_document_text, f, fmt, limit) for f, fmt in documents),
+            return_exceptions=True,
+        )
+        for (file, fmt), result in zip(documents, results):
+            if isinstance(result, ExtractedDocument):
+                extracted.append(result)
+                continue
+            if isinstance(result, BaseException):
+                logger.warning("Text extraction failed for a %s attachment: %s", fmt, result)
+            unreadable.append(file)
+
+    logger.info(
+        "Text-only model: %d document(s) converted to text (%d sampled), "
+        "%d image(s) and %d document(s) dropped",
+        len(extracted),
+        sum(1 for d in extracted if d.truncated),
+        len(images),
+        len(unreadable),
+    )
+    # Attachment order, not discovery order: the guidance naming these joins
+    # the persisted message, and so the cacheable prefix on later turns.
+    unreadable_ids = {id(f) for f in unreadable}
+    unreadable = [f for f in attachments.files_to_send if id(f) in unreadable_ids]
+    dropped_names = {f.filename for f in images + unreadable}
+    attachments.files_to_send = []
+    attachments.extracted_documents = extracted
+    attachments.unreadable_images = images
+    attachments.unreadable_documents = unreadable
+    if dropped_names:
+        attachments.marker_names = [n for n in attachments.marker_names if n not in dropped_names]
+
+
+def _build_extracted_documents_section(extracted: list, document_read_available: bool) -> str:
+    """The text a TEXT-only model reads in place of the documents it cannot.
+
+    Appended to the user message after the attachment guidance. Order follows
+    attachment order, and the text is a pure function of the files, so the
+    persisted message is byte-stable for the prefix it joins on later turns.
+    """
+    if not extracted:
+        return ""
+    parts = [
+        "_The selected model reads text only, so the attached document(s) below "
+        "were converted to text. Layout, images, charts and scanned pages are not "
+        "included._"
+    ]
+    for doc in extracted:
+        name = doc.filename.replace('"', "'")
+        body = doc.text.replace("</attached-document", "<\\/attached-document")
+        attrs = f'name="{name}" {doc.unit}s="{doc.count}"'
+        if doc.truncated:
+            attrs += ' excerpt="sampled"'
+            pointer = (
+                " Use `document_read` to search it or read specific parts."
+                if document_read_available
+                else ""
+            )
+            body = f"[Too long to include in full: what follows is an excerpt.{pointer}]\n\n{body}"
+        parts.append(f"<attached-document {attrs}>\n{body}\n</attached-document>")
+    return "\n\n".join(parts)
+
+
+async def _prepare_session_state(
+    input_data: InvocationRequest,
+    user_id: str,
+    session_meta,
+    *,
+    is_resume: bool,
+    is_continuation: bool,
+) -> Tuple[bool, Optional[str]]:
+    """Map stage B5 (``preamble.session_state``).
+
+    Pre-creates the session row on a first turn, clears the markers a previous
+    turn may have left (paused turn, pending interrupts, truncation,
+    interruption) and records the write-ahead attachment marker. Every read is
+    answered from ``session_meta`` (PR-2 of the preamble spec); only a marker
+    that actually exists costs a write.
+
+    Returns ``(is_new_session, interrupted_turn_reason)``: whether this is the
+    session's first turn (it drives title generation), and the settled reason
+    the previous turn was interrupted, if it was, for the note prepended to
+    this turn's prompt.
+    """
     # Pre-create session metadata so OAuth interrupts and other state can
     # attach to the session row from turn one. Best-effort; on failure the
     # post-stream lazy-create in StreamCoordinator still covers it.
@@ -2543,30 +3171,28 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             except Exception as e:
                 logger.error("Failed to record pending attachments: %s", e, exc_info=True)
 
-    # First turn → kick off title generation concurrently with the stream.
-    # Runs as a background task so it doesn't add latency to TTFT. The
-    # targeted UpdateExpression in update_session_title is race-safe with
-    # the post-stream _update_session_metadata write. The task handle is
-    # kept so stream_with_quota_warning can push the finished title to the
-    # client mid-stream as a `session_title` SSE event.
-    title_task: Optional["asyncio.Task[str]"] = None
-    if is_new_session and input_data.message:
-        title_task = asyncio.create_task(
-            generate_conversation_title(
-                session_id=input_data.session_id,
-                user_id=user_id,
-                user_input=input_data.message,
-            )
-        )
+    return is_new_session, interrupted_turn_reason
 
-    # The prime suspect: five of the preamble's eight reads of the session's
-    # META row live in this stage (pre-create plus the four stale-marker
-    # clears), each on its own round trip, and four of them short-circuit
-    # without writing anything. The title task is inside the boundary because
-    # spawning it is first-turn session state; it is an `asyncio.create_task`,
-    # so it contributes nothing to the number.
-    prelude.mark("preamble.session_state")
 
+@dataclass
+class TurnQuota:
+    """Map stage B6 (``preamble.quota``): what the quota check decided."""
+
+    warning_event: Any = None
+    session_notice_event: Any = None
+    exceeded_event: Any = None
+
+
+async def _check_turn_quota(
+    current_user: User,
+    input_data: InvocationRequest,
+    session_meta,
+    *,
+    is_resume: bool,
+    is_continuation: bool,
+) -> TurnQuota:
+    """Map stage B6 (``preamble.quota``). Fails open: a quota-service error
+    lets the turn run rather than blocking it."""
     # Check quota if enforcement is enabled
     quota_warning_event = None
     quota_session_notice_event = None
@@ -2619,61 +3245,860 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             # Log error but don't block request - fail open for quota errors
             logger.error("Error checking quota for user", exc_info=True)
 
-    # The quota round trip: a cached tier resolve, a cached O(1) cost-summary
-    # GetItem, and — the uncached one — the per-session notice, which reads the
-    # META row for the eighth time this turn.
+    return TurnQuota(
+        warning_event=quota_warning_event,
+        session_notice_event=quota_session_notice_event,
+        exceeded_event=quota_exceeded_event,
+    )
+
+
+@dataclass
+class TurnModel:
+    """Map stage B11: the model this turn runs on and the knobs resolved for it."""
+
+    model_id: Optional[str]
+    provider: Optional[str]
+    caching_enabled: Optional[bool]
+    inference_params: dict
+    mantle_api_mode: Optional[str]
+    mantle_region: Optional[str]
+    # The catalog row's declared input, or None with no row. Read by
+    # `is_text_only_model`, which keeps documents and images off a model
+    # that rejects them.
+    input_modalities: Optional[list] = None
+
+    @property
+    def text_only(self) -> bool:
+        return is_text_only_model(self.input_modalities)
+
+
+def is_text_only_model(input_modalities: Optional[list]) -> bool:
+    """Whether a catalog row declares TEXT input and nothing else.
+
+    Keyed on TEXT-*only*, never on a missing entry: Claude rows declare
+    ``["TEXT", "IMAGE"]`` with no ``DOCUMENT`` and read PDFs natively, so "no
+    DOCUMENT" does not mean "no documents". An empty or absent list (no row,
+    or a row that predates the field) is not text-only either — the turn
+    stays exactly as it was, and the error backstop in
+    ``apis.shared.errors.unsupported_attachment_message`` covers a wrong row.
+    """
+    declared = {str(m).strip().upper() for m in (input_modalities or []) if str(m).strip()}
+    return declared == {"TEXT"}
+
+
+async def _resolve_turn_model(
+    input_data: InvocationRequest,
+    current_user: User,
+    user_id: str,
+    user_settings: dict,
+    agent_model_override,
+) -> TurnModel:
+    """Map stage B11 (in ``tools``): which model, and with what settings.
+
+    Precedence for the id: the Agent's governed ``modelConfig`` (already
+    access-checked against the invoker), else the request's, else the user's
+    saved default, else the catalog's default. The registry then supplies
+    caching, admin bounds and locks on the inference params, the Mantle
+    transport fields, and the provider when nothing else named one.
+    """
+    # Build the canonical request inference-params dict. The frontend
+    # sends ``inference_params`` directly; legacy ``temperature`` /
+    # ``max_tokens`` fields are folded in for older clients and
+    # treated as defaults that lose to anything in ``inference_params``.
+    request_inference_params: dict = dict(input_data.inference_params or {})
+    if input_data.temperature is not None:
+        request_inference_params.setdefault("temperature", input_data.temperature)
+    if input_data.max_tokens is not None:
+        request_inference_params.setdefault("max_tokens", input_data.max_tokens)
+
+    # Resolve the user's persisted default when the request does
+    # not pin a model. Without this, a "no default selected" client
+    # always lands on the hardcoded factory default and the user's
+    # saved preference is silently ignored at chat time (#161).
+    effective_model_id = input_data.model_id
+    effective_provider = input_data.provider
+    if agent_model_override is not None:
+        # The Agent's governed modelConfig wins over the request / user-default
+        # chain. Already access-checked against the invoker in the resolver (R2),
+        # so the earlier request-only gate at the top doesn't leave a hole.
+        effective_model_id = agent_model_override.model_id
+        effective_provider = agent_model_override.provider or effective_provider
+    if not effective_model_id:
+        effective_model_id, effective_provider = await _resolve_fallback_model(
+            user_id, current_user, effective_provider, settings=user_settings
+        )
+
+    # Agent-authored params sit as defaults BENEATH explicit request params,
+    # then flow through _resolve_model_settings' admin bounds/locks like any
+    # other request params — an author can't smuggle out-of-bounds values.
+    if agent_model_override is not None and agent_model_override.params:
+        request_inference_params = {**agent_model_override.params, **request_inference_params}
+
+    # Single registry lookup resolves caching + inference params +
+    # the Mantle endpoint path + provider, merging admin defaults with
+    # request overrides.
+    (
+        caching_enabled,
+        inference_params,
+        mantle_api_mode,
+        mantle_region,
+        registry_provider,
+        input_modalities,
+    ) = await _resolve_model_settings(
+        model_id=effective_model_id,
+        explicit_caching_enabled=input_data.caching_enabled,
+        request_inference_params=request_inference_params,
+    )
+
+    # Recover the provider from the registry when neither the request nor
+    # the Agent's model binding carried one. Agent bindings persist only
+    # ``model_id`` (no provider), so without this a Mantle model like
+    # ``openai.gpt-5.4`` resolves to provider=None → Bedrock and blows up
+    # in ConverseStream with "invalid model identifier" — even though the
+    # same model works from the normal chat path, which always sends
+    # ``provider`` alongside ``model_id``.
+    if not effective_provider and registry_provider:
+        effective_provider = registry_provider
+
+    if caching_enabled is False:
+        logger.info("Prompt caching disabled for model")
+
+    return TurnModel(
+        model_id=effective_model_id,
+        provider=effective_provider,
+        caching_enabled=caching_enabled,
+        inference_params=inference_params,
+        mantle_api_mode=mantle_api_mode,
+        mantle_region=mantle_region,
+        input_modalities=input_modalities,
+    )
+
+
+async def _resolve_effective_tools(
+    input_data: InvocationRequest,
+    current_user: User,
+    user_id: str,
+    agent_tools_override,
+    *,
+    turn_has_tabular: bool,
+) -> Optional[list]:
+    """Map stage B11 (in ``tools``): the tool ids this turn actually carries.
+
+    On an Agent turn, the Agent's bindings — empty when it binds none, never
+    the request's picker; on a plain chat, the request's picker. Then the
+    spreadsheet auto-enable for a session holding a spreadsheet (or an unbound
+    Agent whose knowledge base holds one), then the admin's always-on set
+    unless the Agent binds its own tools, then the platform's system tools.
+    One value, so the cache key, every builder, the attachment guidance and
+    the paused-turn snapshot all see the same list.
+    """
+    # Get agent instance with user-specific configuration
+    # AgentCore Memory tracks preferences across sessions per user_id
+    # Supports multiple LLM providers: AWS Bedrock, OpenAI, and Google Gemini
+    # Use augmented message and assistant system prompt if assistant RAG was applied
+
+    # Spreadsheet tools scoped to the assistant's document corpus,
+    # when an assistant is attached to this request. The frontend
+    # keeps the assistant id in the URL for the whole session's
+    # lifetime, so we can trust `input_data.rag_assistant_id`
+    # directly; no preferences fallback needed.
+    # An Agent's tool bindings replace the request's enabled_tools for this
+    # turn (D5, resolved per invoker above). An Agent that binds no tools gets
+    # an empty list here, not the viewer's picker: its toolset must not change
+    # with whoever is chatting. None ⇒ not an Agent turn (plain chat, or the
+    # Agent surface is off) ⇒ the request drives the toolset exactly as today.
+    # Drives both the built-in extra tools (spreadsheet/artifact gate on
+    # specific ids) and get_agent.
+    effective_enabled_tools = (
+        agent_tools_override.tool_ids
+        if agent_tools_override is not None
+        else input_data.enabled_tools
+    )
+    # An unbound Agent's knowledge base is the one signal of what tools its own
+    # content needs: a spreadsheet there is unreadable without the analysis
+    # tools, which the picker used to supply.
+    agent_unbound = agent_tools_override is not None and not agent_tools_override.owns_toolset
+    # A session holding a spreadsheet gets the Spreadsheet Analysis
+    # tools whether or not the picker has them on, gated on the
+    # caller's RBAC grant. Applied to the *effective* list so it
+    # flows into the cache key, every builder below, the attachment
+    # guidance and the paused-turn snapshot as one value. Sticky
+    # across the session (see `_session_has_tabular`), so the key
+    # does not flip between the attach turn and the follow-up.
+    effective_enabled_tools = await _apply_attachment_tool_autoenable(
+        effective_enabled_tools,
+        current_user,
+        input_data.session_id,
+        user_id,
+        turn_has_tabular=turn_has_tabular,
+        kb_assistant_id=input_data.rag_assistant_id if agent_unbound else None,
+    )
+
+    # Tools an admin pinned are unioned in for users whose roles grant
+    # them, unless this Agent binds its own toolset (D4). Applied to
+    # the same *effective* list for the same reason as the line above:
+    # one value flows into the cache key, every builder, and the
+    # paused-turn snapshot. The set depends only on the catalog and the
+    # user's roles, so it is constant across a session and does not
+    # flip the key turn to turn.
+    effective_enabled_tools = await _apply_admin_always_on_tools(
+        effective_enabled_tools,
+        current_user,
+        agent_bound_tools=agent_tools_override is not None and agent_tools_override.owns_toolset,
+    )
+
+    return effective_enabled_tools
+
+
+@dataclass
+class TurnTools:
+    """Map stage B11: the context-bound tools built for this turn.
+
+    ``extra_tools`` is appended to the registry's filtered tools by
+    ``BaseAgent``. ``document_tools`` is the ``document_read`` subset, whose
+    presence is a cache-key element of its own. ``extra_tools_key_described``
+    says whether every builder that fired closes over values the cache key
+    already carries (otherwise the agent is not cached). ``memory_binding_key``
+    is what the memory tools close over, or None.
+    """
+
+    extra_tools: list
+    document_tools: list
+    extra_tools_key_described: bool
+    memory_binding_key: Optional[dict]
+
+
+async def _build_turn_tools(
+    input_data: InvocationRequest,
+    current_user: User,
+    user_id: str,
+    effective_enabled_tools: Optional[list],
+    *,
+    project_memory,
+    turn_has_document: bool,
+    text_only_model: bool = False,
+) -> TurnTools:
+    """Map stage B11 (in ``tools``): every injected tool, and the key material
+    that describes them. Closures only — no IO except the ``document_read``
+    gate, which is memoized per session once it answers yes."""
+    extra_tools = _build_spreadsheet_tools(
+        enabled_tools=effective_enabled_tools,
+        assistant_id=input_data.rag_assistant_id,
+        session_id=input_data.session_id,
+        user_id=user_id,
+    ) + _build_artifact_tools(
+        enabled_tools=effective_enabled_tools,
+        session_id=input_data.session_id,
+        user_id=user_id,
+    ) + _build_word_document_tools(
+        enabled_tools=effective_enabled_tools,
+        session_id=input_data.session_id,
+        user_id=user_id,
+        user_name=current_user.name,
+    ) + _build_workspace_tools(
+        enabled_tools=effective_enabled_tools,
+        session_id=input_data.session_id,
+        user_id=user_id,
+    ) + _build_excel_spreadsheet_tools(
+        enabled_tools=effective_enabled_tools,
+        session_id=input_data.session_id,
+        user_id=user_id,
+    ) + _build_powerpoint_presentation_tools(
+        enabled_tools=effective_enabled_tools,
+        session_id=input_data.session_id,
+        user_id=user_id,
+    ) + _build_account_tools(effective_enabled_tools, current_user) + _build_skill_authoring_tools(
+        enabled_tools=effective_enabled_tools,
+        session_id=input_data.session_id,
+        user_id=user_id,
+        user_email=current_user.email,
+    )
+
+    # A project harness addresses its spaces by scope (2.4b), and reads the
+    # team's shared tasks (2.5c). Memory first, so the four memory specs keep
+    # their place in the cached toolConfig.
+    if project_memory is not None:
+        from apis.inference_api.chat.project_memory import (
+            build_project_memory_tools,
+            build_shared_task_tools,
+        )
+
+        extra_tools = (
+            extra_tools
+            + build_project_memory_tools(project_memory, current_user)
+            + build_shared_task_tools(project_memory.project_id, current_user)
+        )
+
+    # document_read for any session that carries a readable attachment
+    # (this turn's uploads count). Gated on session state, not the
+    # picker; its presence goes into the cache key below rather than
+    # vetoing the cache, so an attachment session that could keep a
+    # warm agent still does.
+    document_tools = await _build_document_tools(
+        session_id=input_data.session_id,
+        user_id=user_id,
+        turn_has_document=turn_has_document,
+        text_only=text_only_model,
+    )
+    extra_tools = extra_tools + document_tools
+
+    # Can this turn's agent be cached despite carrying injected tools?
+    # Only when every builder that fired closes over values the cache
+    # key already carries (session, user, enabled_tools). Derived from
+    # the same `effective_enabled_tools` that goes into the key below —
+    # passing the request's list here instead would let the predicate
+    # and the key disagree about which builders ran.
+    extra_tools_key_described = injected_tools_are_key_described(
+        enabled_tools=effective_enabled_tools,
+    )
+    # Memory tools close over the project's resolved spaces, so the binding is
+    # a cache-key element (Shared Projects 2.1). Only set when the tools were
+    # built, so the key and the toolset cannot disagree.
+    memory_binding_key = project_memory.binding_key() if project_memory is not None else None
+
+    return TurnTools(
+        extra_tools=extra_tools,
+        document_tools=document_tools,
+        extra_tools_key_described=extra_tools_key_described,
+        memory_binding_key=memory_binding_key,
+    )
+
+
+def _validate_resume_interrupts(agent, input_data: InvocationRequest) -> None:
+    """Reject a resume that names interrupts the cached agent has not paused.
+
+    Cache eviction, a process restart, or a forged request would otherwise be
+    silently accepted by Strands and drop the client's response. Raising up
+    front lets the client see a 400 and restart the turn cleanly.
+    """
+    strands_agent = getattr(agent, "agent", None)
+    interrupt_state = getattr(strands_agent, "_interrupt_state", None) if strands_agent else None
+    known_ids: set[str] = set()
+    if interrupt_state and getattr(interrupt_state, "activated", False):
+        interrupts = getattr(interrupt_state, "interrupts", None) or {}
+        known_ids = set(interrupts.keys())
+    submitted_ids = [entry.interruptId for entry in (input_data.interrupt_responses or [])]
+    unknown_ids = [iid for iid in submitted_ids if iid not in known_ids]
+    if unknown_ids:
+        logger.warning(
+            "Resume rejected: submitted interrupt ids not in paused state"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unknown or expired interrupt ids; restart the turn.",
+        )
+
+
+async def _resume_knowledge_context(
+    assistant_id: Optional[str], current_user: User, user_id: str
+) -> Optional[str]:
+    """A resumed turn's full-context block, re-loaded under a fresh grant."""
+    if not assistant_id:
+        return None
+    from apis.shared.assistants.kb_access import resolve_kb_access
+    from apis.shared.assistants.kb_full_context import load_full_kb_context
+
+    if not assistant_kb_full_context_enabled():
+        return None
+    access = await resolve_kb_access(assistant_id, user_id, user_email=current_user.email)
+    return await load_full_kb_context(assistant_id, access=access)
+
+
+async def _search_and_augment(
+    *,
+    assistant_id: str,
+    message: str,
+    access: Any,
+    full_context: Optional["asyncio.Task[Optional[str]]"] = None,
+) -> Tuple[Optional[list], str]:
+    """Search an assistant's knowledge base and augment ``message`` with it.
+
+    Returns ``(context_chunks, augmented_message)``. Fail-open as it always
+    was: a failed search yields ``(None, message)`` and the turn runs without
+    retrieved context. Never raises, which also means a turn that exits before
+    awaiting it (a refusal after the search started) leaves no unretrieved
+    exception behind.
+
+    ``full_context`` is the turn's ``load_full_kb_context`` task. When it
+    yields a block, the whole knowledge base is already in the system prompt,
+    so the chunks are returned for the citation cards and ``message`` comes
+    back unaugmented. The search still runs alongside, not after it, so a turn
+    that ends up retrieving waits no longer than before.
+    """
+    from apis.shared.assistants.rag_service import (
+        augment_prompt_with_context,
+        search_assistant_knowledgebase_with_cap,
+    )
+
+    try:
+        logger.info("Searching knowledge base for assistant...")
+        # The cap comes back with the results: both are decided from the one
+        # KB_Record read the search makes, rather than reading it again here.
+        context_chunks, cap = await search_assistant_knowledgebase_with_cap(
+            assistant_id=assistant_id,
+            query=message,
+            top_k=5,
+            access=access,
+        )
+        logger.info(f"Knowledge base search returned {len(context_chunks) if context_chunks else 0} chunks")
+        if full_context is not None and await full_context:
+            logger.info("Knowledge base sent whole (full-context mode) - message not augmented")
+            return context_chunks, message
+        if not context_chunks:
+            logger.info("No context chunks found for assistant - using original message without augmentation")
+            return context_chunks, message
+        for i, _chunk in enumerate(context_chunks):
+            logger.info(f"Chunk {i + 1} retrieved")
+            logger.info(f"Chunk {i + 1} metadata retrieved")
+        # Engine-aware cap (Requirement 3.2): managed gets 8,000 so
+        # reranking's top_k chunks actually reach the model; legacy keeps
+        # 2,000. See rag_service.resolve_context_cap / HANDOFF §5.40.
+        augmented = augment_prompt_with_context(
+            user_message=message, context_chunks=context_chunks, max_context_length=cap
+        )
+        logger.info(f"Augmented message with {len(context_chunks)} context chunks")
+        logger.info("Augmented message preview available")
+        return context_chunks, augmented
+    except Exception as e:
+        logger.error("Error searching assistant knowledge base", exc_info=True)
+        logger.error(f"Exception type: {type(e).__name__}")
+        # Continue without RAG context rather than failing
+        return None, message
+
+
+def _build_citations(assistant, context_chunks, rag_assistant_id: Optional[str]) -> list:
+    """Citations to persist and to stream ahead of the answer."""
+    # #111: when the agent's ``show_citations`` flag is off, suppress citations
+    # entirely — leaving this list empty is a single choke point that turns off all
+    # three downstream consumers at once: the ``event: citation`` SSE below, the
+    # ``citations=...`` persisted on the stored message, and the copy handed to
+    # ``agent.stream_async``. RAG retrieval and prompt augmentation above are
+    # deliberately untouched: the model still receives the context chunks, the user
+    # just is not shown (or able to download) the sources.
+    show_citations = getattr(assistant, "show_citations", True)
+    citations_for_storage = []
+    if context_chunks and show_citations:
+        for chunk in context_chunks:
+            citations_for_storage.append(
+                {
+                    "assistantId": rag_assistant_id,
+                    "documentId": chunk.get("metadata", {}).get("document_id", ""),
+                    # Managed KBs carry the filename under ``filename`` (set at ingest,
+                    # managed_backend.py); legacy S3-Vectors used ``source``. Read
+                    # managed first, fall back to legacy, then the placeholder — before
+                    # this, every managed-KB citation rendered "Unknown Source".
+                    "fileName": (
+                        chunk.get("metadata", {}).get("filename")
+                        or chunk.get("metadata", {}).get("source")
+                        or "Unknown Source"
+                    ),
+                    "text": chunk.get("text", "")[:500],  # Limit excerpt length
+                }
+            )
+    return citations_for_storage
+
+
+@router.post("/invocations")
+async def invocations(request: InvocationRequest, current_user: User = Depends(get_current_user_trusted)):
+    """The AgentCore Runtime invocation endpoint: one conversation turn.
+
+    Runs the sequence docs/specs/turn-path-ttft.md maps, in this order. The
+    marks are the `turn_prelude` stage names; everything up to `stream_setup`
+    happens before the response opens, with no channel to the client.
+
+    1. `preamble.ownership`  — one read of the session's META row; 404 if it is
+       another user's.
+    2. `preamble.skills`     — the turn's effective skills (opt-in; ~0 otherwise).
+    3. *(no mark)*           — model retirement; the two MCP App dispatches
+       (`app_tool_call`, `app_context_update`) return here, JSON not SSE; then
+       model access (a streamed, unpersisted refusal, unless quota is
+       exceeded), before anything below writes or spends.
+    4. `preamble.files`      — `_resolve_turn_attachments`.
+    5. `preamble.session_state` — `_prepare_session_state`; the title task on a
+       first turn.
+    6. `preamble.quota`      — `_check_turn_quota`; a block streams as an
+       assistant message.
+    7. *(no mark)*           — retired-model denial, user settings.
+    8. `rag`                 — Agent turns: access, version, bindings, the
+       knowledge-base search, prompt composition, memory, binding persistence.
+    9. *(no mark)*           — custom prompt, personal instructions, the
+       single-flight lease.
+    10. `tools`              — resume: rebuild from the paused snapshot; else
+        `_resolve_turn_model`, `_resolve_effective_tools`, `_build_turn_tools`.
+    11. `agent_build.*`      — `get_agent`, deferred into the stream and
+        narrated (`preparing` / `prepared`) unless the preparing phase is off.
+    12. `stream_setup`       — citations, the generators, the response.
+
+    Then `_guarded_stream` opens the response, builds the agent, emits
+    `turn_prelude`, starts the lease heartbeat and yields
+    `stream_with_quota_warning`, which composes the final message and streams
+    the agent. The SSE contract is in CLAUDE.md § SSE Event Types.
+    """
+    # Session prewarm (spec agentcore-runtime-v2.md §5a). Getting here has
+    # already done the only thing a warm call exists for: AgentCore started (V1)
+    # or restored (V2) the microVM this conversation is pinned to, and
+    # InvocationActivityMiddleware has stamped its idle clock. Return before the
+    # ownership read and everything after it, so a warm call writes no rows,
+    # takes no single-flight lease (the user's first send would collide with
+    # it), charges no quota and calls no model. No flag here: it is a no-op, and
+    # app-api's `POST /chat/prewarm` is the gate.
+    if request.warm:
+        logger.info("prewarm invocation for session %s", _sanitize_log(request.session_id))
+        return {"warmed": True}
+
+    input_data = request
+    user_id = current_user.user_id
+    auth_token = current_user.raw_token
+
+    # Where the pre-stream time goes. Everything between here and the
+    # `StreamingResponse` return happens with NO channel open to the client —
+    # measured at 3.75s on a warm turn — so this is the only way to see which
+    # stage owns it. Pure timing: nothing reaches the model.
+    # See `turn_timing.py` and docs/specs/agent-state-feedback.md.
+    prelude = TurnPrelude()
+    # Whether this turn's agent is built inside the stream (PR-3). Recorded on
+    # the `turn_prelude` line so the two shapes stay distinguishable in the
+    # logs once the flag has been on for a while.
+    deferred_build = False
+
+    # Refuse a turn against a session id another user already owns.
+    #
+    # Session ids travel in shareable URLs (`/s/{sessionId}`). Opening someone
+    # else's link 404s on the metadata read, but the SPA then treats the
+    # session as new and lets the user send — which used to fork the id: a
+    # SECOND metadata row under the requester, on the same session, invisible
+    # to both parties. In prod on 2026-08-31 that also left the original
+    # owner's session resolving non-deterministically between the two rows.
+    #
+    # This IS a confidentiality guard. Memory scopes history by actor id, but
+    # runtime affinity used to hash the session id alone, so both users' turns
+    # landed in one container. There, `_adopt_session_conversation` aliased the
+    # second user's new agent onto the first user's live message list, and each
+    # model saw the other's turns (dev, 2026-08-31). Affinity now pins per
+    # (user, session) and adoption matches on the same pair, so neither depends
+    # on this guard; this guard stops the id being forked at all. 404 rather than 403 so the
+    # response says nothing about whether the session exists, matching what
+    # `GET /sessions/{id}/metadata` already returns for the same case.
+    #
+    # ONE read of the session's META row, shared by everything in the preamble
+    # that used to fetch it again (PR-2, docs/specs/turn-latency-preamble.md).
+    # Measured on dev: eight separate reads of this item cost ~445ms of a
+    # ~455ms stage. That was later traced (PR-3 of the same spec) to boto3
+    # client construction on a throttled container CPU — ~47ms per read site —
+    # not to the DynamoDB round trip, which is ~6ms. Both fixes stand: one read,
+    # on a cached client.
+    #
+    # Deliberately explicit rather than a per-request memo inside
+    # `_get_session_by_gsi`: CLAUDE.md's "never cache session state" rule has
+    # been paid for twice (#741, #751), and a snapshot callers opt into cannot
+    # leak into one that needs a fresh read.
+    session_meta = await load_session_meta(input_data.session_id, user_id)
+    if session_meta.owned_by_other:
+        logger.warning(
+            "Rejected invocation for session %s — owned by a different user",
+            _sanitize_log(input_data.session_id),
+        )
+        raise HTTPException(status_code=404, detail="Session not found")
+    # First of the preamble's five sub-stages (docs/specs/turn-latency-preamble.md).
+    # The coarse `preamble` number survives as `groups.preamble` in the emitted
+    # line, so the four-turn baseline in the agent-state-feedback spec stays
+    # comparable across this split.
+    prelude.mark("preamble.ownership")
+    # Resume requests reuse the cached agent and its paused interrupt state;
+    # they bypass quota, file resolution, and RAG augmentation because those
+    # already ran on the original turn that got paused.
+    is_resume = bool(input_data.interrupt_responses)
+    # Resolve the effective agent type: the client's explicit choice, else the
+    # compiled-in default ("chat"). Used for the skill resolution below and the
+    # non-resume get_agent calls (resume reuses the snapshot's type). An Agent
+    # that binds skills is coerced to "skill" later by the agent-binding
+    # resolver.
+    effective_agent_type = input_data.agent_type or DEFAULT_AGENT_TYPE
+    # Skills feature deferred for this environment: neutralize the legacy
+    # "skill" agent type, which is a ChatAgent alias since v2 PR-2. Voice and
+    # other agent types pass through untouched.
+    if not skills_enabled() and effective_agent_type == "skill":
+        effective_agent_type = "chat"
+    # Resolve the user's *effective* skills once for the whole request: the
+    # accessible set (catalog ∪ own), narrowed by the client's per-turn
+    # enabled_skills selection. Threaded into every get_agent call below so they
+    # share one skills_hash cache key (otherwise the app-tool-call / resume paths
+    # would miss the main turn's cached agent).
+    #
+    # Skills v2: this is no longer gated on agent_type == "skill". Skills are a
+    # plain-chat capability now — the picker in model settings sends
+    # enabled_skills on an ordinary turn and ChatAgent mounts the AgentSkills
+    # plugin. The opt-in default (D6) is what keeps this cheap: an absent or
+    # empty selection short-circuits to [] without touching RBAC or the skill
+    # table, so every turn that doesn't ask for skills costs exactly what it did
+    # before. An Agent turn replaces this further down with the Agent's own skills
+    # (none, when it binds none).
+    effective_skill_ids = None
+    if skills_enabled() and input_data.enabled_skills:
+        effective_skill_ids = _apply_enabled_skills_filter(
+            await _resolve_accessible_skill_ids(current_user),
+            input_data.enabled_skills,
+        )
+    # Near-zero on a turn that selects no skills — the opt-in default (D6)
+    # short-circuits before touching RBAC or the skill table. A non-trivial
+    # number here means the RBAC cache missed or the owner-index query is slow.
+    prelude.mark("preamble.skills")
+    # A "Continue" after a max_tokens truncation. Like resume, it bypasses
+    # quota / RAG / file resolution and does NOT clear the turn state; unlike
+    # resume there is no interrupt to validate — the agent is rebuilt from the
+    # resent params and re-entered with an empty prompt (assistant-prefill).
+    is_continuation = bool(input_data.continue_truncated)
+    # Marketplace D11: the Agent was `@`-mentioned in the composer, so it runs
+    # this turn only — it does not bind the conversation. Only meaningful
+    # alongside `rag_assistant_id`; on its own it does nothing.
+    is_agent_mention = bool(input_data.agent_mention) and bool(input_data.rag_assistant_id)
+    logger.info(
+        "Invocation request received (resume=%s, continue_truncated=%s, agent_mention=%s)"
+        % (is_resume, is_continuation, is_agent_mention)
+    )
+    logger.info("Message received")
+
+    # Model retirement (docs/specs/model-retirement.md §7). Resolved before anything
+    # builds an agent from ``input_data.model_id``, so the App tool-call / context /
+    # continuation paths land in the same agent-cache slot as the turn itself. A
+    # redirect swaps the provider as well: the request's described the retired
+    # model, and a successor on another transport misroutes with it. A denial is
+    # streamed at the access check below, once there is a turn to answer.
+    retired_model_denial: Optional[str] = None
+    requested_model = await resolve_effective_model(input_data.model_id)
+    if requested_model is not None:
+        if requested_model.denied:
+            retired_model_denial = retired_model_message(requested_model.retired)
+        elif requested_model.redirected:
+            input_data.model_id = requested_model.model_id
+            input_data.provider = requested_model.provider
+
+    # App-initiated tools/call (MCP Apps PR #5). Like resume/continuation it
+    # bypasses quota / RAG / file resolution / title — there is no model
+    # turn. We reuse the conversation's live agent when it carries the tool's
+    # MCP client, else rebuild it (so the MCP client session + auth are wired
+    # exactly as for a model-driven call), dispatch the one
+    # named tool, publish synthesized tool_use/tool_result into the thread
+    # via the per-session broker, and return the CallToolResult as JSON for
+    # app-api to relay back to the iframe. Inert behind the host flag (the
+    # UIToolCatalog is empty, so dispatch rejects every call as not
+    # app-visible).
+    if input_data.app_tool_call is not None:
+        atc = input_data.app_tool_call
+        try:
+            agent = await _agent_for_app_tool_call(
+                input_data,
+                current_user,
+                user_id,
+                auth_token,
+                agent_type=effective_agent_type,
+                accessible_skill_ids=effective_skill_ids,
+            )
+            payload = await dispatch_app_tool_call(
+                agent,
+                session_id=input_data.session_id,
+                user_id=user_id,
+                tool_use_id=atc.tool_use_id,
+                tool_name=atc.tool_name,
+                arguments=atc.arguments,
+            )
+            return JSONResponse(payload)
+        except AppToolCallError as e:
+            # 200 + envelope, not `status_code=e.code`: AgentCore Runtime
+            # rewrites any non-2xx to a generic 424 and discards the
+            # message, so a deliberate 409 ("connect the account") reached
+            # the SPA as "check your CloudWatch logs". app-api restores the
+            # real status. See `mcp_apps.error_envelope`.
+            return app_tool_error_response(e.message, e.code)
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("app tools/call invocation failed", exc_info=True)
+            return JSONResponse({"error": "Internal error"}, status_code=500)
+
+    # App-pushed model context (MCP Apps PR #6, `ui/update-model-context`).
+    # Like app_tool_call it bypasses quota / RAG / file resolution / title
+    # and runs NO model turn. It builds no agent either: the payload is held
+    # per `(session, user)`, off any agent instance, and the next real user
+    # turn merges and clears it. Inert behind the host flag (no live App
+    # ever calls this).
+    if input_data.app_context_update is not None:
+        acu = input_data.app_context_update
+        try:
+            payload = dispatch_app_context_update(
+                session_id=input_data.session_id,
+                user_id=user_id,
+                resource_uri=acu.resource_uri,
+                content=acu.content,
+                structured_content=acu.structured_content,
+            )
+            return JSONResponse(payload)
+        except AppContextUpdateError as e:
+            # Same AgentCore flattening as the app_tool_call path above.
+            return app_tool_error_response(e.message, e.code)
+        except HTTPException:
+            raise
+        except Exception:
+            logger.error("app context update invocation failed", exc_info=True)
+            return JSONResponse({"error": "Internal error"}, status_code=500)
+
+
+    # Model access, decided before the turn touches anything. Everything below
+    # writes or spends: the attachment recovery pops the previous turn's
+    # unanswered-uploads marker, `_prepare_session_state` pre-creates the
+    # sidebar row, and a first turn spawns the title task (a Nova Micro call).
+    # A refused turn used to do all three — a new conversation with a generated
+    # title for a turn that never ran. Retirement resolution above already found
+    # the effective id's catalog row, so it is handed over rather than looked up
+    # again (TTFT: no second catalog read; the check only moved).
+    #
+    # Same condition as before the move, so resume, continuation and
+    # `@`-mention turns are judged exactly as they were. The one exception is a
+    # retired model with no successor on a non-resume turn: that is answered by
+    # the conversational denial after the quota check, which persists the
+    # refusal and so needs the session row. Judging the retired id here would
+    # answer it with the access refusal instead of the retirement message (the
+    # check never sees a retired id otherwise; see
+    # `apis/shared/rbac/model_access.py`). The App dispatches above stay
+    # ungated, as they were: they run no model turn.
+    #
+    # A denial streams as an assistant message, like the retirement one: the
+    # Runtime data plane wraps any non-2xx from this container as a 424, so a
+    # bare 403 reached the SPA as a generic error it could not explain. Unlike
+    # the retirement one it is not persisted: there is no session row yet (a
+    # persisted turn would be history with no sidebar entry), the turn never
+    # ran, and the user's remedy is to pick another model and resend.
+    #
+    # Quota still takes precedence over the refusal: an over-quota user is told
+    # about the quota, whatever model they picked. So a refusal consults the
+    # quota check first, and an exceeded quota falls through to the usual
+    # quota refusal below, which persists a turn and so does need the row.
+    # Only the refused path runs it early; an allowed turn's preamble is
+    # unchanged, stage for stage.
+    early_quota: Optional[TurnQuota] = None
+    if input_data.model_id and not (retired_model_denial and not is_resume):
+        app_role_service = get_app_role_service()
+        known_record = requested_model is not None and requested_model.model_id == input_data.model_id
+        access_kwargs = {"record": requested_model.record} if known_record else {}
+        if not await app_role_service.can_access_model(
+            current_user, input_data.model_id, **access_kwargs
+        ):
+            early_quota = await _check_turn_quota(
+                current_user,
+                input_data,
+                session_meta,
+                is_resume=is_resume,
+                is_continuation=is_continuation,
+            )
+            if early_quota.exceeded_event is None:
+                return _forbidden_turn(
+                    input_data,
+                    user_id,
+                    model_access_denied_message(
+                        input_data.model_id, requested_model.record if known_record else None
+                    ),
+                    persist=False,
+                )
+
+    if input_data.enabled_tools:
+        logger.info(f"Enabled tools ({len(input_data.enabled_tools)})")
+
+    # Attachments: recover the previous turn's unanswered uploads, fetch this
+    # turn's from S3, dedupe, partition (inline / spreadsheet / deck /
+    # oversized) and hold the inline set to one message's byte budget.
+    attachments = await _resolve_turn_attachments(
+        input_data,
+        user_id,
+        session_meta,
+        is_resume=is_resume,
+        is_continuation=is_continuation,
+    )
+
+    # Covers the unconsumed-attachment recovery read (answered from the
+    # snapshot), the S3 fetch behind `resolve_files`, and the partitioning.
+    # ~1ms on a turn with no attachments; otherwise the S3 GETs are the cost.
+    prelude.mark("preamble.files")
+
+    # Session state: the row pre-create, the four stale-marker clears and the
+    # write-ahead attachment marker, all answered from `session_meta`.
+    is_new_session, interrupted_turn_reason = await _prepare_session_state(
+        input_data,
+        user_id,
+        session_meta,
+        is_resume=is_resume,
+        is_continuation=is_continuation,
+    )
+
+    # First turn → kick off title generation concurrently with the stream.
+    # Runs as a background task so it doesn't add latency to TTFT. The
+    # targeted UpdateExpression in update_session_title is race-safe with
+    # the post-stream _update_session_metadata write. The task handle is
+    # kept so stream_with_quota_warning can push the finished title to the
+    # client mid-stream as a `session_title` SSE event.
+    title_task: Optional["asyncio.Task[str]"] = None
+    if is_new_session and input_data.message:
+        title_task = asyncio.create_task(
+            generate_conversation_title(
+                session_id=input_data.session_id,
+                user_id=user_id,
+                user_input=input_data.message,
+            )
+        )
+
+    # Five reads of the META row used to live here (pre-create plus the four
+    # stale-marker clears), each on its own round trip; since PR-2 all five are
+    # answered from `session_meta`, so a non-trivial number means a marker
+    # write or a first turn's pre-create. The title task is inside the boundary
+    # because spawning it is first-turn session state; it is an
+    # `asyncio.create_task`, so it contributes nothing to the number.
+    prelude.mark("preamble.session_state")
+
+    quota = early_quota or await _check_turn_quota(
+        current_user,
+        input_data,
+        session_meta,
+        is_resume=is_resume,
+        is_continuation=is_continuation,
+    )
+    quota_warning_event = quota.warning_event
+    quota_session_notice_event = quota.session_notice_event
+    quota_exceeded_event = quota.exceeded_event
+
+    # The quota check: a cached tier resolve, a cached O(1) cost-summary
+    # GetItem, and the per-session notice, answered from the snapshot's
+    # `totalCost` since PR-2b (or by its own read on a legacy row without one).
     prelude.mark("preamble.quota")
 
     # If quota exceeded, stream the quota exceeded message instead of agent response
     if quota_exceeded_event:
-        return StreamingResponse(
-            stream_conversational_message(
-                message=quota_exceeded_event.message,
-                stop_reason="quota_exceeded",
-                metadata_event=quota_exceeded_event,
-                session_id=input_data.session_id,
-                user_id=user_id,
-                user_input=input_data.message,
-            ),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Session-ID": input_data.session_id},
+        return _refuse_turn(
+            input_data,
+            user_id,
+            message=quota_exceeded_event.message,
+            stop_reason="quota_exceeded",
+            metadata_event=quota_exceeded_event,
         )
 
     # A retired model with no successor is denied for everyone, wildcard holders
-    # included — as a conversational message, not the bare 403 below. Not on a
+    # included — as a conversational message, like the access check above. Not on a
     # resume: that turn finishes on its paused snapshot's model, whatever the
     # request carries.
     if retired_model_denial and not is_resume:
-        retired_event = ConversationalErrorEvent(
-            code=ErrorCode.FORBIDDEN, message=retired_model_denial, recoverable=False
-        )
-        return StreamingResponse(
-            stream_conversational_message(
-                message=retired_model_denial,
-                stop_reason="error",
-                metadata_event=retired_event,
-                session_id=input_data.session_id,
-                user_id=user_id,
-                user_input=input_data.message,
-            ),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Session-ID": input_data.session_id},
-        )
-
-    # Check model access if a specific model_id is requested
-    if input_data.model_id:
-        app_role_service = get_app_role_service()
-        if not await app_role_service.can_access_model(current_user, input_data.model_id):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Access denied to model: {input_data.model_id}",
-            )
+        return _forbidden_turn(input_data, user_id, retired_model_denial)
 
     # Handle assistant RAG integration if assistant_id is provided
     # Import here to avoid circular import (app_api.assistants imports from inference_api.chat.routes)
     assistant = None
     context_chunks = None
     augmented_message = input_data.message
+    # The knowledge-base search, started where it used to be awaited and
+    # awaited after the agent build instead (turn-path spec §5 P3b). None on a
+    # plain turn, a continuation, or once its result has been applied.
+    kb_search: Optional["asyncio.Task[Tuple[Optional[list], str]]"] = None
+    # The whole knowledge base when it fits the budget (``kb_full_context``),
+    # loaded alongside everything up to the agent build and awaited by it: the
+    # block goes into the system prompt. None on a plain turn or a resume.
+    kb_full_context_task: Optional["asyncio.Task[Optional[str]]"] = None
     system_prompt = input_data.system_prompt  # Start with provided system prompt
     # One settings read per turn: the default model and personal instructions both
     # come from it. A preview is an author testing an agent, so it gets none of theirs.
@@ -2685,15 +4110,15 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
     # (D5). None ⇒ resolve exactly as today. Set in the assistant block below,
     # consumed at model resolution / prompt assembly; None on resume/continuation.
     agent_model_override = None
-    agent_memory = None
     memory_context = None
     # Agent Designer: an Agent's ``tool`` bindings, resolved per invoker (D5), replace
     # the request's ``enabled_tools`` for the turn (like ``model_override`` replaces the
     # model). None ⇒ the Agent binds no tools ⇒ the request's enabled_tools drive the turn.
     agent_tools_override = None
-    # An Agent's ``skill`` bindings, resolved per invoker (D5). When set they replace the
-    # request's skills AND force skill-mode (agent_type="skill") for the turn. None ⇒ the
-    # Agent binds no skills ⇒ the request's agent_type/enabled_skills drive the turn.
+    # An Agent's ``skill`` bindings, resolved per invoker (D5). On an Agent turn they replace
+    # the request's skills AND force skill-mode (agent_type="skill"); an Agent that binds no
+    # skills resolves to an empty set, so it runs with none. None ⇒ not an Agent turn ⇒ the
+    # request's agent_type/enabled_skills drive the turn.
     agent_skills_override = None
     # Shared Projects: set when this turn's agent is a project's hidden harness. Carried to
     # the session binding and to every cost row of the turn (``projectId`` plus the
@@ -2701,6 +4126,9 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
     # dropped (§9.6) and is streamed before ``message_start``; it never reaches the prompt.
     turn_project_id: Optional[str] = None
     agent_notice_event: Optional[AgentNoticeEvent] = None
+    # Who is speaking in a harness turn, prepended to the message (never the system
+    # prompt, which every member shares); see `_build_project_member_note`.
+    project_member_note: Optional[str] = None
     # Shared Projects 2.4b: a harness turn's memory load (started once the project is
     # known) and its result, which supplies `memory_context`, the scope-addressed
     # memory tools and their cache-key element.
@@ -2747,11 +4175,6 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
     if input_data.rag_assistant_id and not is_resume:
         # Local imports to avoid circular dependency
         from apis.shared.assistants.kb_access import granted
-        from apis.shared.assistants.rag_service import (
-            augment_prompt_with_context,
-            resolve_context_cap,
-            search_assistant_knowledgebase_with_formatting,
-        )
         from apis.shared.assistants.service import (
             get_assistant_with_access_check,
             mark_share_as_interacted,
@@ -2917,34 +4340,16 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             from apis.shared.assistants.service import is_disabled_project_harness
 
             if await is_disabled_project_harness(input_data.rag_assistant_id):
-                refusal = PROJECTS_DISABLED_MESSAGE
-                refused_event = ConversationalErrorEvent(
-                    code=ErrorCode.FORBIDDEN, message=refusal, recoverable=False
-                )
-                return StreamingResponse(
-                    stream_conversational_message(
-                        message=refusal,
-                        stop_reason="error",
-                        metadata_event=refused_event,
-                        session_id=input_data.session_id,
-                        user_id=user_id,
-                        user_input=input_data.message,
-                    ),
-                    media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Session-ID": input_data.session_id},
-                )
+                return _forbidden_turn(input_data, user_id, PROJECTS_DISABLED_MESSAGE)
 
-            # Check if assistant exists at all to provide better error message
+            # A deleted agent and one the caller may not use get the same answer, so
+            # the response never says whether an id exists. Which it was goes to the
+            # log only, where it helps whoever is debugging and tells a caller nothing.
             from apis.shared.assistants.service import assistant_exists
 
             exists = await assistant_exists(input_data.rag_assistant_id)
-
-            if not exists:
-                logger.warning("Assistant does not exist (404)")
-                raise HTTPException(status_code=404, detail=f"Assistant not found: {input_data.rag_assistant_id}")
-            else:
-                logger.warning("Access denied to assistant (403)")
-                raise HTTPException(status_code=403, detail=f"Access denied: You do not have permission to access this assistant")
+            logger.warning("Agent unavailable for this turn (%s)", "no access" if exists else "not found")
+            return _forbidden_turn(input_data, user_id, AGENT_UNAVAILABLE_MESSAGE)
 
         # Log assistant details for debugging
         logger.info("Assistant loaded successfully!")
@@ -3035,22 +4440,10 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
         if runs_project_harness:
             refusal, turn_project = await _project_turn_gate(assistant.project_id)
             if refusal:
-                refused_event = ConversationalErrorEvent(
-                    code=ErrorCode.FORBIDDEN, message=refusal, recoverable=False
-                )
-                return StreamingResponse(
-                    stream_conversational_message(
-                        message=refusal,
-                        stop_reason="error",
-                        metadata_event=refused_event,
-                        session_id=input_data.session_id,
-                        user_id=user_id,
-                        user_input=input_data.message,
-                    ),
-                    media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Session-ID": input_data.session_id},
-                )
+                return _forbidden_turn(input_data, user_id, refusal)
             turn_project_id = assistant.project_id
+            # The role the access check above resolved from the project: no extra read.
+            project_member_note = _build_project_member_note(current_user, assistant_permission)
             # Shared Projects 2.4b: the project's memory spaces, read now and awaited at
             # prompt assembly (5b), so the reads overlap binding resolution and the
             # knowledge-base search instead of adding to the time to first token.
@@ -3072,7 +4465,6 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                     assistant, current_user, degrade=runs_project_harness
                 )
                 agent_model_override = agent_plan.model_override
-                agent_memory = agent_plan.memory
                 agent_tools_override = agent_plan.tools
                 agent_skills_override = agent_plan.skills
                 if agent_plan.unavailable:
@@ -3083,59 +4475,44 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                         project_id=turn_project_id,
                     )
             except AgentBindingBlockedError as block:
-                blocked_event = ConversationalErrorEvent(
-                    code=ErrorCode.FORBIDDEN, message=block.message, recoverable=False
+                return _forbidden_turn(input_data, user_id, block.message)
+
+        # Full-context mode. Started here, with the search, and awaited by the agent
+        # build, so its DynamoDB Query (and on a conversation's first turn, its
+        # downloads) overlaps everything between here and the build. Runs on a
+        # continuation too: the block is part of the system prompt, and dropping it
+        # would rebuild the agent under a different key mid-answer.
+        if assistant_kb_full_context_enabled():
+            from apis.shared.assistants.kb_full_context import load_full_kb_context
+
+            kb_full_context_task = asyncio.create_task(
+                load_full_kb_context(
+                    input_data.rag_assistant_id,
+                    access=granted(input_data.rag_assistant_id, user_id, assistant_permission),
                 )
-                return StreamingResponse(
-                    stream_conversational_message(
-                        message=block.message,
-                        stop_reason="error",
-                        metadata_event=blocked_event,
-                        session_id=input_data.session_id,
-                        user_id=user_id,
-                        user_input=input_data.message,
-                    ),
-                    media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Session-ID": input_data.session_id},
-                )
+            )
 
         # Skipped on a continuation: the turn carries an empty message, so a
         # knowledge-base search would spend a query on "" and augment nothing. The
         # context the original turn retrieved is already in the history being continued.
         if not is_continuation:
-            # 3. Search assistant knowledge base
+            # 3–4. Search the assistant's knowledge base and augment the message.
+            # Started here, awaited after the agent build: the build reads
+            # neither the chunks nor the augmented message — only the stream
+            # does, for the citation frames and `final_message` — so the two
+            # can overlap (turn-path spec §5 P3b). Off, it is awaited right here.
             logger.info("Starting knowledge base search for assistant...")
-            try:
-                logger.info("Searching knowledge base for assistant...")
-                context_chunks = await search_assistant_knowledgebase_with_formatting(
+            kb_search = asyncio.create_task(
+                _search_and_augment(
                     assistant_id=input_data.rag_assistant_id,
-                    query=input_data.message,
-                    top_k=5,
+                    message=input_data.message,
                     access=granted(input_data.rag_assistant_id, user_id, assistant_permission),
+                    full_context=kb_full_context_task,
                 )
-                logger.info(f"Knowledge base search returned {len(context_chunks) if context_chunks else 0} chunks")
-                if context_chunks:
-                    for i, chunk in enumerate(context_chunks):
-                        logger.info(f"Chunk {i + 1} retrieved")
-                        logger.info(f"Chunk {i + 1} metadata retrieved")
-
-                # 4. Augment message with context
-                if context_chunks:
-                    # Engine-aware cap (Requirement 3.2): managed gets 8,000 so
-                    # reranking's top_k chunks actually reach the model; legacy keeps
-                    # 2,000. See rag_service.resolve_context_cap / HANDOFF §5.40.
-                    cap = resolve_context_cap(input_data.rag_assistant_id)
-                    augmented_message = augment_prompt_with_context(user_message=input_data.message, context_chunks=context_chunks, max_context_length=cap)
-                    logger.info(
-                        f"Augmented message with {len(context_chunks)} context chunks"
-                    )
-                    logger.info("Augmented message preview available")
-                else:
-                    logger.info("No context chunks found for assistant - using original message without augmentation")
-            except Exception as e:
-                logger.error("Error searching assistant knowledge base", exc_info=True)
-                logger.error(f"Exception type: {type(e).__name__}")
-                # Continue without RAG context rather than failing
+            )
+            if not kb_search_ahead_enabled():
+                context_chunks, augmented_message = await kb_search
+                kb_search = None
 
         # 5. Append assistant's instructions to the base system prompt (don't replace)
         # For preview sessions, prefer the system_prompt from the request (live form edits)
@@ -3193,38 +4570,6 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
 
             project_memory = await await_project_memory(project_memory_task)
             memory_context = project_memory.memory_context or None
-            if agent_memory is not None:
-                logger.warning("Project harness has a memory binding; project memory replaces it")
-                agent_memory = None
-
-        # 5b'. Agent Designer Phase 3: hydrate the bound Memory Space content (read-only),
-        # in either branch. Sent as `memory_context`, not appended to the prompt.
-        # Hydration re-reads via the invoker
-        # (MemorySpaceService re-checks viewer+ internally). Empty for a fresh space.
-        if agent_memory is not None:
-            from apis.shared.memory.hydration import render_memory_block, resolve_always_load
-            from apis.shared.memory.service import MemorySpaceService
-
-            try:
-                fragments = await asyncio.to_thread(
-                    resolve_always_load,
-                    MemorySpaceService(),
-                    agent_memory.space_id,
-                    user_id,
-                    current_user.email,
-                    agent_memory.always_load,
-                )
-                memory_block = render_memory_block(agent_memory.space_name, fragments)
-                if memory_block:
-                    # Kept apart from system_prompt: it goes after the prompt,
-                    # outside <user_instructions>, behind its own cache point
-                    # (Shared Projects 2.2).
-                    memory_context = memory_block
-                    logger.info("Hydrated bound Memory Space content for the prompt")
-            except Exception:
-                # Never fail a turn on a memory-read hiccup — the permission was already
-                # resolved; injection is best-effort context.
-                logger.error("Failed to hydrate bound Memory Space; continuing", exc_info=True)
 
         # 6. Save assistant_id to session preferences (persist for future loads)
         # Skip persistence for preview sessions and for continuations (a continuation
@@ -3396,6 +4741,15 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
         # `_interrupt_state` from AgentCore Memory, so the paused tool call
         # picks up where it left off. Non-resume requests use the request
         # body as before.
+        #
+        # Bound before the branch: the stream closure reads it on every turn,
+        # and only the non-resume branch (a TEXT-only model with documents
+        # attached) ever fills it. The same goes for the reference section
+        # (large documents attached by reference) and whether this turn carries
+        # `document_read`, which decides if that section advertises a handle.
+        extracted_documents_section = ""
+        reference_documents_section = ""
+        document_read_available = False
         if is_resume:
             from datetime import datetime, timezone
             from apis.shared.sessions.metadata import clear_paused_turn, get_paused_turn
@@ -3460,6 +4814,13 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 memory_binding=snapshot.memory_binding,
                 # The memory block is hashed with the system prompt in the key.
                 memory_context=snapshot.memory_context,
+                # So is a full-context knowledge base, which is too large for the
+                # snapshot row. Re-load it: the block is deterministic, so an
+                # unchanged knowledge base yields the same bytes and the same
+                # slot; one changed during the pause misses and rebuilds, the
+                # pre-existing eviction path.
+                knowledge_context=await _resume_knowledge_context(snapshot.assistant_id, current_user, user_id),
+                text_only_model=bool(snapshot.text_only_model),
                 # Resume never builds injected tools, so an agent built on a
                 # resume *miss* lacks them. Writing it would put a tool-less
                 # agent in the slot the next plain turn hits (same key), and
@@ -3499,191 +4860,56 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             # snapshot's toolset, the same source the resume `get_agent` used.
             effective_enabled_tools = snapshot.enabled_tools
         else:
-            # Build the canonical request inference-params dict. The frontend
-            # sends ``inference_params`` directly; legacy ``temperature`` /
-            # ``max_tokens`` fields are folded in for older clients and
-            # treated as defaults that lose to anything in ``inference_params``.
-            request_inference_params: dict = dict(input_data.inference_params or {})
-            if input_data.temperature is not None:
-                request_inference_params.setdefault("temperature", input_data.temperature)
-            if input_data.max_tokens is not None:
-                request_inference_params.setdefault("max_tokens", input_data.max_tokens)
-
-            # Resolve the user's persisted default when the request does
-            # not pin a model. Without this, a "no default selected" client
-            # always lands on the hardcoded factory default and the user's
-            # saved preference is silently ignored at chat time (#161).
-            effective_model_id = input_data.model_id
-            effective_provider = input_data.provider
-            if agent_model_override is not None:
-                # The Agent's governed modelConfig wins over the request / user-default
-                # chain. Already access-checked against the invoker in the resolver (R2),
-                # so the earlier request-only gate at the top doesn't leave a hole.
-                effective_model_id = agent_model_override.model_id
-                effective_provider = agent_model_override.provider or effective_provider
-            if not effective_model_id:
-                effective_model_id, effective_provider = await _resolve_fallback_model(
-                    user_id, current_user, effective_provider, settings=user_settings
-                )
-
-            # Agent-authored params sit as defaults BENEATH explicit request params,
-            # then flow through _resolve_model_settings' admin bounds/locks like any
-            # other request params — an author can't smuggle out-of-bounds values.
-            if agent_model_override is not None and agent_model_override.params:
-                request_inference_params = {**agent_model_override.params, **request_inference_params}
-
-            # Single registry lookup resolves caching + inference params +
-            # the Mantle endpoint path + provider, merging admin defaults with
-            # request overrides.
-            caching_enabled, inference_params, mantle_api_mode, mantle_region, registry_provider = await _resolve_model_settings(
-                model_id=effective_model_id,
-                explicit_caching_enabled=input_data.caching_enabled,
-                request_inference_params=request_inference_params,
+            # The model: the Agent's binding, else the request's, else the
+            # user's default, else the catalog's; then the registry's settings.
+            turn_model = await _resolve_turn_model(
+                input_data, current_user, user_id, user_settings, agent_model_override
             )
 
-            # Recover the provider from the registry when neither the request nor
-            # the Agent's model binding carried one. Agent bindings persist only
-            # ``model_id`` (no provider), so without this a Mantle model like
-            # ``openai.gpt-5.4`` resolves to provider=None → Bedrock and blows up
-            # in ConverseStream with "invalid model identifier" — even though the
-            # same model works from the normal chat path, which always sends
-            # ``provider`` alongside ``model_id``.
-            if not effective_provider and registry_provider:
-                effective_provider = registry_provider
+            # A model whose row declares TEXT input only rejects document and
+            # image blocks; convert or drop them now that the model is known.
+            # Returns immediately for every other model.
+            await _adapt_attachments_for_model(attachments, turn_model)
 
-            if caching_enabled is False:
-                logger.info("Prompt caching disabled for model")
-
-            # Get agent instance with user-specific configuration
-            # AgentCore Memory tracks preferences across sessions per user_id
-            # Supports multiple LLM providers: AWS Bedrock, OpenAI, and Google Gemini
-            # Use augmented message and assistant system prompt if assistant RAG was applied
-
-            # Spreadsheet tools scoped to the assistant's document corpus,
-            # when an assistant is attached to this request. The frontend
-            # keeps the assistant id in the URL for the whole session's
-            # lifetime, so we can trust `input_data.rag_assistant_id`
-            # directly; no preferences fallback needed.
-            # An Agent's tool bindings replace the request's enabled_tools for this
-            # turn (D5, resolved per invoker above). None ⇒ no tool binding ⇒ the
-            # request drives the toolset exactly as today. Drives both the built-in
-            # extra tools (spreadsheet/artifact gate on specific ids) and get_agent.
-            effective_enabled_tools = (
-                agent_tools_override.tool_ids
-                if agent_tools_override is not None
-                else input_data.enabled_tools
-            )
-            # A session holding a spreadsheet gets the Spreadsheet Analysis
-            # tools whether or not the picker has them on, gated on the
-            # caller's RBAC grant. Applied to the *effective* list so it
-            # flows into the cache key, every builder below, the attachment
-            # guidance and the paused-turn snapshot as one value. Sticky
-            # across the session (see `_session_has_tabular`), so the key
-            # does not flip between the attach turn and the follow-up.
-            effective_enabled_tools = await _apply_attachment_tool_autoenable(
-                effective_enabled_tools,
+            # The tool ids this turn carries — one value for the cache key,
+            # every builder, the attachment guidance and the paused snapshot.
+            effective_enabled_tools = await _resolve_effective_tools(
+                input_data,
                 current_user,
-                input_data.session_id,
                 user_id,
-                turn_has_tabular=bool(diverted_tabular),
+                agent_tools_override,
+                turn_has_tabular=bool(attachments.diverted_tabular)
+                or _folders_have(attachments.folders, is_tabular_file),
             )
 
-            # Tools an admin pinned are unioned in for users whose roles grant
-            # them, unless this Agent binds its own toolset (D4). Applied to
-            # the same *effective* list for the same reason as the line above:
-            # one value flows into the cache key, every builder, and the
-            # paused-turn snapshot. The set depends only on the catalog and the
-            # user's roles, so it is constant across a session and does not
-            # flip the key turn to turn.
-            effective_enabled_tools = await _apply_admin_always_on_tools(
-                effective_enabled_tools,
+            # Reassigning these function-scope locals here (before the main-turn
+            # get_agent below) makes them flow into construction — and thus the
+            # paused-turn snapshot — so an Agent turn resumes on the same skills_hash.
+            effective_agent_type, effective_skill_ids = _apply_agent_skills_override(
+                effective_agent_type, effective_skill_ids, agent_skills_override
+            )
+
+            turn_tools = await _build_turn_tools(
+                input_data,
                 current_user,
-                agent_bound_tools=agent_tools_override is not None,
+                user_id,
+                effective_enabled_tools,
+                project_memory=project_memory,
+                turn_has_document=attachments.turn_has_document,
+                text_only_model=turn_model.text_only,
             )
-
-            # An Agent's skill bindings replace the request's skills for this turn so
-            # ChatAgent's AgentSkills plugin discloses exactly the bound set (D5,
-            # resolved per invoker above). Reassigning these function-scope locals here
-            # (before the main-turn get_agent below) makes them flow into construction —
-            # and thus the paused-turn snapshot — so a bound-skill agent resumes on the
-            # same skills_hash. None ⇒ no skill binding ⇒ the request drives skills/type.
-            if agent_skills_override is not None:
-                effective_agent_type = "skill"
-                effective_skill_ids = agent_skills_override.skill_ids
-
-            extra_tools = _build_spreadsheet_tools(
-                enabled_tools=effective_enabled_tools,
-                assistant_id=input_data.rag_assistant_id,
-                session_id=input_data.session_id,
-                user_id=user_id,
-            ) + _build_artifact_tools(
-                enabled_tools=effective_enabled_tools,
-                session_id=input_data.session_id,
-                user_id=user_id,
-            ) + _build_word_document_tools(
-                enabled_tools=effective_enabled_tools,
-                session_id=input_data.session_id,
-                user_id=user_id,
-            ) + _build_workspace_tools(
-                enabled_tools=effective_enabled_tools,
-                session_id=input_data.session_id,
-                user_id=user_id,
-            ) + _build_excel_spreadsheet_tools(
-                enabled_tools=effective_enabled_tools,
-                session_id=input_data.session_id,
-                user_id=user_id,
-            ) + _build_powerpoint_presentation_tools(
-                enabled_tools=effective_enabled_tools,
-                session_id=input_data.session_id,
-                user_id=user_id,
-            ) + _build_account_tools(effective_enabled_tools, current_user)
-
-            memory_tools = _build_memory_tools(
-                agent_memory=agent_memory,
-                user_id=user_id,
-                user_email=current_user.email,
+            document_read_available = bool(turn_tools.document_tools)
+            extracted_documents_section = _build_extracted_documents_section(
+                attachments.extracted_documents,
+                document_read_available=document_read_available,
             )
-            # A project harness addresses its spaces by scope instead (2.4b).
-            if project_memory is not None:
-                from apis.inference_api.chat.project_memory import build_project_memory_tools
-
-                memory_tools = build_project_memory_tools(project_memory, current_user)
-            extra_tools = extra_tools + memory_tools
-
-            # document_read for any session that carries a readable attachment
-            # (this turn's uploads count). Gated on session state, not the
-            # picker; its presence goes into the cache key below rather than
-            # vetoing the cache, so an attachment session that could keep a
-            # warm agent still does.
-            document_tools = await _build_document_tools(
-                session_id=input_data.session_id,
-                user_id=user_id,
-                turn_has_document=turn_has_document,
+            # Large-document spec §4B.3: the stored digest or a fixed stub per
+            # reference, read off the row the resolver already returned. Never
+            # a digest build, never an S3 read.
+            reference_documents_section = render_references_section(
+                attachments.reference_documents,
+                include_handle=document_read_available,
             )
-            extra_tools = extra_tools + document_tools
-
-            # Can this turn's agent be cached despite carrying injected tools?
-            # Only when every builder that fired closes over values the cache
-            # key already carries (session, user, enabled_tools). Derived from
-            # the same `effective_enabled_tools` that goes into the key below —
-            # passing the request's list here instead would let the predicate
-            # and the key disagree about which builders ran.
-            extra_tools_key_described = injected_tools_are_key_described(
-                enabled_tools=effective_enabled_tools,
-            )
-            # Memory tools close over the resolved binding, so it is a cache-key
-            # element (Shared Projects 2.1). Only set when the tools were built,
-            # so the key and the toolset cannot disagree.
-            if project_memory is not None:
-                memory_binding_key = project_memory.binding_key()
-            elif memory_tools:
-                memory_binding_key = {
-                    "spaceId": agent_memory.space_id,
-                    "spaceName": agent_memory.space_name,
-                    "access": agent_memory.access,
-                }
-            else:
-                memory_binding_key = None
 
             # System-prompt assembly, the single-flight lease, skill
             # resolution and every tool builder (documents, attachments,
@@ -3702,28 +4928,38 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 call sites — see `defer_agent_build` below — and eighteen
                 keyword arguments that must not drift between them.
                 """
+                knowledge_context = None
+                if kb_full_context_task is not None:
+                    knowledge_context = await kb_full_context_task
+                    # What was left of the full-context load once everything ahead
+                    # of the build was done: ~0 on a warm turn, its downloads on a
+                    # conversation's first.
+                    prelude.mark("agent_build.kb_full_context")
                 return await get_agent(
                     session_id=input_data.session_id,
                     user_id=user_id,
                     auth_token=auth_token,
                     enabled_tools=effective_enabled_tools,
-                    model_id=effective_model_id,
+                    model_id=turn_model.model_id,
                     system_prompt=system_prompt,  # Use assistant's instructions if available
-                    caching_enabled=caching_enabled,
-                    provider=effective_provider,
-                    inference_params=inference_params,
-                    mantle_api_mode=mantle_api_mode,
-                    mantle_region=mantle_region,
+                    caching_enabled=turn_model.caching_enabled,
+                    provider=turn_model.provider,
+                    inference_params=turn_model.inference_params,
+                    mantle_api_mode=turn_model.mantle_api_mode,
+                    mantle_region=turn_model.mantle_region,
                     agent_type=effective_agent_type,
-                    extra_tools=extra_tools,
+                    extra_tools=turn_tools.extra_tools,
                     is_resume=False,
                     accessible_skill_ids=effective_skill_ids,
-                    extra_tools_key_described=extra_tools_key_described,
-                    has_document_tools=bool(document_tools),
+                    extra_tools_key_described=turn_tools.extra_tools_key_described,
+                    has_document_tools=bool(turn_tools.document_tools),
                     assistant_id=input_data.rag_assistant_id,
                     build_stage_recorder=_mark_build_stage,
-                    memory_binding=memory_binding_key,
+                    build_detail_recorder=prelude.detail,
+                    memory_binding=turn_tools.memory_binding_key,
                     memory_context=memory_context,
+                    text_only_model=turn_model.text_only,
+                    knowledge_context=knowledge_context,
                 )
 
             # Defer the build into the stream so it can be narrated.
@@ -3749,58 +4985,15 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 prelude.mark("agent_build.rest")
 
         # Resume requests must target interrupts that the cached agent
-        # actually has paused. Cache eviction, a process restart, or a
-        # forged request will otherwise be silently accepted by Strands
-        # and drop the client's response. Reject up front so the client
-        # sees a 400 and can restart the turn cleanly.
+        # actually has paused; see `_validate_resume_interrupts`.
         if is_resume:
-            strands_agent = getattr(agent, "agent", None)
-            interrupt_state = getattr(strands_agent, "_interrupt_state", None) if strands_agent else None
-            known_ids: set[str] = set()
-            if interrupt_state and getattr(interrupt_state, "activated", False):
-                interrupts = getattr(interrupt_state, "interrupts", None) or {}
-                known_ids = set(interrupts.keys())
-            submitted_ids = [entry.interruptId for entry in (input_data.interrupt_responses or [])]
-            unknown_ids = [iid for iid in submitted_ids if iid not in known_ids]
-            if unknown_ids:
-                logger.warning(
-                    "Resume rejected: submitted interrupt ids not in paused state"
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Unknown or expired interrupt ids; restart the turn.",
-                )
+            _validate_resume_interrupts(agent, input_data)
 
-        # Build citations list for persistence (convert context chunks to citation format)
-        # Build citations list for persistence (convert context chunks to citation format)
-        #
-        # #111: when the agent's ``show_citations`` flag is off, suppress citations
-        # entirely — leaving this list empty is a single choke point that turns off all
-        # three downstream consumers at once: the ``event: citation`` SSE below, the
-        # ``citations=...`` persisted on the stored message, and the copy handed to
-        # ``agent.stream_async``. RAG retrieval and prompt augmentation above are
-        # deliberately untouched: the model still receives the context chunks, the user
-        # just is not shown (or able to download) the sources.
-        show_citations = getattr(assistant, "show_citations", True)
-        citations_for_storage = []
-        if context_chunks and show_citations:
-            for chunk in context_chunks:
-                citations_for_storage.append(
-                    {
-                        "assistantId": input_data.rag_assistant_id,
-                        "documentId": chunk.get("metadata", {}).get("document_id", ""),
-                        # Managed KBs carry the filename under ``filename`` (set at ingest,
-                        # managed_backend.py); legacy S3-Vectors used ``source``. Read
-                        # managed first, fall back to legacy, then the placeholder — before
-                        # this, every managed-KB citation rendered "Unknown Source".
-                        "fileName": (
-                            chunk.get("metadata", {}).get("filename")
-                            or chunk.get("metadata", {}).get("source")
-                            or "Unknown Source"
-                        ),
-                        "text": chunk.get("text", "")[:500],  # Limit excerpt length
-                    }
-                )
+        # Citations to persist and to stream ahead of the answer. Empty when
+        # the Agent hides them, which switches off every downstream consumer.
+        citations_for_storage = _build_citations(
+            assistant, context_chunks, input_data.rag_assistant_id
+        )
 
         # Create stream with optional quota warning injection
         async def stream_with_quota_warning() -> AsyncGenerator[str, None]:
@@ -3809,9 +5002,13 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             # (kicked off before the quota check on first turns) finishes,
             # push the title to the client so the sidebar/header rename in
             # parallel with the pending response instead of at stream end.
-            # Checked between agent events — never awaited, so it adds no
-            # latency; a stream that outruns Nova Micro simply never emits
-            # and the SPA's post-close metadata refresh covers it.
+            # Never awaited, so it adds no latency. Polled from two places:
+            # the coordinator's live status merge (every 100ms, so a title
+            # that lands during the model's time-to-first-token or a long
+            # tool call goes out right away) and between agent events below
+            # (the only route while that merge is switched off). A stream
+            # that outruns Nova Micro simply never emits and the SPA's
+            # post-close metadata refresh covers it.
             title_emitted = False
 
             def _session_title_sse() -> Optional[str]:
@@ -3867,14 +5064,20 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             # The original text becomes the single source of truth for UI display,
             # while the full augmented prompt stays in AgentCore Memory for the LLM.
             attachment_guidance = _build_attachment_guidance(
-                diverted_tabular,
-                diverted_presentations,
-                oversized_inline,
+                attachments.diverted_tabular,
+                attachments.diverted_presentations,
+                attachments.oversized_inline,
                 effective_enabled_tools,
-                over_budget=over_budget_inline,
-                dropped_over_count_names=dropped_over_count_names,
-                dropped_over_count_total=dropped_over_count_total,
+                over_budget=attachments.over_budget_inline,
+                dropped_over_count_names=attachments.dropped_over_count_names,
+                dropped_over_count_total=attachments.dropped_over_count_total,
                 max_files=MAX_FILES_PER_MESSAGE,
+                unpersisted=attachments.unpersisted_inline,
+                unreadable_images=attachments.unreadable_images,
+                unreadable_documents=attachments.unreadable_documents,
+                references=attachments.reference_documents,
+                document_read_available=document_read_available,
+                search_available=_reference_search_available(document_read_available),
             )
             # When multiple spreadsheets are visible, ship the full inventory
             # up front so the agent can disambiguate intentionally instead of
@@ -3891,6 +5094,27 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             final_message = augmented_message
             if attachment_guidance:
                 final_message = f"{final_message}\n\n{attachment_guidance}"
+            # Rendered into the persisted user message once, from this turn's
+            # read of the row: a digest that lands later never rewrites it, so
+            # restored history stays byte-stable (large-document spec §4B.5).
+            if reference_documents_section:
+                final_message = f"{final_message}\n\n{reference_documents_section}"
+            # Folder manifests (drive-folder spec §4.4): the same contract. A
+            # pure function of each row as read on this turn, so a folder still
+            # expanding is listed as far as it got and never rewritten later.
+            folders_section = render_folders_section(
+                attachments.folders,
+                document_read_available=document_read_available,
+                spreadsheet_tools=bool(effective_enabled_tools)
+                and bool({"analyze_spreadsheet", "list_spreadsheets"}.intersection(effective_enabled_tools)),
+                presentation_tools=bool(effective_enabled_tools)
+                and bool(POWERPOINT_PRESENTATION_TOOL_IDS.intersection(effective_enabled_tools)),
+            )
+            if folders_section:
+                final_message = f"{final_message}\n\n{folders_section}"
+                record_folder_manifests(attachments.folders, folders_section)
+            if extracted_documents_section:
+                final_message = f"{final_message}\n\n{extracted_documents_section}"
             if tabular_inventory:
                 final_message = f"{final_message}\n\n{tabular_inventory}"
 
@@ -3899,12 +5123,14 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
             # to this turn only. Skipped on resume/continuation (Strands
             # ignores `final_message` there) so a pending update survives
             # until the next real user turn instead of being silently
-            # cleared. Kept out of persisted history via the
-            # `original_message` path below (cache-prefix-safe).
+            # cleared. It is persisted as part of this user message, so later
+            # turns still know what the App did, and hidden from the UI by the
+            # `original_message` displayText split below. Appended history,
+            # never the cached prefix.
             if not is_resume and not is_continuation:
-                pending_ctx_block = merge_and_clear_pending_context(agent)
-                if pending_ctx_block:
-                    final_message = f"{pending_ctx_block}\n\n{final_message}"
+                final_message = _with_pending_app_context(
+                    final_message, input_data.session_id, user_id
+                )
 
                 # Interrupted-turn context: the prior turn ended early (Stop /
                 # refresh / dropped connection) and its marker was popped at
@@ -3919,10 +5145,13 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 # files the previous turn never got an answer for. Say so, or
                 # the model has to guess why documents it was not asked about
                 # are attached to the message.
-                if recovered_upload_ids and attachment_marker_names:
+                if attachments.recovered_upload_ids and attachments.marker_names:
                     final_message = (
-                        f"{_build_attachment_recovery_note(attachment_marker_names)}\n\n{final_message}"
+                        f"{_build_attachment_recovery_note(attachments.marker_names)}\n\n{final_message}"
                     )
+
+                if project_member_note:
+                    final_message = f"{project_member_note}\n\n{final_message}"
 
                 if interrupted_turn_reason:
                     final_message = (
@@ -3946,11 +5175,11 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
 
             message_will_be_modified = (
                 final_message != input_data.message  # RAG augmentation / attachment guidance / inventory
-                or bool(files_to_send)               # File attachments
+                or bool(attachments.files_to_send)   # File attachments
                 # The `[Attached files: …]` marker is appended for diverted
                 # attachments too, so the persisted text differs from what the
                 # user typed even when nothing went inline (a lone .pptx).
-                or bool(attachment_marker_names)
+                or bool(attachments.marker_names)
             )
             # Strands' resume protocol wants each entry wrapped as
             # {"interruptResponse": {...}}. The InvocationRequest schema
@@ -3961,12 +5190,22 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 if input_data.interrupt_responses
                 else None
             )
+            # Client data for tools, never for the model: Strands hands
+            # `invocation_state` to tools via ToolContext and leaves it out of
+            # the Converse request, so the cacheable prefix is untouched. A
+            # fresh dict per request (Strands mutates it), and None when there
+            # is nothing to carry, which keeps the coordinator's call as it was.
+            turn_invocation_state = (
+                {FRAME_HEIGHT_STATE_KEY: input_data.browser_frame_height}
+                if input_data.browser_frame_height is not None
+                else None
+            )
 
             async for event in agent.stream_async(
                 final_message,
                 session_id=input_data.session_id,
-                files=files_to_send if files_to_send else None,
-                attachment_names=attachment_marker_names or None,
+                files=attachments.files_to_send if attachments.files_to_send else None,
+                attachment_names=attachments.marker_names or None,
                 citations=citations_for_storage if citations_for_storage else None,
                 original_message=input_data.message if message_will_be_modified else None,
                 interrupt_responses=interrupt_responses_payload,
@@ -3993,6 +5232,11 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                 # is not. None for preview sessions and the local
                 # no-DynamoDB path, where steering is simply inert.
                 turn_lease=session_lease,
+                poll_side_frame=_session_title_sse if title_task is not None else None,
+                # The same clock as `turn_prelude`, continued to the first model
+                # output and emitted as `turn_first_token` (turn-path P1b).
+                turn_clock=prelude,
+                invocation_state=turn_invocation_state,
             ):
                 yield event
                 # Interleave the finished title between agent events (same
@@ -4054,7 +5298,7 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
         # generator's finally is the release site for the happy path (the two
         # except handlers below cover pre-stream failures).
         async def _guarded_stream() -> AsyncGenerator[str, None]:
-            nonlocal agent
+            nonlocal agent, kb_search, context_chunks, augmented_message, citations_for_storage
 
             heartbeat_task = None
             try:
@@ -4117,6 +5361,7 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                             session_id=input_data.session_id,
                             user_id=user_id,
                             user_input=input_data.message,
+                            long_term_memory=not input_data.rag_assistant_id,
                         ):
                             yield frame
                         return
@@ -4149,6 +5394,20 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                         + "\n\n"
                     )
 
+                # The knowledge-base search ran alongside the build; take its
+                # result now, ahead of `stream_with_quota_warning`, which is
+                # the first reader of the chunks (citation frames) and of the
+                # augmented message (`final_message`). `rag_wait` is what was
+                # left of the search once the build was done — ~0 when the
+                # build outlasted it.
+                if kb_search is not None:
+                    context_chunks, augmented_message = await kb_search
+                    kb_search = None
+                    citations_for_storage = _build_citations(
+                        assistant, context_chunks, input_data.rag_assistant_id
+                    )
+                    prelude.mark("rag_wait")
+
                 # Emitted here rather than before the return: with the build
                 # deferred, "the window before the client can hear anything"
                 # ends at the agent, not at the response.
@@ -4159,6 +5418,13 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
                         "isResume": is_resume,
                         "hasAssistant": bool(input_data.rag_assistant_id),
                         "deferredBuild": deferred_build,
+                        # Whether the build's SDK clients came from the
+                        # process-wide session (`agent_build_shared_session_enabled`,
+                        # a kill switch), and how many builds this process has
+                        # run: 1 on a conversation's first turn, which is
+                        # always a fresh Runtime process.
+                        "sharedSession": agent_build_shared_session_enabled(),
+                        "processBuilds": process_build_count(),
                     },
                 )
 
@@ -4188,7 +5454,7 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
         return StreamingResponse(
             _guarded_stream(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Session-ID": input_data.session_id},
+            headers=_sse_headers(input_data.session_id),
         )
 
     except HTTPException:
@@ -4208,15 +5474,10 @@ async def invocations(request: InvocationRequest, current_user: User = Depends(g
 
         error_event = build_conversational_error_event(code=ErrorCode.AGENT_ERROR, error=e, session_id=input_data.session_id, recoverable=True)
 
-        return StreamingResponse(
-            stream_conversational_message(
-                message=error_event.message,
-                stop_reason="error",
-                metadata_event=error_event,
-                session_id=input_data.session_id,
-                user_id=user_id,
-                user_input=input_data.message,
-            ),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Session-ID": input_data.session_id},
+        return _refuse_turn(
+            input_data,
+            user_id,
+            message=error_event.message,
+            stop_reason="error",
+            metadata_event=error_event,
         )

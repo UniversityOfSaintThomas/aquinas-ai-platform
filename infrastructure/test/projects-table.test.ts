@@ -5,11 +5,13 @@
  * deleted by app-api's CRUD surface; the invocation path resolves membership,
  * back-fills a member's userId and bumps COST# rollups.
  */
+import * as fs from 'fs';
+import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import { PlatformStack } from '../lib/platform-stack';
 import { ProjectsConstruct } from '../lib/constructs/data/projects-construct';
-import { createMockConfig, mockSsmContext, MOCK_ACCOUNT, MOCK_REGION } from './helpers/mock-config';
+import { createMockConfig, mockSsmContext, MOCK_ACCOUNT, MOCK_PREFIX, MOCK_REGION } from './helpers/mock-config';
 
 describe('ProjectsConstruct', () => {
   const config = createMockConfig();
@@ -86,9 +88,28 @@ describe('Shared Projects compute wiring', () => {
     runtimeEnv = (Object.values(runtimes)[0] as any).Properties.EnvironmentVariables;
   });
 
-  it('gives the Runtime the table name and the kill switch', () => {
+  it('gives the Runtime the kill switch, and derives the table name rather than sending it', () => {
     expect(runtimeEnv.PROJECTS_ENABLED).toBe('true');
-    expect(runtimeEnv).toHaveProperty('DYNAMODB_PROJECTS_TABLE_NAME');
+    // The inference-api rebuilds `{prefix}-projects` from PROJECT_PREFIX
+    // (backend/src/apis/shared/config/derived_environment.json, held to the
+    // template by runtime-derived-environment-manifest.test.ts).
+    expect(runtimeEnv).not.toHaveProperty('DYNAMODB_PROJECTS_TABLE_NAME');
+    const manifest = JSON.parse(fs.readFileSync(
+      path.resolve(__dirname, '../../backend/src/apis/shared/config/derived_environment.json'), 'utf8',
+    )) as { variables: Array<{ name: string; suffix: string }> };
+    expect(manifest.variables).toContainEqual(expect.objectContaining({ name: 'DYNAMODB_PROJECTS_TABLE_NAME', suffix: 'projects' }));
+  });
+
+  it('gives the Runtime the content-lint settings packed into one variable, in MEMORY_ARN\'s slot', () => {
+    // Shared Projects 2.7: the Runtime is at 49 of 50 variables, so the lint's
+    // two settings travel as one JSON value, and MEMORY_ARN (only ever logged at
+    // startup; AGENTCORE_MEMORY_ID is what code reads) was retired to make room.
+    expect(JSON.parse(runtimeEnv.MEMORY_LINT as string)).toEqual({ mode: 'warn' });
+    expect(runtimeEnv).not.toHaveProperty('MEMORY_ARN');
+    expect(runtimeEnv).not.toHaveProperty('MEMORY_LINT_MODE');
+    // No patterns, no parameter: a deployment without them adds no resource.
+    const params = Object.values(template.findResources('AWS::SSM::Parameter')).map((p: any) => p.Properties.Name);
+    expect(params).not.toContain(`/${MOCK_PREFIX}/memory/sensitive-patterns`);
   });
 
   it('no longer sets the OAuth variables nothing on the Runtime reads', () => {
@@ -97,6 +118,12 @@ describe('Shared Projects compute wiring', () => {
     // grants stay; only the env entries were dead.
     expect(runtimeEnv).not.toHaveProperty('OAUTH_TOKEN_ENCRYPTION_KEY_ARN');
     expect(runtimeEnv).not.toHaveProperty('OAUTH_CLIENT_SECRETS_ARN');
+  });
+
+  it('expires archived memory items on `ttl` in the memory-spaces table (2.5a-2)', () => {
+    const tables = Object.values(template.findResources('AWS::DynamoDB::Table')) as any[];
+    const memory = tables.find((r) => String(JSON.stringify(r.Properties.TableName)).includes('memory-spaces'));
+    expect(memory.Properties.TimeToLiveSpecification).toEqual({ AttributeName: 'ttl', Enabled: true });
   });
 
   it('grants the Runtime read + update on the table and its indexes, never put or delete', () => {
@@ -110,6 +137,25 @@ describe('Shared Projects compute wiring', () => {
       'dynamodb:UpdateItem',
     ]);
     expect(statement.Resource).toHaveLength(2);
+  });
+
+  it('lets the Runtime put notification rows on the projects table and nothing else (2.5a)', () => {
+    const statement = findStatement(template, 'ProjectsInboxWrite');
+    expect([...statement.Action].sort()).toEqual(['dynamodb:BatchWriteItem', 'dynamodb:PutItem']);
+    expect(statement.Condition).toEqual({
+      'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['INBOX#*'] },
+    });
+    expect(JSON.stringify(statement.Resource)).not.toContain('/index/');
+  });
+
+  it('lets the Runtime read one share row and its snapshot body, nothing else (2.5c)', () => {
+    const table = findStatement(template, 'SharedConversationsTableRead');
+    expect(table.Action).toEqual('dynamodb:GetItem');
+    expect(JSON.stringify(table.Resource)).not.toContain('/index/');
+
+    const body = findStatement(template, 'SharedConversationsBodyRead');
+    expect(body.Action).toEqual('s3:GetObject');
+    expect(JSON.stringify(body.Resource)).toContain('/shares/*');
   });
 
   it('gives app-api the table name, the flag and full CRUD on the table', () => {

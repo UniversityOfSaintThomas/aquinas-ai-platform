@@ -17,6 +17,27 @@ interface ManagedModelsListResponse {
   totalCount: number;
 }
 
+/** A speech-to-speech row: voice mode's model, never a chat one. */
+export function isSpeechModel(model: { outputModalities?: string[] }): boolean {
+  return (model.outputModalities ?? []).some((m) => m.toUpperCase() === 'SPEECH');
+}
+
+/**
+ * A row that declares TEXT input and nothing else: the backend converts its
+ * documents to text and drops its images (`is_text_only_model` in
+ * `inference_api/chat/routes.py` — keep the two in step).
+ *
+ * Keyed on TEXT-*only*, never on a missing entry: Claude rows declare
+ * `['TEXT', 'IMAGE']` with no DOCUMENT and read PDFs natively. An empty or
+ * absent list is not text-only either.
+ */
+export function isTextOnlyModel(model: { inputModalities?: string[] } | null | undefined): boolean {
+  const declared = new Set(
+    (model?.inputModalities ?? []).map((m) => m.trim().toUpperCase()).filter(Boolean),
+  );
+  return declared.size === 1 && declared.has('TEXT');
+}
+
 @Injectable({
   providedIn: 'root'
 })
@@ -43,7 +64,9 @@ export class ModelService {
     modelName: 'System Default',
     provider: 'bedrock',
     providerName: 'Anthropic',
-    inputModalities: ['TEXT'],
+    // Haiku 4.5 reads images (and PDFs natively). A bare ['TEXT'] would mark the
+    // fallback text-only and warn about attachments it handles fine.
+    inputModalities: ['TEXT', 'IMAGE'],
     outputModalities: ['TEXT'],
     maxInputTokens: 200000,
     maxOutputTokens: 4096,
@@ -159,15 +182,22 @@ export class ModelService {
    * in which case the provider's own default applies and we don't claim to
    * know what it is.
    */
-  readonly selectedEffort = computed<string | null>(() => {
-    const control = this.effortControl();
-    if (!control) return null;
-    const override = this.selectedModelOverrides()[control.key];
+  readonly selectedEffort = computed<string | null>(() => this.effortFor(this.selectedModel()));
+
+  /**
+   * The effort level a message on `model` would be sent with, by the same
+   * rule as `selectedEffort`. Effort overrides are kept per model, so a
+   * switch to another model sends that model's own level, not the current one.
+   */
+  effortFor(model: ManagedModel | null | undefined): string | null {
+    const control = resolveEffortControl(model);
+    if (!control || !model) return null;
+    const override = this._inferenceOverrides()[model.modelId]?.[control.key];
     if (typeof override === 'string' && control.levels.includes(override)) {
       return override;
     }
     return control.defaultLevel;
-  });
+  }
 
   constructor() {
     // Load models on initialization
@@ -227,9 +257,11 @@ export class ModelService {
       );
 
       // Filter to enabled models a user may select. Retired rows are held apart:
-      // never offered, only followed to their successor.
+      // never offered, only followed to their successor. Speech-to-speech rows
+      // (Nova 2 Sonic) are catalogued so voice sessions price, but they answer
+      // no chat API — the backend already omits them; this is the belt.
       const enabledModels = response.models.filter(
-        model => model.enabled && model.status !== 'retired',
+        model => model.enabled && model.status !== 'retired' && !isSpeechModel(model),
       );
       this.retiredModels.set(response.models.filter(model => model.status === 'retired'));
 

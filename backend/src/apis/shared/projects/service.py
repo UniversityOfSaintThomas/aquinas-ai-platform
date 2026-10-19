@@ -21,6 +21,7 @@ delete is always two deliberate steps.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -30,6 +31,7 @@ from typing import List, Optional, Tuple
 
 from apis.shared.audit import TARGET_PROJECT, AuditAction, AuditRecord, AuditService, get_audit_service
 from apis.shared.auth.models import User
+from apis.shared.directory import DirectoryAdapter, DirectoryPerson, get_directory
 from apis.shared.notifications import NotificationKind, NotificationService
 from apis.shared.timestamps import utc_now_iso
 
@@ -48,6 +50,12 @@ from .models import (
     normalize_email,
 )
 from .repository import ProjectRepository, ProjectWriteConflict
+from .schedules import (
+    REASON_MEMBER_REMOVED,
+    REASON_NOT_EDITOR,
+    REASON_PROJECT_ARCHIVED,
+    ProjectSchedules,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -139,12 +147,30 @@ class ProjectService:
         audit: Optional[AuditService] = None,
         notifications: Optional[NotificationService] = None,
         memory: Optional[ProjectMemoryGateway] = None,
+        directory: Optional[DirectoryAdapter] = None,
     ):
         self.repository = repository or ProjectRepository()
+        self._directory = directory
         self.harness = harness or AssistantsHarnessGateway()
         self.memory = memory or MemorySpacesGateway()
         self.audit = audit or get_audit_service()
         self.notifications = notifications or NotificationService(table_name=self.repository.table_name)
+        self.schedules = ProjectSchedules(self.repository, self.notifications)
+
+    # ── people ──────────────────────────────────────────────────────────
+
+    def known_people(self, emails: List[str]) -> dict[str, DirectoryPerson]:
+        """The people among ``emails`` who have signed in, by email. Best-effort: ``{}`` on failure.
+
+        A member counts as signed in if their row is bound to an account (they
+        have opened the project) *or* the directory knows their email, because
+        :meth:`transfer_ownership` can bind them from the directory.
+        """
+        try:
+            return (self._directory or get_directory()).find_by_emails(emails)
+        except Exception:
+            logger.warning("Directory lookup failed", exc_info=True)
+            return {}
 
     # ── trail ───────────────────────────────────────────────────────────
 
@@ -160,6 +186,22 @@ class ProjectService:
             project_id=project.project_id,
             project_name=project.name,
             payload=payload,
+        )
+
+    def _notify_members(self, kind: NotificationKind, actor: User, project: Project) -> None:
+        """Tell every member (pending invitees too) except the actor. Archive and restore
+        are rare, so they reach everyone with no preference to opt out of (G20)."""
+        try:
+            members = self.repository.list_members(project.project_id)
+        except Exception:
+            logger.warning("Could not list members of %s to send %s", project.project_id, kind, exc_info=True)
+            return
+        self.notifications.notify_many(
+            (m.email for m in members),
+            kind=kind,
+            actor=actor,
+            project_id=project.project_id,
+            project_name=project.name,
         )
 
     def list_audit(
@@ -236,6 +278,7 @@ class ProjectService:
         except ProjectWriteConflict as e:
             raise ProjectConflictError("The project changed at the same time. Reload and try again.") from e
         self._record_update(admin, project, saved, reason=reason or "admin")
+        self._status_changed_schedules(admin, project, saved)
         return saved
 
     # ── projects ────────────────────────────────────────────────────────
@@ -366,8 +409,24 @@ class ProjectService:
         except ProjectWriteConflict as e:
             raise ProjectConflictError("The project changed while you were editing it. Reload and try again.") from e
         self._record_update(user, project, saved)
+        if project.status != saved.status:
+            self._notify_members("project_archived" if saved.status == "archived" else "project_restored", user, saved)
+            await asyncio.to_thread(self._status_changed_schedules, user, project, saved)
         await self._sync_harness_identity(project, saved)
         return saved, role
+
+    def _status_changed_schedules(self, actor: User, before: Project, after: Project) -> None:
+        """Archiving freezes the project's schedules; restoring thaws what archiving froze.
+
+        No schedule notice on archive: every member has just been told the project
+        is archived, and that is the reason.
+        """
+        if before.status == after.status:
+            return
+        if after.status == "archived":
+            self.schedules.pause_where(after, REASON_PROJECT_ARCHIVED, actor=actor, notify=False)
+        else:
+            self.schedules.resume_archived(after)
 
     async def _sync_harness_identity(self, before: Project, after: Project) -> None:
         """Give the harness the project's new name/description, if either changed.
@@ -428,6 +487,9 @@ class ProjectService:
         # project owns, so a failure here must leave them for the retry.
         for space_id in self._owned_space_ids(project):
             self.memory.purge_space(space_id)
+        # Schedules live in their creators' partitions, found only through the
+        # pointers the row delete below removes, so they go first.
+        await asyncio.to_thread(self.schedules.delete_all, project_id)
         deleted = self.repository.delete_project_rows(project_id)
         logger.info("Purged project %s (%d rows, harness %s)", project_id, deleted, project.harness_agent_id)
         self.record(AuditAction.PROJECT_DELETED, user, project_id, before={"name": project.name})
@@ -582,6 +644,8 @@ class ProjectService:
                 before={"email": target, "role": current.role}, after={"email": target, "role": role},
             )
             self._notify("project_role_changed", target, user, project, role=role)
+            if role == "viewer":
+                self.schedules.pause_where(project, REASON_NOT_EDITOR, owner_email=target, actor=user)
         return updated
 
     def remove_member(self, project_id: str, user: User, email: str) -> None:
@@ -599,6 +663,7 @@ class ProjectService:
             before={"email": target, "role": member.role if member else None},
         )
         self._notify("project_removed", target, user, project)
+        self.schedules.pause_where(project, REASON_MEMBER_REMOVED, owner_email=target, actor=user)
 
     def leave(self, project_id: str, user: User) -> None:
         project, role = self._require(project_id, user, "viewer")
@@ -609,12 +674,28 @@ class ProjectService:
         self.record(
             AuditAction.PROJECT_MEMBER_REMOVED, user, project_id, before={"email": email, "role": role}, reason="left"
         )
+        self._notify("project_member_left", project.owner_email, user, project, role=role)
+        self.schedules.pause_where(project, REASON_MEMBER_REMOVED, owner_email=email, actor=user)
 
     def _delete_member(self, project_id: str, email: str) -> None:
         try:
             self.repository.remove_member(project_id, email, utc_now_iso())
         except ProjectWriteConflict as e:
             raise ProjectNotFoundError("That person is not a member of this project") from e
+
+    def _bind_member(self, project_id: str, member: ProjectMember) -> ProjectMember:
+        """Bind an unbound member to the account their email signs in as, if the directory knows it.
+
+        A member is otherwise bound the first time they open the project
+        (:func:`resolve_project_role`); this covers someone who has signed in but
+        not opened it yet. When the users table holds more than one account for an
+        email, the directory answers with the one that signed in most recently.
+        """
+        person = self.known_people([member.email]).get(member.email)
+        if person is None or not person.user_id:
+            return member
+        self.repository.set_member_user_id(project_id, member.email, person.user_id)
+        return member.model_copy(update={"user_id": person.user_id})
 
     def transfer_ownership(self, project_id: str, user: User, new_owner_email: str) -> Project:
         """Hand the project to an existing editor; the old owner becomes an editor."""
@@ -626,8 +707,10 @@ class ProjectService:
         if member.role != "editor":
             raise ProjectConflictError("Ownership can only go to an editor. Make them an editor first.")
         if not member.user_id:
+            member = self._bind_member(project_id, member)
+        if not member.user_id:
             raise ProjectConflictError(
-                "They haven't opened this project yet. Ownership can be transferred once they have."
+                "They haven't signed in yet. Ownership can be transferred once they have."
             )
         try:
             self.repository.transfer_ownership(project, member, utc_now_iso())

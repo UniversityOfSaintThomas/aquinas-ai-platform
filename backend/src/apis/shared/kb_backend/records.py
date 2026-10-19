@@ -162,9 +162,20 @@ def work_pk(state: str) -> str:
 
 
 def _table():
-    import boto3
+    """The assistants table, on the process-cached DynamoDB resource.
 
-    return boto3.resource("dynamodb").Table(os.environ["DYNAMODB_ASSISTANTS_TABLE_NAME"])
+    A fresh ``boto3.resource`` per call cost ~45–55ms on its first request in the
+    Runtime (a new connection pool), against ~4ms on a reused one — and a turn's
+    knowledge base search reads this table on its critical path. ``AWS_REGION`` is
+    passed explicitly (it is what boto3 would resolve anyway) so this shares its
+    cache entry, and its warm connection, with the facade's document-status
+    lookups on the same table.
+    """
+    from apis.shared.aws_clients import get_dynamodb_table
+
+    return get_dynamodb_table(
+        os.environ["DYNAMODB_ASSISTANTS_TABLE_NAME"], os.environ.get("AWS_REGION")
+    )
 
 
 # ── Model ────────────────────────────────────────────────────────────────────
@@ -277,6 +288,25 @@ def resolve_engine(item: Optional[Mapping[str, Any]]) -> str:
     if not item:
         return ENGINE_LEGACY
     return ENGINE_MANAGED if item.get("retrievalEngine") == ENGINE_MANAGED else ENGINE_LEGACY
+
+
+def awaiting_provisioning(item: Optional[Mapping[str, Any]]) -> bool:
+    """Whether this is a managed knowledge base that is not built yet.
+
+    A document added now must wait for the born-managed provisioning job, which
+    ingests every ``provisioning`` row once the knowledge base exists. Tests the
+    engine AND the absence of the AWS identifiers rather than
+    ``provisioningState``, because the identifiers are what ingestion needs;
+    ``records.attach_aws_ids`` sets both in one write, so they cannot disagree.
+
+    Lives here, not beside the trigger in ``kb_upgrade``, so the crawler can ask
+    it from the kb-sync image too, which carries ``kb_backend`` but not
+    ``kb_upgrade``.
+    """
+    if resolve_engine(item) != ENGINE_MANAGED:
+        return False
+    item = item or {}
+    return not (item.get("awsKbId") and item.get("awsDataSourceId"))
 
 
 # ── Reads ────────────────────────────────────────────────────────────────────
@@ -811,6 +841,33 @@ def acquire_lease(
     )
 
 
+def release_lease(assistant_id: str, app_kb_id: str, lease_until: str) -> None:
+    """Give the worker lease back the moment a step is done with it.
+
+    Raises :class:`TransitionLost` when there is nothing of ours to release.
+
+    Expiry alone is not enough. The lease runs as long as the dispatcher's
+    interval, and it is taken about a second after the tick that dispatched it, so
+    a step that re-queues itself is still "held" when the next tick arrives. That
+    worker then loses the lease to a predecessor that finished minutes earlier,
+    and every re-queue costs two intervals instead of one.
+
+    Guarded on ``migrationLeaseUntil`` still being the value this worker wrote.
+    That value identifies the holder, because :func:`acquire_lease` only admits
+    a write when no live lease exists, so no two live leases can share it. The
+    guard means a worker that overran its lease cannot release the one its
+    successor has since taken. Because it is a condition on an attribute, it also
+    fails on a record a teardown has removed, and never recreates it.
+    """
+    _conditional(
+        _table().update_item,
+        Key={"PK": kb_pk(assistant_id), "SK": kb_sk(app_kb_id)},
+        UpdateExpression="REMOVE migrationLeaseUntil",
+        ConditionExpression="migrationLeaseUntil = :until",
+        ExpressionAttributeValues={":until": lease_until},
+    )
+
+
 def retry_from_failed(
     assistant_id: str,
     app_kb_id: str,
@@ -880,7 +937,20 @@ def request_teardown(
     Guarded on the generation this call read, so two concurrent deletes and a
     worker's own transition cannot interleave into a lost update; a lost race
     re-reads and tries again.
+
+    **Refuses a reserved id** (:mod:`~apis.shared.kb_backend.reserved`), returning
+    ``None`` as for an absent record. The conversation-search index keeps its
+    record at ``AST#conversations``, a partition with no agent in it, which is
+    exactly what an orphan sweep looks for; queuing it here would delete every
+    user's search index. This is the one function every agent teardown goes
+    through, so the check lives here rather than at each caller.
     """
+    from apis.shared.kb_backend.reserved import is_reserved_kb_id
+
+    if is_reserved_kb_id(assistant_id) or is_reserved_kb_id(app_kb_id):
+        logger.warning(f"refusing to queue reserved knowledge base {app_kb_id} for teardown")
+        return None
+
     table = _table()
     key = {"PK": kb_pk(assistant_id), "SK": kb_sk(app_kb_id)}
     for _ in range(attempts):

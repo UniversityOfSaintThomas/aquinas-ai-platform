@@ -7,8 +7,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # Agent Designer Phase 1 (D3): the uniform binding kinds. Requests validate against
 # this set; storage tolerates unknown kinds on read so records written by newer code
 # survive a read/write round trip through older code (forward + rollback compat).
-KNOWN_BINDING_KINDS = ("knowledge_base", "tool", "skill", "memory_space")
-BindingKind = Literal["knowledge_base", "tool", "skill", "memory_space"]
+KNOWN_BINDING_KINDS = ("knowledge_base", "tool", "skill")
+BindingKind = Literal["knowledge_base", "tool", "skill"]
 
 # Agent Marketplace Phase 1 (D2): the listing lifecycle. The transition table and the
 # sparse-index key derivation live in ``assistants.listing`` — this is only the wire type.
@@ -113,9 +113,8 @@ class AgentBinding(BaseModel):
     """A single primitive binding on an Agent (D3).
 
     ``kind`` is an open string on read (unknown kinds pass through untouched); the
-    request layer validates it against ``KNOWN_BINDING_KINDS``. Phase 1 resolves only
-    ``memory_space`` and ``knowledge_base``; ``tool`` and ``skill`` are accepted and
-    stored but inert (not resolved) until Phase 2/3.
+    request layer validates it against ``KNOWN_BINDING_KINDS``. A stored ``memory_space``
+    binding (the kind was retired — memory belongs to Projects) is ignored at run time.
     """
 
     model_config = ConfigDict(populate_by_name=True)
@@ -582,7 +581,7 @@ class AgentCapability(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     label: str = Field(..., description="Display name of the bound primitive")
-    kind: str = Field(..., description="Binding kind (tool | skill | memory_space)")
+    kind: str = Field(..., description="Binding kind (tool | skill)")
 
 
 # Two states, not three. The Marketplace spec's D6 sketched a middle "limits"
@@ -744,7 +743,7 @@ class BindableItem(BaseModel):
     of these so every picker in the Designer consumes the same shape. ``ref`` is the
     value the UI stores: ``modelConfig.modelId`` for ``kind == "model"``, otherwise a
     ``binding.ref``. ``meta`` carries kind-specific display extras (provider, MCP
-    server sub-tools, memory-space role, …) that the picker renders but never has to
+    server sub-tools, …) that the picker renders but never has to
     understand structurally.
     """
 
@@ -827,6 +826,23 @@ class SkillExposure(BaseModel):
     label: str = Field(..., description="Skill display name, for the submit dialog's enumeration")
 
 
+class ShareSkillExposureResponse(BaseModel):
+    """The owner-authored skills that come along with sharing an Agent (§6/D7).
+
+    The share dialog's half of D7.1: the same enumeration the submit dialog shows, for the
+    narrower act of adding people or leaving the Agent PUBLIC. Owner only.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    agent_id: str = Field(..., alias="agentId", description="Agent identifier")
+    exposed_skills: List[SkillExposure] = Field(
+        default_factory=list,
+        alias="exposedSkills",
+        description="Skills the owner wrote that anyone with access to the Agent can use and read",
+    )
+
+
 class ListingSubmissionResponse(BaseModel):
     """The resulting listing plus the disclosures the author was shown (D7)."""
 
@@ -845,7 +861,7 @@ class ListingPreflightResponse(BaseModel):
     """What the submit dialog shows before the author commits (D7).
 
     The same checks ``submit_listing`` runs, answered without a transition: the skills
-    publication would expose, the memory-space block if there is one, and whether the
+    publication would expose, the project-harness block if there is one, and whether the
     author has to consent to going public.
 
     ⚠️ ``blockReason`` and ``requiresPublic`` are deliberately **separate signals**, not
@@ -1618,8 +1634,8 @@ class RoleAgentPinRow(BaseModel):
     notes: List[str] = Field(
         default_factory=list,
         description=(
-            "What the role-level check could not decide — a memory-space binding resolves "
-            "per person, so 'ready' here never claims to have checked it"
+            "What the role-level check could not decide, so 'ready' here never claims "
+            "to have checked it"
         ),
     )
 
@@ -1895,15 +1911,6 @@ class AdminQueueCountsResponse(BaseModel):
     open_report_count: int = Field(
         0, alias="openReportCount", description="Problem reports awaiting triage (D15)"
     )
-
-
-class AssistantTestChatRequest(BaseModel):
-    """Request body for testing assistant chat with RAG"""
-
-    model_config = ConfigDict(populate_by_name=True)
-
-    message: str = Field(..., description="User message to test")
-    session_id: Optional[str] = Field(None, description="Optional session ID for ephemeral chat")
 
 
 class ShareAssistantRequest(BaseModel):

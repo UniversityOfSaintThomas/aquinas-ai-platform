@@ -10,9 +10,9 @@ import {
   viewChild,
 } from '@angular/core';
 import { NgTemplateOutlet } from '@angular/common';
-import { Message } from '../../services/models/message.model';
+import { FolderAttachmentData, Message } from '../../services/models/message.model';
 import { MessageListComponent } from '../message-list/message-list.component';
-import { ChatInputComponent } from '../chat-input/chat-input.component';
+import { ChatInputComponent, ComposerProject } from '../chat-input/chat-input.component';
 import { AnimatedTextComponent } from '../../../components/animated-text';
 import { ParagraphSkeletonComponent } from '../../../components/paragraph-skeleton';
 import { Topnav } from '../../../components/topnav/topnav';
@@ -36,6 +36,8 @@ import { VoiceOverlayComponent } from '../voice-overlay';
 import { VoiceChatService } from '../../services/voice';
 import { ChatStateService } from '../../services/chat/chat-state.service';
 import { ProjectsService } from '../../../projects/services/projects.service';
+import { MessageMapService } from '../../services/session/message-map.service';
+import { ExpiredSessionNoticeComponent } from '../expired-session-notice/expired-session-notice.component';
 
 /**
  * Configuration options for ChatContainerComponent.
@@ -80,6 +82,7 @@ export interface ChatContainerConfig {
     AgentIndicatorComponent,
     ContextMeterComponent,
     VoiceOverlayComponent,
+    ExpiredSessionNoticeComponent,
   ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: './chat-container.component.html',
@@ -102,6 +105,7 @@ export class ChatContainerComponent {
   private readonly chatState = inject(ChatStateService);
   private readonly modelService = inject(ModelService);
   private readonly projectsService = inject(ProjectsService);
+  private readonly messageMap = inject(MessageMapService);
 
   /**
    * What the bound Agent fixes for this conversation, for the indicator.
@@ -152,6 +156,25 @@ export class ChatContainerComponent {
   // Required inputs
   messages = input.required<Message[]>();
   sessionId = input<string | null>(null);
+  /**
+   * Let the composer attach Drive folders (drive-folder spec §4.7). Off unless
+   * the parent sends folders with the turn: the session page does; the agent
+   * preview and the marketplace test drive do not, so they never offer one.
+   */
+  allowFolderAttachments = input<boolean>(false);
+  /**
+   * Offer "Project or folder" beneath the full-page empty state's composer
+   * (docs/specs/composer-project-folder-picker.md). Only the session page sets
+   * it; a thread and the embedded previews never show it.
+   */
+  showScopePicker = input<boolean>(false);
+  /**
+   * The Shared Project this conversation runs in, resolved by the session page
+   * (it resolves the URL's `?project=` before the harness Agent has loaded).
+   * The empty state then shows the greeting, with the composer's placeholder
+   * naming the project, instead of the harness Agent's launch card.
+   */
+  project = input<ComposerProject | null>(null);
 
   // Optional inputs
 
@@ -184,6 +207,12 @@ export class ChatContainerComponent {
   // Configuration with defaults
   config = input<Partial<ChatContainerConfig>>({});
 
+  /**
+   * The history on screen came from the conversation archive, so the
+   * composer gives way to a read-only notice (conversation-search §10 q4).
+   */
+  protected readonly isArchiveServed = computed(() => this.messageMap.isArchiveServed(this.sessionId()));
+
   protected readonly resolvedConfig = computed<ChatContainerConfig>(() => ({
     showTopnav: false,
     showEmptyState: true,
@@ -199,7 +228,7 @@ export class ChatContainerComponent {
   // `mentionAgentId` and `invokedSkillIds` ride through untouched: the container is a
   // layout shell, and dropping either field here would silently turn every `@`-mention
   // back into a plain turn, or every `/` skill command into ordinary prose.
-  messageSubmitted = output<{ content: string; timestamp: Date; fileUploadIds?: string[]; mentionAgentId?: string; invokedSkillIds?: string[] }>();
+  messageSubmitted = output<{ content: string; timestamp: Date; fileUploadIds?: string[]; mentionAgentId?: string; invokedSkillIds?: string[]; folders?: FolderAttachmentData[] }>();
   continueRequested = output<void>();
   messageCancelled = output<void>();
   fileAttached = output<File>();
@@ -354,8 +383,16 @@ export class ChatContainerComponent {
     this.messageListComponent()?.scrollToLastUserMessage(behavior);
   }
 
+  /**
+   * Anchor one message at the top of the viewport (a search result's turn).
+   * True when the message was rendered and scrolled to.
+   */
+  scrollToMessage(messageId: string, behavior: ScrollBehavior = 'smooth'): boolean {
+    return this.messageListComponent()?.scrollToMessage(messageId, behavior) ?? false;
+  }
+
   // Event handlers
-  onMessageSubmitted(event: { content: string; timestamp: Date; fileUploadIds?: string[]; mentionAgentId?: string; invokedSkillIds?: string[] }) {
+  onMessageSubmitted(event: { content: string; timestamp: Date; fileUploadIds?: string[]; mentionAgentId?: string; invokedSkillIds?: string[]; folders?: FolderAttachmentData[] }) {
     this.messageSubmitted.emit(event);
 
     // Wait for DOM to update (user message to be added) then scroll to it

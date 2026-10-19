@@ -146,6 +146,17 @@ jobs:
       CDK_APP_API_MEMORY: ${{ vars.CDK_APP_API_MEMORY }}
       CDK_APP_API_DESIRED_COUNT: ${{ vars.CDK_APP_API_DESIRED_COUNT }}
       CDK_APP_API_MAX_CAPACITY: ${{ vars.CDK_APP_API_MAX_CAPACITY }}
+      # Per-task cap on concurrent /chat/api-converse Bedrock calls (default 16).
+      CDK_APP_API_CONVERSE_MAX_IN_FLIGHT: ${{ vars.CDK_APP_API_CONVERSE_MAX_IN_FLIGHT }}
+      # AgentCore Runtime platform version: V1 (default) or V2. An in-place
+      # update; the runtime id is unchanged. Unset means V1, so a V2 stack
+      # reverts to V1 if this variable is deleted. See
+      # docs/specs/agentcore-runtime-v2.md.
+      CDK_AGENTCORE_RUNTIME_PLATFORM_VERSION: ${{ vars.CDK_AGENTCORE_RUNTIME_PLATFORM_VERSION }}
+      # Escape hatch for scripts/platform/check-runtime-env-contract.sh: set to
+      # `true` only after confirming the live inference-api image derives its
+      # resource names (docs/specs/agentcore-runtime-v2.md §8).
+      SKIP_RUNTIME_ENV_CONTRACT_CHECK: ${{ vars.SKIP_RUNTIME_ENV_CONTRACT_CHECK }}
       CDK_ALB_SUBDOMAIN: ${{ vars.CDK_ALB_SUBDOMAIN }}
       CDK_CERTIFICATE_ARN: ${{ vars.CDK_CERTIFICATE_ARN }}
       # Shared us-east-1 CloudFront cert (wildcard covering {domain} + *.{domain}).
@@ -241,11 +252,43 @@ jobs:
       # variable to "false" in an environment only to dark-stop the feature there.
       CDK_MEMORY_SPACES_ENABLED: ${{ vars.CDK_MEMORY_SPACES_ENABLED }}
       # Shared Projects (project workspace, membership, harness, project memory).
-      # Opt-in while in development (CLAUDE.md "Feature flags"): set the
-      # `CDK_PROJECTS_ENABLED` variable to "true" in an environment to turn it on
-      # there. Unset (empty string) or anything else means off. The SPA's
-      # matching switch is `features.projects` in src/environments/*.ts.
+      # Default ON with a kill switch (CLAUDE.md "Feature flags"): unset (empty
+      # string) means on; set the `CDK_PROJECTS_ENABLED` variable to "false" in an
+      # environment to turn it off there. The SPA's matching switch is
+      # `features.projects` in src/environments/*.ts.
       CDK_PROJECTS_ENABLED: ${{ vars.CDK_PROJECTS_ENABLED }}
+      # Direct user grants (tools/models/skills granted to one user beside their
+      # roles; the admin surface at /admin/user-grants). Default ON with a kill
+      # switch: set `CDK_USER_GRANTS_ENABLED` to "false" in an environment to
+      # turn it off there. app-api only. The SPA's matching switch is
+      # `features.userGrants` in src/environments/*.ts.
+      CDK_USER_GRANTS_ENABLED: ${{ vars.CDK_USER_GRANTS_ENABLED }}
+      # Session prewarm: POST /chat/prewarm starts a conversation's AgentCore
+      # Runtime microVM before its first send (docs/specs/agentcore-runtime-v2.md
+      # §5a). Opt-in while in development: set `CDK_SESSION_PREWARM_ENABLED` to
+      # "true" in an environment to turn it on there. app-api only. The SPA's
+      # matching switch is `features.sessionPrewarm` in src/environments/*.ts.
+      CDK_SESSION_PREWARM_ENABLED: ${{ vars.CDK_SESSION_PREWARM_ENABLED }}
+      # Client-measured time to first token: POST /telemetry/turn-timing records the
+      # SPA's own send-to-first-token in AgentCoreStack/TurnLatency
+      # (docs/specs/turn-path-ttft.md §6). Default ON with a kill switch: set
+      # `CDK_CLIENT_TURN_TIMING_ENABLED` to "false" in an environment to turn it
+      # off there. app-api only. The SPA's matching switch is `features.clientTurnTiming`.
+      CDK_CLIENT_TURN_TIMING_ENABLED: ${{ vars.CDK_CLIENT_TURN_TIMING_ENABLED }}
+      # Scheduled time-to-first-token probe (docs/specs/turn-path-ttft.md §6E).
+      # Configuration, not a flag: set `CDK_TTFT_PROBE_USER_ID` to the Cognito sub
+      # of a user with an active headless grant to run a fixed turn hourly as that
+      # user; unset leaves the schedule disabled. `CDK_TTFT_PROBE_MODEL_ID` pins the
+      # model (recommended); unset uses that user's default.
+      CDK_TTFT_PROBE_USER_ID: ${{ vars.CDK_TTFT_PROBE_USER_ID }}
+      CDK_TTFT_PROBE_MODEL_ID: ${{ vars.CDK_TTFT_PROBE_MODEL_ID }}
+      # Project-memory content lint (Shared Projects 2.7). Configuration, not a
+      # flag: it applies only inside Projects. Unset (empty string) means the
+      # defaults: `warn`, and no deployment patterns. `CDK_MEMORY_LINT_MODE` is
+      # off | warn | block; `CDK_MEMORY_SENSITIVE_PATTERNS` is a JSON list of
+      # Python regexes (strings or {"pattern", "label"}) or one per line.
+      CDK_MEMORY_LINT_MODE: ${{ vars.CDK_MEMORY_LINT_MODE }}
+      CDK_MEMORY_SENSITIVE_PATTERNS: ${{ vars.CDK_MEMORY_SENSITIVE_PATTERNS }}
       # Platform self-service (account tools: whoami / quota / settings reads +
       # the confirmed set_default_model write). Opt-in while in development: set
       # the `CDK_PLATFORM_SELF_SERVICE_ENABLED` variable to "true" in an
@@ -263,6 +306,52 @@ jobs:
       # and see the ones their role grants. Which skills a cohort gets is a
       # role's `grantedSkills`, managed in the admin roles UI.
       CDK_SKILLS_ENABLED: ${{ vars.CDK_SKILLS_ENABLED }}
+      # Skill authoring tools: the seven `my_skill_*` agent tools that create
+      # and edit the invoking user's own skills (docs/specs/skill-creator.md
+      # D12). Default ON with a kill switch: unset (empty string) means on; set
+      # the `CDK_SKILL_AUTHORING_ENABLED` variable to "false" in an environment
+      # to turn it off there. Nobody gets the tools until the `my_skill_create`
+      # catalog row is seeded and granted to a role.
+      CDK_SKILL_AUTHORING_ENABLED: ${{ vars.CDK_SKILL_AUTHORING_ENABLED }}
+      # Word tracked changes: a .docx's tracked changes reach the model written
+      # out as [deleted: …] / [inserted: …], and the Word tools gain
+      # redline_word_document (docs/specs/word-tracked-changes.md). Default ON
+      # with a kill switch: unset (empty string) means on; set the
+      # `CDK_WORD_TRACKED_CHANGES_ENABLED` variable to "false" in an environment
+      # to turn it off there. Sets the flag on both app-api and the Runtime.
+      CDK_WORD_TRACKED_CHANGES_ENABLED: ${{ vars.CDK_WORD_TRACKED_CHANGES_ENABLED }}
+      # Assistant KB full-context mode: an assistant whose whole knowledge base
+      # fits 50,000 tokens gets it in the system prompt instead of retrieved
+      # chunks. Opt-in while in development: set the
+      # `CDK_ASSISTANT_KB_FULL_CONTEXT_ENABLED` variable to "true" in an
+      # environment to turn it on there. Unset (empty string) or anything else
+      # means off. Sets the flag on the Runtime only.
+      CDK_ASSISTANT_KB_FULL_CONTEXT_ENABLED: ${{ vars.CDK_ASSISTANT_KB_FULL_CONTEXT_ENABLED }}
+      # Large document attachments: documents over the 4 MB inline limit are
+      # attached by reference and read from sidecars a preparation Lambda
+      # builds (docs/specs/large-document-attachments.md). Default ON with a
+      # kill switch: unset (empty string) means on; set the
+      # `CDK_LARGE_DOCUMENT_ATTACHMENTS_ENABLED` variable to "false" in an
+      # environment to turn it off there, and the prepare queue and Lambda are
+      # not deployed at all. Sets the flag on app-api only.
+      CDK_LARGE_DOCUMENT_ATTACHMENTS_ENABLED: ${{ vars.CDK_LARGE_DOCUMENT_ATTACHMENTS_ENABLED }}
+      # The shared `attachments` managed knowledge base for large documents
+      # (docs/specs/large-document-attachments.md §4E). Opt-in while in
+      # development, and only together with CDK_LARGE_DOCUMENT_ATTACHMENTS_ENABLED
+      # (synth fails otherwise). Adds two EventBridge rules and the user-files
+      # bucket's EventBridge notification; the knowledge base is created on
+      # first ingest and billed at $5/GB-month of indexed source bytes.
+      CDK_ATTACHMENT_KB_ENABLED: ${{ vars.CDK_ATTACHMENT_KB_ENABLED }}
+      # Folder attachments: a conversation can attach a Google Drive folder
+      # (docs/specs/drive-folder-attachments.md). Default ON with a kill switch;
+      # unset follows CDK_LARGE_DOCUMENT_ATTACHMENTS_ENABLED, and "true" without
+      # it fails synth. Sets the flag on app-api and the Runtime; no resources.
+      CDK_FOLDER_ATTACHMENTS_ENABLED: ${{ vars.CDK_FOLDER_ATTACHMENTS_ENABLED }}
+      # Folder sync: a project saved from a Drive folder can keep its Files in
+      # step with the folder (docs/specs/assistant-kb-sync.md §11). Default ON
+      # with a kill switch ("false" turns it off). Sets the flag on app-api and
+      # both kb-sync Lambdas; no resources. The SPA's matching switch is `features.folderSync`.
+      CDK_FOLDER_SYNC_ENABLED: ${{ vars.CDK_FOLDER_SYNC_ENABLED }}
       # SageMaker fine-tuning. The tables, bucket, SageMaker role and IAM
       # grants deploy unconditionally, but these two decide whether the feature
       # is reachable and how it is rationed, and neither was forwarded before —
@@ -358,6 +447,34 @@ jobs:
       # (default 100). Leave unset to take those defaults.
       CDK_MANAGED_KB_STORAGE_ALARM_GB: ${{ vars.CDK_MANAGED_KB_STORAGE_ALARM_GB }}
       CDK_MANAGED_KB_DAILY_COST_ALARM_USD: ${{ vars.CDK_MANAGED_KB_DAILY_COST_ALARM_USD }}
+      # Days a conversation's content is kept after each turn, wherever it is
+      # stored (docs/specs/conversation-search.md §3). Unset means 365. Memory
+      # events stop at 365 even if this is higher; minimum 3.
+      CDK_CONVERSATION_RETENTION_DAYS: ${{ vars.CDK_CONVERSATION_RETENTION_DAYS }}
+      # Session rows follow the retention setting too: a daily task deletes
+      # sessions whose last turn is past it, through the same cascade as a
+      # user's delete (docs/specs/conversation-search.md §3).
+      #   CDK_CONVERSATION_RETENTION_PRUNES_SESSIONS  unset means ON; "false"
+      #                                               keeps rows as title-only
+      #                                               shells and stops the task
+      #   CDK_CONVERSATION_RETENTION_PRUNE_ARMED      unset means REPORT-ONLY;
+      #                                               "true" lets the task delete.
+      #                                               Even armed, the first run in
+      #                                               an environment is a dry run.
+      CDK_CONVERSATION_RETENTION_PRUNES_SESSIONS: ${{ vars.CDK_CONVERSATION_RETENTION_PRUNES_SESSIONS }}
+      CDK_CONVERSATION_RETENTION_PRUNE_ARMED: ${{ vars.CDK_CONVERSATION_RETENTION_PRUNE_ARMED }}
+      # Conversation index write path: the per-turn transcript archive that
+      # conversation search is built from (docs/specs/conversation-search.md
+      # §4). Opt-in while in development: set the
+      # `CDK_CONVERSATION_INDEX_ENABLED` variable to "true" in an environment
+      # to turn it on there. Unset (empty string) or anything else means off.
+      CDK_CONVERSATION_INDEX_ENABLED: ${{ vars.CDK_CONVERSATION_INDEX_ENABLED }}
+      # Conversation search read path: GET /sessions/search on app-api
+      # (docs/specs/conversation-search.md §5). Default on: set the
+      # `CDK_CONVERSATION_SEARCH_ENABLED` variable to "false" in an environment
+      # to turn it off there, and set `features.conversationSearch` to false in
+      # the matching environment file to match. Unset or anything else is on.
+      CDK_CONVERSATION_SEARCH_ENABLED: ${{ vars.CDK_CONVERSATION_SEARCH_ENABLED }}
       # Observability. All optional — unset means the default in config.ts.
       # XRAY_SAMPLING_RATE is a rate (0.0-1.0), not a percentage.
       CDK_OBSERVABILITY_ALARM_TOPIC_ENABLED: ${{ vars.CDK_OBSERVABILITY_ALARM_TOPIC_ENABLED }}
@@ -420,6 +537,14 @@ jobs:
       # a viewer that cannot load. See docs/specs/authenticated-web-assessment.md.
       - name: Fetch Amazon DCV Web Client SDK
         run: bash scripts/build/fetch-dcv-sdk.sh
+
+      # CDK builds the infrastructure/bootstrap-assets/* stub images when
+      # their asset hash is new, and every stub's base image comes from
+      # public.ecr.aws. Authenticate so that pull is not subject to ECR
+      # Public's anonymous per-IP data limit on this shared x86 runner.
+      # Best-effort; see the script header.
+      - name: Log in to ECR Public
+        run: bash scripts/build/ecr-public-login.sh
 
       - name: Deploy PlatformStack
         run: bash scripts/platform/deploy.sh

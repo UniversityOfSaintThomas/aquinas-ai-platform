@@ -40,7 +40,7 @@ def test_the_main_turn_passes_the_binding_it_built_tools_from():
         if _is_false(kw.get("is_resume")) and "extra_tools_key_described" in kw
     ]
     assert len(mains) == 1
-    assert ast.unparse(mains[0]["memory_binding"]) == "memory_binding_key"
+    assert ast.unparse(mains[0]["memory_binding"]) == "turn_tools.memory_binding_key"
 
 
 def test_memory_context_is_passed_on_the_main_turn_and_replayed_on_resume():
@@ -64,6 +64,20 @@ def test_a_harness_keys_on_the_scopes_its_tools_were_built_from():
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             assigned.setdefault(node.targets[0].id, []).append(ast.unparse(node.value))
-    assert "project_memory.binding_key()" in assigned["memory_binding_key"]
-    assert "build_project_memory_tools(project_memory, current_user)" in assigned["memory_tools"]
+    assert any("project_memory.binding_key()" in v for v in assigned["memory_binding_key"])
+    assert "build_project_memory_tools(project_memory, current_user)" in source
     assert "project_memory.memory_context or None" in assigned["memory_context"]
+
+
+def test_every_turn_build_carries_the_text_only_flag():
+    """Dropped on any of these, a text-only model is sent the media blocks in
+    history and fails the turn. The main turn and the App dispatch share a
+    cache slot; resume replays the snapshot."""
+    calls = list(_get_agent_calls())
+    resume = [kw for kw in calls if _is_true(kw.get("is_resume"))][0]
+    main = [kw for kw in calls if _is_false(kw.get("is_resume")) and "extra_tools_key_described" in kw][0]
+    dispatch = [kw for kw in calls if _is_false(kw.get("is_resume")) and "extra_tools_key_described" not in kw]
+    assert ast.unparse(main["text_only_model"]) == "turn_model.text_only"
+    assert ast.unparse(resume["text_only_model"]) == "bool(snapshot.text_only_model)"
+    assert len(dispatch) == 1
+    assert ast.unparse(dispatch[0]["text_only_model"]) == "is_text_only_model(input_modalities)"

@@ -53,6 +53,43 @@ describe('MessageMapService', () => {
     expect(service).toBeTruthy();
   });
 
+  describe('a message with a Drive folder', () => {
+    it('puts the folder chip after the files and before the text', () => {
+      const folder = { folderAttachId: 'fa-1', name: 'Course', source: 'Drive', status: 'ready', fileCount: 1, files: ['a.pdf'], moreCount: 0 };
+      const file = { uploadId: 'u1', filename: 'n.pdf', mimeType: 'application/pdf', sizeBytes: 1 };
+      const message = service.addUserMessage('s1', 'what is due?', [file], [folder]);
+      expect(message.content.map((b) => b.type)).toEqual(['fileAttachment', 'folderAttachment', 'text']);
+      expect(message.content[1].folderAttachment).toEqual(folder);
+    });
+  });
+
+  describe('a message that was not sent', () => {
+    it('marks it with the reason, as a new object so OnPush bubbles re-render', () => {
+      const sent = service.addUserMessage('s1', 'first');
+      const failed = service.addUserMessage('s1', 'second');
+
+      service.markSendFailed('s1', failed.id, 'A response was still finishing.');
+
+      const [first, second] = service.getMessagesForSession('s1')();
+      expect(first).toBe(sent);
+      expect(second).not.toBe(failed);
+      expect(second.sendFailure).toEqual({ reason: 'A response was still finishing.' });
+    });
+
+    it('removes it ahead of a resend only while it is the last message', () => {
+      const failed = service.addUserMessage('s1', 'first');
+      service.addUserMessage('s1', 'second');
+
+      // Removing from the middle would shift every later msg-{session}-{index} id.
+      expect(service.removeTrailingMessage('s1', failed.id)).toBe(false);
+      expect(service.getMessagesForSession('s1')()).toHaveLength(2);
+
+      const last = service.getMessagesForSession('s1')()[1];
+      expect(service.removeTrailingMessage('s1', last.id)).toBe(true);
+      expect(service.getMessagesForSession('s1')().map(m => m.id)).toEqual([failed.id]);
+    });
+  });
+
   it('should get messages for session', () => {
     const messagesSignal = service.getMessagesForSession('session-1');
     expect(messagesSignal).toBeTruthy();
@@ -343,6 +380,44 @@ describe('MessageMapService', () => {
 
   it('endStreaming is a no-op for a session without an active stream', () => {
     expect(() => service.endStreaming('never-streamed')).not.toThrow();
+  });
+
+  describe('archive-served sessions', () => {
+    const archivedMessages = [
+      { id: 'msg-old-0', role: 'user', content: [{ type: 'text', text: 'From last year' }] },
+    ];
+
+    it('marks a session archive-served when the messages came from the archive', async () => {
+      mockSessionService.getMessages.mockResolvedValue({ messages: archivedMessages, fromArchive: true });
+
+      await service.loadMessagesForSession('old');
+
+      expect(service.isArchiveServed('old')).toBe(true);
+      expect(service.isArchiveServed('other')).toBe(false);
+      expect(service.isArchiveServed(null)).toBe(false);
+    });
+
+    it('treats a response without the flag (an older server) as live', async () => {
+      mockSessionService.getMessages.mockResolvedValue({ messages: archivedMessages });
+
+      await service.loadMessagesForSession('live');
+
+      expect(service.isArchiveServed('live')).toBe(false);
+    });
+
+    it('drops the mark when a re-fetch comes back from Memory, and on clearSession', async () => {
+      mockSessionService.getMessages.mockResolvedValue({ messages: archivedMessages, fromArchive: true });
+      await service.loadMessagesForSession('old');
+
+      mockSessionService.getMessages.mockResolvedValue({ messages: archivedMessages, fromArchive: false });
+      await service.reloadMessagesForSession('old');
+      expect(service.isArchiveServed('old')).toBe(false);
+
+      mockSessionService.getMessages.mockResolvedValue({ messages: archivedMessages, fromArchive: true });
+      await service.reloadMessagesForSession('old');
+      service.clearSession('old');
+      expect(service.isArchiveServed('old')).toBe(false);
+    });
   });
 
   it('should clear session', () => {

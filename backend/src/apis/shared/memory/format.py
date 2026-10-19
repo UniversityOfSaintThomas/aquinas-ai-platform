@@ -69,6 +69,16 @@ _TRAILING_ANCHOR_RE = re.compile(r"[ \t]*<!--[ \t]*e:([0-9A-Za-z]{8})[ \t]*-->\s
 # Anything that looks like an anchor comment. Used to reject anchors that are
 # malformed or sit anywhere other than the end of an item.
 _ANY_ANCHOR_RE = re.compile(r"<!--\s*e:")
+# An anchor-shaped comment that does end an item but holds no system id, such
+# as ``<!-- e:team-roster -->``. A model writing a new file invents these; told
+# its anchor "may only end an item" when it already did, Haiku 4.5 moved it to
+# the end four times over and made 16 failed saves in one turn (2026-10-16).
+_TRAILING_ANCHOR_LIKE_RE = re.compile(r"[ \t]*<!--[ \t]*e:([^>]*?)[ \t]*-->\s*\Z")
+_NOT_AN_ANCHOR = (
+    "Item on line {lineno} ends in <!-- e:{given} -->, which is not an anchor the system issued. "
+    "Anchors are assigned by the system: remove the comment to save it as a new item, or copy "
+    "the anchor exactly as memory_read returned it to keep an existing one."
+)
 
 _WIKILINK_RE = re.compile(r"\[\[([^\[\]\n]+)\]\]")
 
@@ -557,9 +567,16 @@ def parse_items(body: str) -> Tuple[Item, ...]:
             anchor = match.group(1).lower()
             if not is_valid_anchor(anchor):
                 raise MemoryFormatError(
-                    f"The item on line {lineno} has a malformed anchor.", code="malformed_anchor"
+                    _NOT_AN_ANCHOR.format(lineno=lineno, given=match.group(1)), code="malformed_anchor"
                 )
             joined = joined[: match.start()]
+        else:
+            loose = _TRAILING_ANCHOR_LIKE_RE.search(joined)
+            # Only the last comment: one earlier in the item is misplaced, not malformed.
+            if loose and not _ANY_ANCHOR_RE.search(joined[: loose.start()]):
+                raise MemoryFormatError(
+                    _NOT_AN_ANCHOR.format(lineno=lineno, given=loose.group(1)), code="malformed_anchor"
+                )
         try:
             text = check_item_text(joined)
         except MemoryFormatError as exc:
@@ -568,14 +585,20 @@ def parse_items(body: str) -> Tuple[Item, ...]:
     return tuple(items)
 
 
-def render_items(items: Sequence[Item]) -> str:
+def render_items(items: Sequence[Item], *, allow_new: bool = False) -> str:
     """Render anchored items as a markdown list (one trailing newline).
 
     Every item must already carry an anchor; minting is the save pipeline's
-    job, so a render can never invent identities.
+    job, so a render can never invent identities. ``allow_new`` renders an
+    item without one as a new item, for a save to mint its anchor (a
+    maintenance split's pointer, 2.6c).
     """
     out: List[str] = []
     for item in items:
+        if allow_new and not item.anchor:
+            lines = item.text.split("\n")
+            out.extend([f"- {lines[0]}"] + [f"  {line}" if line else "" for line in lines[1:]])
+            continue
         if not item.anchor or not is_valid_anchor(item.anchor):
             raise MemoryFormatError("Every item must have an anchor before it is rendered.", code="missing_anchor")
         lines = item.text.split("\n")

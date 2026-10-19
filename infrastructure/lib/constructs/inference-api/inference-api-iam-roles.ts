@@ -53,6 +53,18 @@ export const RUNTIME_MEMORY_ACTIONS: readonly string[] = [
   'bedrock-agentcore:DeleteMemoryRecord',
 ];
 
+/**
+ * The attributes a `STATS#{slug}` update may touch (Shared Projects 2.6b): the
+ * key, plus what `MemorySpaceRepository.record_retrieval` sets.
+ */
+export const MEMORY_STATS_ATTRIBUTES: readonly string[] = [
+  'PK',
+  'SK',
+  'slug',
+  'retrievalCount',
+  'lastRetrievedAt',
+];
+
 export function createRuntimeExecutionRole(
   scope: Construct,
   config: AppConfig,
@@ -353,15 +365,42 @@ export function createRuntimeExecutionRole(
   }));
 
   // ── Skill reference files (S3, read-only) ──
-  // The runtime is a READER of a skill's reference files (PR-6 progressive
-  // disclosure); app-api owns writes. Provisioned now so PR-6 needs no infra
-  // change. No code consumes it yet.
+  // The runtime reads a skill's reference files (`read_skill_file`, progressive
+  // disclosure) and, since the skill authoring tools (docs/specs/skill-creator.md
+  // D12), writes the invoking user's OWN skill bundles: `my_skill_create` /
+  // `_update` project SKILL.md, `my_skill_write_file` puts a file and
+  // `my_skill_delete_file` garbage-collects the orphaned object. Ownership is
+  // enforced by UserSkillService, not here. Put and delete are scoped to the
+  // live bundle layout under `skills/` (files and SKILL.md). A pinned version's
+  // frozen copies live under `skill-versions/`, outside that grant, so nothing
+  // the runtime does can alter what a pin runs. Whole-skill delete stays
+  // app-api's: no runtime tool exposes it.
   const skillResourcesBucketArn = refs.skillResourcesBucket.bucketArn;
   role.addToPolicy(new iam.PolicyStatement({
     sid: 'SkillResourcesBucketRead',
     effect: iam.Effect.ALLOW,
     actions: ['s3:GetObject', 's3:ListBucket'],
     resources: [skillResourcesBucketArn, `${skillResourcesBucketArn}/*`],
+  }));
+  role.addToPolicy(new iam.PolicyStatement({
+    sid: 'SkillResourcesBucketWrite',
+    effect: iam.Effect.ALLOW,
+    actions: ['s3:PutObject', 's3:DeleteObject'],
+    resources: [`${skillResourcesBucketArn}/skills/*`],
+  }));
+
+  // ── Conversation archive (put, plus the read that guards a re-archive) ──
+  // The after-`done` put of each turn's transcript (conversation search). A
+  // resumed turn re-archives its paused copy, and reads that object first so
+  // it never replaces a different turn's (`put_turn_guarded`). No ListBucket:
+  // a missing key then reads as 403, which the guard treats as "write
+  // create-only". Listing and deleting stay app-api's.
+  const conversationArchiveBucketArn = refs.conversationArchiveBucket.bucketArn;
+  role.addToPolicy(new iam.PolicyStatement({
+    sid: 'ConversationArchivePut',
+    effect: iam.Effect.ALLOW,
+    actions: ['s3:PutObject', 's3:GetObject'],
+    resources: [`${conversationArchiveBucketArn}/conversations/*`],
   }));
 
   // ── Memory Spaces (S3 + DynamoDB, readwrite) ──
@@ -382,6 +421,49 @@ export function createRuntimeExecutionRole(
               'dynamodb:Query', 'dynamodb:BatchWriteItem'],
     resources: [memorySpacesTableArn, `${memorySpacesTableArn}/index/*`],
   }));
+  // A project harness's `memory_read` counts each file it returns in the
+  // file's `STATS#{slug}` row (Shared Projects 2.6b): one UpdateItem that adds
+  // to a counter, so no read-modify-write. `dynamodb:Attributes` pins it to
+  // the stats row's own attributes (with the key), so it can't rewrite a
+  // manifest or a file version; keep the list in step with
+  // `MemorySpaceRepository.record_retrieval`. Its own managed policy rather than
+  // another statement on the role: the role's statements already spill into
+  // CDK overflow policies, packed by a size CDK estimates before ARNs resolve,
+  // and on dev OverflowPolicy1 resolves to 5,473 of IAM's 6,144 characters.
+  // The same packing rolled back the first 2.6a deploy on app-api's role.
+  //
+  // `analyze_spreadsheet` downloads an assistant's knowledge-base spreadsheet
+  // from its original upload in rag-documents (`assistants/{id}/documents/...`),
+  // so the Runtime reads that prefix too; so does full-context mode
+  // (`kb_full_context`), which sends a small knowledge base's uploads whole.
+  // Read-only, no ListBucket: the key
+  // comes from the assistant's DOC# row. It rides this policy for the same
+  // overflow reason, and to add no resource to a stack near 500. Its
+  // description stays as it is: changing it replaces the policy.
+  new iam.ManagedPolicy(scope, 'RuntimeMemoryStatsPolicy', {
+    roles: [role],
+    description: 'AgentCore Runtime: count memory file reads in STATS# rows (Shared Projects 2.6b)',
+    statements: [
+      new iam.PolicyStatement({
+        sid: 'AssistantDocumentsRead',
+        effect: iam.Effect.ALLOW,
+        actions: ['s3:GetObject'],
+        resources: [`${refs.ragDocumentsBucket.bucketArn}/assistants/*`],
+      }),
+      new iam.PolicyStatement({
+        sid: 'MemorySpacesStatsUpdate',
+        effect: iam.Effect.ALLOW,
+        actions: ['dynamodb:UpdateItem'],
+        resources: [memorySpacesTableArn],
+        conditions: {
+          'ForAllValues:StringEquals': {
+            'dynamodb:Attributes': [...MEMORY_STATS_ATTRIBUTES],
+          },
+          StringEqualsIfExists: { 'dynamodb:ReturnValues': 'NONE' },
+        },
+      }),
+    ],
+  });
 
   // ── Shared Projects (DynamoDB) ──
   // The invocation path resolves membership (META + MEMBER#), back-fills a
@@ -394,6 +476,38 @@ export function createRuntimeExecutionRole(
     actions: ['dynamodb:GetItem', 'dynamodb:BatchGetItem', 'dynamodb:Query',
               'dynamodb:UpdateItem'],
     resources: [projectsTableArn, `${projectsTableArn}/index/*`],
+  }));
+  // A member's `memory_propose` tells the project's editors (Shared Projects
+  // 2.5a). Notifications are `INBOX#{email}` rows on this table, so the
+  // Runtime may put rows under that key prefix and no other.
+  role.addToPolicy(new iam.PolicyStatement({
+    sid: 'ProjectsInboxWrite',
+    effect: iam.Effect.ALLOW,
+    actions: ['dynamodb:PutItem', 'dynamodb:BatchWriteItem'],
+    resources: [projectsTableArn],
+    conditions: {
+      'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['INBOX#*'] },
+    },
+  }));
+
+  // ── Shared tasks, read-only (Shared Projects 2.5c) ──
+  // A project harness's `shared_task_read` tool reads one project share by id:
+  // a GetItem on its row and a GetObject on its snapshot body. The Runtime
+  // never lists, writes or deletes shares; app-api owns that surface. Names are
+  // derived from PROJECT_PREFIX in the container (apis/shared/shares/snapshots.py)
+  // because the Runtime's environment has no room for two more variables.
+  const sharedConversationsTableArn = refs.sharedConversationsTable.tableArn;
+  role.addToPolicy(new iam.PolicyStatement({
+    sid: 'SharedConversationsTableRead',
+    effect: iam.Effect.ALLOW,
+    actions: ['dynamodb:GetItem'],
+    resources: [sharedConversationsTableArn],
+  }));
+  role.addToPolicy(new iam.PolicyStatement({
+    sid: 'SharedConversationsBodyRead',
+    effect: iam.Effect.ALLOW,
+    actions: ['s3:GetObject'],
+    resources: [`${refs.sharedConversationsBucket.bucketArn}/shares/*`],
   }));
 
   // ── S3 Vectors (RAG query) ──

@@ -78,9 +78,23 @@ export interface AppConfig {
   platformCosts: PlatformCostsConfig;
   memorySpaces: MemorySpacesConfig;
   projects: ProjectsConfig;
+  userGrants: UserGrantsConfig;
+  sessionPrewarm: SessionPrewarmConfig;
+  clientTurnTiming: ClientTurnTimingConfig;
+  ttftProbe: TtftProbeConfig;
+  memoryLint: MemoryLintConfig;
+  conversationIndex: ConversationIndexConfig;
+  conversationSearch: ConversationSearchConfig;
   platformSelfService: PlatformSelfServiceConfig;
   feedbackEvalSampling: FeedbackEvalSamplingConfig;
   skills: SkillsConfig;
+  skillAuthoring: SkillAuthoringConfig;
+  wordTrackedChanges: WordTrackedChangesConfig;
+  assistantKbFullContext: AssistantKbFullContextConfig;
+  largeDocumentAttachments: LargeDocumentAttachmentsConfig;
+  attachmentKb: AttachmentKbConfig;
+  folderAttachments: FolderAttachmentsConfig;
+  folderSync: FolderSyncConfig;
   agents: AgentsConfig;
   agentMarketplace: AgentMarketplaceConfig;
   dictation: DictationConfig;
@@ -97,6 +111,37 @@ export interface AppConfig {
    */
   tokenExchange?: TokenExchangeConfig;
   observability: ObservabilityConfig;
+  /**
+   * How many days a conversation's content is kept after each turn, wherever
+   * it is stored (docs/specs/conversation-search.md §3). One number for every
+   * copy so the clocks cannot drift: today it sets AgentCore Memory's
+   * `eventExpiryDuration` (clamped to Memory's 365-day maximum); the
+   * conversation archive's lifecycle rule (`ConversationArchiveConstruct`)
+   * takes the raw value, and the search index follows the archive. Long-term
+   * memory records (facts, preferences) are unaffected.
+   *
+   * Integer >= 3. Values above 365 are accepted here because the archive can
+   * honour them; Memory still stops at 365.
+   */
+  conversationRetentionDays: number;
+  /**
+   * Whether `conversationRetentionDays` also removes session rows
+   * (CONVERSATION_RETENTION_PRUNES_SESSIONS, from
+   * CDK_CONVERSATION_RETENTION_PRUNES_SESSIONS). Default **true**, `false`
+   * opts out: a feature switch, permanent (docs/specs/conversation-search.md
+   * §3). On does not delete by itself; see `conversationRetentionPruneArmed`.
+   */
+  conversationRetentionPrunesSessions: boolean;
+  /**
+   * Whether the daily retention pruner may delete session rows rather than
+   * only report them (CONVERSATION_RETENTION_PRUNE_ARMED, from
+   * CDK_CONVERSATION_RETENTION_PRUNE_ARMED). Default **false**, the same
+   * inverted convention as `managedKb.reconcilerArmed`: the task is deployed
+   * and runs from day one, report-only, until an environment arms it. Even
+   * armed, the first run in an environment is a dry run (the pruner keeps the
+   * record in SSM).
+   */
+  conversationRetentionPruneArmed: boolean;
   appVersion: string;
   tags: { [key: string]: string };
 }
@@ -186,6 +231,18 @@ export interface AppApiConfig {
   desiredCount: number;
   maxCapacity: number;
   additionalCorsOrigins?: string; // Extra CORS origins to append (comma-separated)
+  /**
+   * How many `POST /chat/api-converse` Bedrock calls one app-api task runs at
+   * once (API_CONVERSE_MAX_IN_FLIGHT, from CDK_APP_API_CONVERSE_MAX_IN_FLIGHT).
+   * The route runs boto3 on a worker pool of exactly this many threads; a call
+   * past the cap is refused at once with HTTP 429 + `Retry-After` rather than
+   * queued against the ALB's 60s idle timeout. The 60/min per-key rate limit
+   * measures rate; this measures concurrency, which is what exhausted the
+   * task in the 2026-10 batch-job bursts. Integer >= 1, default 16. Raise it
+   * with the task's CPU: each in-flight call holds a thread for the life of
+   * the model call (tens of seconds for a long completion).
+   */
+  apiConverseMaxInFlight: number;
 }
 
 /**
@@ -197,6 +254,16 @@ export interface AppApiConfig {
  */
 export interface InferenceApiConfig {
   additionalCorsOrigins?: string; // Extra CORS origins to append (comma-separated)
+  /**
+   * AgentCore Runtime platform version (`PlatformVersion` on the Runtime,
+   * from CDK_AGENTCORE_RUNTIME_PLATFORM_VERSION). `V1` (the default) or `V2`,
+   * the Runtime that reclaims idle memory mid-session and restores sessions
+   * from a snapshot. Always written explicitly, never omitted, so switching
+   * back to V1 is an in-place update CloudFormation is told about rather than
+   * a property removal whose effect is up to the service. See
+   * docs/specs/agentcore-runtime-v2.md.
+   */
+  runtimePlatformVersion: string;
 }
 
 export interface RagIngestionConfig {
@@ -355,15 +422,179 @@ export interface MemorySpacesConfig {
 }
 
 /**
- * Shared Projects feature flag (docs/specs/shared-projects.md). **Opt-in while the
- * feature is in development**: off unless CDK_PROJECTS_ENABLED=true (or a
- * `projects.enabled: true` cdk.json context), so a deployment turns it on by choice.
- * See CLAUDE.md "Feature flags". Sets the PROJECTS_ENABLED env var
- * on app-api and inference-api. The projects table is provisioned
+ * Shared Projects feature flag (docs/specs/shared-projects.md). **Default ON with a
+ * kill switch**: on unless CDK_PROJECTS_ENABLED=false (or a `projects.enabled: false`
+ * cdk.json context). A feature switch, see CLAUDE.md "Feature flags". Sets the
+ * PROJECTS_ENABLED env var on app-api and inference-api. The projects table is provisioned
  * unconditionally, so this only gates route mounting and the project harness on
  * the invocation path at runtime.
  */
 export interface ProjectsConfig {
+  enabled: boolean;
+}
+
+/**
+ * Direct user grants (tools, models and skills granted to one user beside their
+ * roles). **Default ON with a kill switch**: on unless CDK_USER_GRANTS_ENABLED=false
+ * (or a `userGrants.enabled: false` cdk.json context). A feature switch, see
+ * CLAUDE.md "Feature flags". Sets USER_GRANTS_ENABLED on **app-api only**: it
+ * gates the admin write surface (`/admin/user-grants`), and permission resolution
+ * reads an existing grant row wherever it runs without a switch — the AgentCore
+ * Runtime is at its environment-variable cap, and an absent row is the off state
+ * (see `user_grants_enabled` in `apis/shared/feature_flags.py`).
+ */
+export interface UserGrantsConfig {
+  enabled: boolean;
+}
+
+/**
+ * Session prewarm (docs/specs/agentcore-runtime-v2.md §5a). **Opt-in while the
+ * feature is in development**: off unless CDK_SESSION_PREWARM_ENABLED=true (or a
+ * `sessionPrewarm.enabled: true` cdk.json context). Sets SESSION_PREWARM_ENABLED
+ * on **app-api only**, which serves `POST /chat/prewarm`: it forwards a no-op
+ * `warm` invocation so a conversation's Runtime microVM starts before its first
+ * send. The Runtime needs no copy (the warm action is a no-op behind the route),
+ * so it spends none of the Runtime's environment-variable budget. It spends
+ * Runtime session time on conversations nobody sends, so it is cheap on V2,
+ * which reclaims idle memory, and billed at peak memory on V1.
+ */
+export interface SessionPrewarmConfig {
+  enabled: boolean;
+}
+
+/**
+ * Client-measured time to first token (docs/specs/turn-path-ttft.md §6).
+ * **Default ON with a kill switch**: on unless CDK_CLIENT_TURN_TIMING_ENABLED=false
+ * (or a `clientTurnTiming.enabled: false` cdk.json context). A feature switch. Sets
+ * CLIENT_TURN_TIMING_ENABLED on **app-api only**, which serves
+ * `POST /telemetry/turn-timing`: the SPA reports each turn's
+ * send-to-first-token, and app-api records it as EMF in AgentCoreStack/TurnLatency.
+ * It is the only metric covering the browser, the app-api hop, Runtime routing
+ * and session start. Spends none of the Runtime's environment budget.
+ */
+export interface ClientTurnTimingConfig {
+  enabled: boolean;
+}
+
+/**
+ * Scheduled time-to-first-token probe (docs/specs/turn-path-ttft.md §6E). Not a
+ * feature flag: operational configuration. Enabled when CDK_TTFT_PROBE_USER_ID
+ * names a user (Cognito sub) with an active headless grant; the probe acts as
+ * that user, hourly, and its turns count against their quota. Unset (the
+ * default) leaves the schedule DISABLED and creates no alarm.
+ * CDK_TTFT_PROBE_MODEL_ID pins the model; unset means the user's default, which
+ * moves the baseline whenever the default changes.
+ */
+export interface TtftProbeConfig {
+  userId: string;
+  modelId: string;
+}
+
+/** What the project-memory content lint does with a finding. */
+export type MemoryLintMode = 'off' | 'warn' | 'block';
+
+/**
+ * Content lint for project memory (Shared Projects 2.7, docs/specs/shared-projects.md
+ * §9.3). A deterministic pattern check on text entering a project's memory; it
+ * applies only inside Shared Projects, so PROJECTS_ENABLED is its gate and this is
+ * configuration, not a feature flag.
+ *
+ * - `mode` (CDK_MEMORY_LINT_MODE): `warn` (default, decided 2026-09-22) saves and
+ *   reports a finding, `block` refuses the save, `off` skips the check.
+ * - `sensitivePatterns` (CDK_MEMORY_SENSITIVE_PATTERNS): the deployment's own
+ *   patterns, Python regular expressions, as a JSON list of strings or
+ *   `{"pattern", "label"}` objects, or one pattern per line. Empty = none.
+ *   Forwarded verbatim; the backend skips (and logs) a pattern it can't compile.
+ *
+ * app-api and the maintenance worker get MEMORY_LINT_MODE and
+ * MEMORY_SENSITIVE_PATTERNS. The AgentCore Runtime's environment is near both of
+ * its caps (50 variables; 2,560 bytes on V2), so it gets one small MEMORY_LINT
+ * value (the mode, and a hash of the patterns) and reads the patterns from the
+ * SSM parameter `/{prefix}/memory/sensitive-patterns`, created only when there are
+ * some (inference-agentcore-construct.ts).
+ */
+export interface MemoryLintConfig {
+  mode: MemoryLintMode;
+  sensitivePatterns: string;
+}
+
+/**
+ * Bounded so the patterns fit a Lambda's 4 KB environment beside the worker's
+ * other variables, and a standard-tier SSM parameter (4 KB).
+ */
+export const MEMORY_SENSITIVE_PATTERNS_MAX_CHARS = 3000;
+
+const MEMORY_LINT_MODES: readonly MemoryLintMode[] = ['off', 'warn', 'block'];
+
+/** Parse and check the lint settings at synth, so a typo fails the deploy rather than every save. */
+export function parseMemoryLintConfig(rawMode: string | undefined, rawPatterns: unknown): MemoryLintConfig {
+  const modeText = (rawMode ?? '').trim().toLowerCase();
+  const mode = (modeText || 'warn') as MemoryLintMode;
+  if (!MEMORY_LINT_MODES.includes(mode)) {
+    throw new Error(`CDK_MEMORY_LINT_MODE must be off, warn or block (got "${rawMode}").`);
+  }
+  // A cdk.json context may give the list as JSON rather than as a string.
+  const sensitivePatterns = (
+    Array.isArray(rawPatterns) ? JSON.stringify(rawPatterns) : typeof rawPatterns === 'string' ? rawPatterns : ''
+  ).trim();
+  if (sensitivePatterns.length > MEMORY_SENSITIVE_PATTERNS_MAX_CHARS) {
+    throw new Error(
+      `CDK_MEMORY_SENSITIVE_PATTERNS is ${sensitivePatterns.length} characters; the limit is ` +
+        `${MEMORY_SENSITIVE_PATTERNS_MAX_CHARS}, so it fits a Lambda environment.`,
+    );
+  }
+  if (sensitivePatterns.startsWith('[')) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(sensitivePatterns);
+    } catch {
+      throw new Error('CDK_MEMORY_SENSITIVE_PATTERNS starts with "[" but is not valid JSON.');
+    }
+    const ok =
+      Array.isArray(parsed) &&
+      parsed.every(
+        (entry) =>
+          (typeof entry === 'string' && entry.trim() !== '') ||
+          (typeof entry === 'object' &&
+            entry !== null &&
+            typeof (entry as { pattern?: unknown }).pattern === 'string' &&
+            ((entry as { label?: unknown }).label === undefined ||
+              typeof (entry as { label?: unknown }).label === 'string')),
+      );
+    if (!ok) {
+      throw new Error(
+        'CDK_MEMORY_SENSITIVE_PATTERNS must be a JSON list of pattern strings or {"pattern", "label"} objects.',
+      );
+    }
+  }
+  return { mode, sensitivePatterns };
+}
+
+/**
+ * Conversation index write path (docs/specs/conversation-search.md §4).
+ * **Opt-in while in development**: off unless CDK_CONVERSATION_INDEX_ENABLED=true
+ * (or a `conversationIndex.enabled: true` cdk.json context). Sets
+ * CONVERSATION_INDEX_ENABLED on app-api and the AgentCore Runtime, which gates
+ * every write to the conversation archive (the runtime's after-`done` put and
+ * app-api's fork copy). The archive bucket is provisioned unconditionally, and
+ * deleting a session's archive objects does not wait on this flag: a deployment
+ * that turns indexing off must still be able to remove what it already wrote.
+ */
+export interface ConversationIndexConfig {
+  enabled: boolean;
+}
+
+/**
+ * Conversation search read path (docs/specs/conversation-search.md §5).
+ * **Default ON with a kill switch**: only CDK_CONVERSATION_SEARCH_ENABLED=false
+ * (or a `conversationSearch.enabled: false` cdk.json context) turns it off. Sets
+ * CONVERSATION_SEARCH_ENABLED on app-api, which serves `GET /sessions/search`
+ * only while it is on. Nothing on the AgentCore Runtime reads it, so it spends
+ * none of the Runtime's environment-variable budget. Separate from
+ * `conversationIndex`, which stays opt-in: with the index off, search matches
+ * titles and opening prompts only and makes no knowledge-base calls.
+ */
+export interface ConversationSearchConfig {
   enabled: boolean;
 }
 
@@ -407,6 +638,118 @@ export interface FeedbackEvalSamplingConfig {
  * can reach *which* skills is a role's `grantedSkills`, edited in that UI.
  */
 export interface SkillsConfig {
+  enabled: boolean;
+}
+
+/**
+ * Skill authoring tools (docs/specs/skill-creator.md D12): the seven `my_skill_*`
+ * agent tools that create and edit the invoking user's own skills. **Default ON
+ * with a kill switch**: on unless CDK_SKILL_AUTHORING_ENABLED=false (or a
+ * `skillAuthoring.enabled: false` cdk.json context). A feature switch. Sets
+ * SKILL_AUTHORING_ENABLED=false on the AgentCore Runtime only, and only while off,
+ * so an environment on the default spends none of the Runtime's environment budget.
+ * No app-api or SPA switch: the tools run in the Runtime and reuse the existing
+ * approval card. ANDs with `skills.enabled` and the `my_skill_create` tool grant,
+ * which no role holds until an admin grants it.
+ */
+export interface SkillAuthoringConfig {
+  enabled: boolean;
+}
+
+/**
+ * Word tracked changes (docs/specs/word-tracked-changes.md): a .docx's tracked
+ * changes reach the model written out as `[deleted: …]` / `[inserted: …]`, and
+ * the Word tools gain `redline_word_document`. **Default ON with a kill switch**:
+ * on unless CDK_WORD_TRACKED_CHANGES_ENABLED=false (or a
+ * `wordTrackedChanges.enabled: false` cdk.json context). A feature switch. Sets
+ * WORD_TRACKED_CHANGES_ENABLED on app-api, which builds the upload digest whose
+ * paragraph numbers must match `document_read`'s, and on the AgentCore Runtime
+ * only while off, so an environment on the default spends none of the Runtime's
+ * environment budget. No SPA switch.
+ */
+export interface WordTrackedChangesConfig {
+  enabled: boolean;
+}
+
+/**
+ * Assistant knowledge base full-context mode
+ * (backend/src/apis/shared/assistants/kb_full_context.py): when an assistant's
+ * whole knowledge base fits the token budget (50,000 by default, the Runtime's
+ * `ASSISTANT_KB_FULL_CONTEXT_MAX_TOKENS`), the full text of its documents goes
+ * at the end of the system prompt instead of retrieved chunks in the user
+ * message. **Opt-in while in development**: off unless
+ * CDK_ASSISTANT_KB_FULL_CONTEXT_ENABLED=true (or an
+ * `assistantKbFullContext.enabled: true` cdk.json context). While on, sets
+ * ASSISTANT_KB_FULL_CONTEXT_ENABLED on the AgentCore Runtime; while off, the
+ * variable is absent. The text comes from the documents bucket, which the
+ * Runtime can always read (`AssistantDocumentsRead`). No SPA switch.
+ */
+export interface AssistantKbFullContextConfig {
+  enabled: boolean;
+}
+
+/**
+ * Large document attachments (docs/specs/large-document-attachments.md): a
+ * pdf, docx, txt, md or html attachment over the 4 MB inline limit is attached
+ * by reference and read through `document_read` from sidecars a preparation
+ * Lambda builds. **Default ON with a kill switch**: on unless
+ * CDK_LARGE_DOCUMENT_ATTACHMENTS_ENABLED=false (or a
+ * `largeDocumentAttachments.enabled: false` cdk.json context). A feature switch:
+ * while on, the `LargeDocumentPrepareConstruct` (prepare queue, its dead-letter
+ * queue, the Lambda) adds about 11 resources; while off it is not synthesized
+ * at all. Sets LARGE_DOCUMENT_ATTACHMENTS_ENABLED
+ * and, while on, the prepare queue's URL on **app-api only**: the Runtime reads
+ * a prepared file by its row, never by a switch, so it spends none of its
+ * environment budget.
+ */
+export interface LargeDocumentAttachmentsConfig {
+  enabled: boolean;
+}
+
+/**
+ * The shared `attachments` managed knowledge base for large documents
+ * (docs/specs/large-document-attachments.md §4E, Tier 2). **Opt-in while in
+ * development**: off unless CDK_ATTACHMENT_KB_ENABLED=true (or an
+ * `attachmentKb.enabled: true` cdk.json context), and refused without
+ * `largeDocumentAttachments.enabled`, because it rides the large-document
+ * pipeline: the prepare Lambda also ingests, removes and evicts documents.
+ * While on it adds two resources (an S3 Object Deleted rule and a daily
+ * schedule, both targeting the prepare queue), turns on the user-files bucket's
+ * EventBridge delivery, and grants on existing roles. Sets
+ * ATTACHMENT_KB_ENABLED on the prepare Lambda and app-api. The knowledge base
+ * itself is created on first ingest, never by CloudFormation.
+ */
+export interface AttachmentKbConfig {
+  enabled: boolean;
+}
+
+/**
+ * Folder attachments (docs/specs/drive-folder-attachments.md): a conversation
+ * can attach a Google Drive folder, whose readable files app-api imports as
+ * session files delivered by reference whatever their size. **Default ON with a
+ * kill switch**, following `largeDocumentAttachments.enabled` when
+ * CDK_FOLDER_ATTACHMENTS_ENABLED (and the `folderAttachments.enabled` cdk.json
+ * context) is unset, and refused on without it, because a folder file is read
+ * through the prepare Lambda's sidecars: without that pipeline there is nothing
+ * to read a small file through. A feature switch. Sets FOLDER_ATTACHMENTS_ENABLED
+ * on app-api (the routes and the expansion task) and, only while off, on the
+ * AgentCore Runtime (a turn's folder manifests). No resources.
+ */
+export interface FolderAttachmentsConfig {
+  enabled: boolean;
+}
+
+/**
+ * Folder sync (docs/specs/assistant-kb-sync.md §11): a `drive_folder` KB sync
+ * policy keeps a knowledge base (a project saved from a Drive folder) in step
+ * with that folder on the existing kb-sync dispatcher and worker. **Default ON
+ * with a kill switch**: on unless CDK_FOLDER_SYNC_ENABLED=false (or a
+ * `folderSync.enabled: false` cdk.json context). A feature switch. Sets
+ * FOLDER_SYNC_ENABLED on app-api (creating a folder policy) and on both kb-sync
+ * Lambdas (running one).
+ * No resources: the worker already holds every grant a folder run uses.
+ */
+export interface FolderSyncConfig {
   enabled: boolean;
 }
 
@@ -575,6 +918,43 @@ export interface TokenExchangeConfig {
   /** client_id this deployment authenticates as. */
   clientId: string;
 }
+
+/**
+ * Default for `conversationRetentionDays` (CDK_CONVERSATION_RETENTION_DAYS).
+ * A year, because that is the most AgentCore Memory can hold and the first
+ * setting should be one every copy of a conversation can honour.
+ */
+export const CONVERSATION_RETENTION_DAYS_DEFAULT = 365;
+
+/**
+ * Default for `inferenceApi.runtimePlatformVersion`
+ * (CDK_AGENTCORE_RUNTIME_PLATFORM_VERSION). V1 is what every Runtime created
+ * before V2 reports, so the default changes nothing on an existing stack.
+ */
+export const AGENTCORE_RUNTIME_PLATFORM_VERSION_DEFAULT = 'V1';
+
+/**
+ * Platform versions the AgentCore Runtime accepts. The CloudFormation schema
+ * takes any non-blank string, so the list is ours: a typo like `v2` or `2`
+ * fails synth instead of reaching the service. Add a version here when AWS
+ * ships one.
+ */
+export const AGENTCORE_RUNTIME_PLATFORM_VERSIONS = ['V1', 'V2'] as const;
+
+/**
+ * Default for `appApi.apiConverseMaxInFlight` (CDK_APP_API_CONVERSE_MAX_IN_FLIGHT).
+ * Mirrors `DEFAULT_MAX_IN_FLIGHT` in backend/src/apis/app_api/chat/bedrock_offload.py,
+ * which is what a task falls back to when the variable is absent; keep the two
+ * in step so a CDK deploy and a bare container behave the same.
+ */
+export const API_CONVERSE_MAX_IN_FLIGHT_DEFAULT = 16;
+
+/**
+ * AgentCore Memory's `EventExpiryDuration` range, in days, per the
+ * `AWS::BedrockAgentCore::Memory` CloudFormation reference.
+ */
+export const AGENTCORE_MEMORY_EVENT_EXPIRY_MIN_DAYS = 3;
+export const AGENTCORE_MEMORY_EVENT_EXPIRY_MAX_DAYS = 365;
 
 // Observability defaults. Tuned for cost: these are what a fork inherits when it
 // configures nothing. See .kiro/steering/observability.md.
@@ -798,6 +1178,12 @@ export function loadConfig(scope: cdk.App): AppConfig {
   validateAwsAccount(awsAccount);
   validateAwsRegion(awsRegion);
 
+  // Large document attachments: default ON with a kill switch. Read once here
+  // because folder attachments' default follows it.
+  const largeDocumentAttachmentsEnabled: boolean = process.env.CDK_LARGE_DOCUMENT_ATTACHMENTS_ENABLED
+    ? process.env.CDK_LARGE_DOCUMENT_ATTACHMENTS_ENABLED.trim().toLowerCase() !== 'false'
+    : scope.node.tryGetContext('largeDocumentAttachments')?.enabled ?? true;
+
   // Top-level shared CORS origins — always includes https://{domainName} when set.
   // CDK_CORS_ORIGINS provides ADDITIONAL origins on top of the domain.
   const domainName = process.env.CDK_DOMAIN_NAME || scope.node.tryGetContext('domainName');
@@ -894,10 +1280,28 @@ export function loadConfig(scope: cdk.App): AppConfig {
       maxCapacity: parseIntEnv(process.env.CDK_APP_API_MAX_CAPACITY)
         ?? parseIntEnv(scope.node.tryGetContext('appApi.maxCapacity'))
         ?? scope.node.tryGetContext('appApi')?.maxCapacity,
+      // Same precedence as the sizing knobs, then the committed default.
+      // requireWholeNumber first: parseIntEnv would turn "8.5" into 8 and
+      // "abc" into the default, hiding a typo behind a silently different cap.
+      apiConverseMaxInFlight:
+        parseIntEnv(requireWholeNumber(
+          'CDK_APP_API_CONVERSE_MAX_IN_FLIGHT', process.env.CDK_APP_API_CONVERSE_MAX_IN_FLIGHT))
+        ?? parseIntEnv(requireWholeNumber(
+          'context appApi.apiConverseMaxInFlight', scope.node.tryGetContext('appApi.apiConverseMaxInFlight')))
+        ?? parseIntEnv(requireWholeNumber(
+          'context appApi.apiConverseMaxInFlight', scope.node.tryGetContext('appApi')?.apiConverseMaxInFlight))
+        ?? API_CONVERSE_MAX_IN_FLIGHT_DEFAULT,
       additionalCorsOrigins: process.env.CDK_APP_API_CORS_ORIGINS || scope.node.tryGetContext('appApi')?.additionalCorsOrigins,
     },
     inferenceApi: {
       additionalCorsOrigins: process.env.CDK_INFERENCE_API_CORS_ORIGINS || scope.node.tryGetContext('inferenceApi')?.additionalCorsOrigins,
+      // env var > flat context > nested context > default. `||`, not `??`:
+      // an unset GitHub variable arrives as '' and must fall through.
+      runtimePlatformVersion:
+        process.env.CDK_AGENTCORE_RUNTIME_PLATFORM_VERSION?.trim()
+        || scope.node.tryGetContext('inferenceApi.runtimePlatformVersion')
+        || scope.node.tryGetContext('inferenceApi')?.runtimePlatformVersion
+        || AGENTCORE_RUNTIME_PLATFORM_VERSION_DEFAULT,
     },
     ragIngestion: {
       additionalCorsOrigins: process.env.CDK_RAG_CORS_ORIGINS || scope.node.tryGetContext('ragIngestion')?.additionalCorsOrigins,
@@ -1061,12 +1465,57 @@ export function loadConfig(scope: cdk.App): AppConfig {
         : scope.node.tryGetContext('memorySpaces')?.enabled ?? true,
     },
     projects: {
-      // Opt-in while in development (CLAUDE.md "Feature flags"): only the literal
-      // "true" turns it on. The workflow forwards an EMPTY STRING when the variable
-      // is unset, which falls through to the context and then to off.
+      // Default ON with a kill switch (CLAUDE.md "Feature flags"): only the literal
+      // "false" turns it off. The workflow forwards an EMPTY STRING when the
+      // variable is unset, which falls through to the context and then to on.
       enabled: process.env.CDK_PROJECTS_ENABLED
-        ? process.env.CDK_PROJECTS_ENABLED.trim().toLowerCase() === 'true'
-        : scope.node.tryGetContext('projects')?.enabled ?? false,
+        ? process.env.CDK_PROJECTS_ENABLED.trim().toLowerCase() !== 'false'
+        : scope.node.tryGetContext('projects')?.enabled ?? true,
+    },
+    userGrants: {
+      // Default ON with a kill switch, same parsing as projects above.
+      enabled: process.env.CDK_USER_GRANTS_ENABLED
+        ? process.env.CDK_USER_GRANTS_ENABLED.trim().toLowerCase() !== 'false'
+        : scope.node.tryGetContext('userGrants')?.enabled ?? true,
+    },
+    sessionPrewarm: {
+      // Opt-in while in development (CLAUDE.md "Feature flags"): only the literal
+      // "true" turns it on; an unset workflow variable arrives as "" and is off.
+      enabled: process.env.CDK_SESSION_PREWARM_ENABLED
+        ? process.env.CDK_SESSION_PREWARM_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('sessionPrewarm')?.enabled ?? false,
+    },
+    clientTurnTiming: {
+      // Default ON with a kill switch, same parsing as projects above.
+      enabled: process.env.CDK_CLIENT_TURN_TIMING_ENABLED
+        ? process.env.CDK_CLIENT_TURN_TIMING_ENABLED.trim().toLowerCase() !== 'false'
+        : scope.node.tryGetContext('clientTurnTiming')?.enabled ?? true,
+    },
+    ttftProbe: {
+      // Configuration, not a flag: unset workflow variables arrive as "".
+      userId: (process.env.CDK_TTFT_PROBE_USER_ID || scope.node.tryGetContext('ttftProbe')?.userId || '').trim(),
+      modelId: (process.env.CDK_TTFT_PROBE_MODEL_ID || scope.node.tryGetContext('ttftProbe')?.modelId || '').trim(),
+    },
+    // Project-memory content lint: configuration of Shared Projects, not a flag.
+    // The workflow forwards an EMPTY STRING when a variable is unset, which falls
+    // through to the context and then to the defaults (warn, no patterns).
+    memoryLint: parseMemoryLintConfig(
+      process.env.CDK_MEMORY_LINT_MODE || scope.node.tryGetContext('memoryLint')?.mode,
+      process.env.CDK_MEMORY_SENSITIVE_PATTERNS || scope.node.tryGetContext('memoryLint')?.sensitivePatterns,
+    ),
+    conversationIndex: {
+      // Opt-in while in development, same parsing as projects above.
+      enabled: process.env.CDK_CONVERSATION_INDEX_ENABLED
+        ? process.env.CDK_CONVERSATION_INDEX_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('conversationIndex')?.enabled ?? false,
+    },
+    conversationSearch: {
+      // Default on: the workflow forwards an EMPTY STRING when the variable is
+      // unset, which falls through to the context and then to on. Only the
+      // literal "false" (any case) is the off switch.
+      enabled: process.env.CDK_CONVERSATION_SEARCH_ENABLED
+        ? process.env.CDK_CONVERSATION_SEARCH_ENABLED.trim().toLowerCase() !== 'false'
+        : scope.node.tryGetContext('conversationSearch')?.enabled ?? true,
     },
     platformSelfService: {
       // Opt-in while in development (CLAUDE.md "Feature flags"): only the literal
@@ -1088,6 +1537,50 @@ export function loadConfig(scope: cdk.App): AppConfig {
       enabled: process.env.CDK_SKILLS_ENABLED
         ? process.env.CDK_SKILLS_ENABLED !== 'false'
         : scope.node.tryGetContext('skills')?.enabled ?? true,
+    },
+    skillAuthoring: {
+      // Default ON with a kill switch, same parsing as projects above: '' (an
+      // unset workflow variable) and anything but "false" are on.
+      enabled: process.env.CDK_SKILL_AUTHORING_ENABLED
+        ? process.env.CDK_SKILL_AUTHORING_ENABLED.trim().toLowerCase() !== 'false'
+        : scope.node.tryGetContext('skillAuthoring')?.enabled ?? true,
+    },
+    wordTrackedChanges: {
+      // Default ON with a kill switch, same parsing as skillAuthoring above.
+      enabled: process.env.CDK_WORD_TRACKED_CHANGES_ENABLED
+        ? process.env.CDK_WORD_TRACKED_CHANGES_ENABLED.trim().toLowerCase() !== 'false'
+        : scope.node.tryGetContext('wordTrackedChanges')?.enabled ?? true,
+    },
+    assistantKbFullContext: {
+      // Opt-in while in development: '' (an unset workflow variable) and
+      // anything but "true" are off.
+      enabled: process.env.CDK_ASSISTANT_KB_FULL_CONTEXT_ENABLED
+        ? process.env.CDK_ASSISTANT_KB_FULL_CONTEXT_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('assistantKbFullContext')?.enabled ?? false,
+    },
+    largeDocumentAttachments: {
+      // Default ON with a kill switch, same parsing as skillAuthoring above.
+      enabled: largeDocumentAttachmentsEnabled,
+    },
+    attachmentKb: {
+      // Opt-in while in development, same parsing as assistantKbFullContext.
+      enabled: process.env.CDK_ATTACHMENT_KB_ENABLED
+        ? process.env.CDK_ATTACHMENT_KB_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('attachmentKb')?.enabled ?? false,
+    },
+    folderAttachments: {
+      // Default ON with a kill switch, same parsing as skillAuthoring, except that
+      // unset follows large-document attachments: a deployment that turns those
+      // off loses folder attachments with them instead of failing synth.
+      enabled: process.env.CDK_FOLDER_ATTACHMENTS_ENABLED
+        ? process.env.CDK_FOLDER_ATTACHMENTS_ENABLED.trim().toLowerCase() !== 'false'
+        : scope.node.tryGetContext('folderAttachments')?.enabled ?? largeDocumentAttachmentsEnabled,
+    },
+    folderSync: {
+      // Default ON with a kill switch, same parsing as skillAuthoring above.
+      enabled: process.env.CDK_FOLDER_SYNC_ENABLED
+        ? process.env.CDK_FOLDER_SYNC_ENABLED.trim().toLowerCase() !== 'false'
+        : scope.node.tryGetContext('folderSync')?.enabled ?? true,
     },
     agents: {
       // Default ON with a kill switch (house style, mirroring memorySpaces /
@@ -1240,6 +1733,29 @@ export function loadConfig(scope: cdk.App): AppConfig {
           clientId: tokenExchangeClientId,
         }
       : undefined,
+    // Env > context > default, as for the sizing knobs. parseIntEnv maps the
+    // '' an unset GitHub variable arrives as to undefined, so `??` falls
+    // through to 365. It also maps junk to undefined and truncates "30.5" to
+    // 30, which would hide a typo behind a silently different retention, so
+    // requireWholeNumber rejects anything that is not digits first.
+    conversationRetentionDays:
+      parseIntEnv(requireWholeNumber(
+        'CDK_CONVERSATION_RETENTION_DAYS', process.env.CDK_CONVERSATION_RETENTION_DAYS))
+      ?? parseIntEnv(requireWholeNumber(
+        'context conversationRetentionDays', scope.node.tryGetContext('conversationRetentionDays')))
+      ?? CONVERSATION_RETENTION_DAYS_DEFAULT,
+    // Default ON with a kill switch: "false"/"0" turns it off, an unset GitHub
+    // variable ('') falls through to the context and then to on, and any other
+    // value fails the synth rather than guessing.
+    conversationRetentionPrunesSessions:
+      parseBooleanEnv(process.env.CDK_CONVERSATION_RETENTION_PRUNES_SESSIONS)
+      ?? parseBooleanEnv(contextString(scope, 'conversationRetentionPrunesSessions'))
+      ?? true,
+    // Inverted, like managedKb.reconcilerArmed: unset or '' is disarmed.
+    conversationRetentionPruneArmed:
+      parseBooleanEnv(process.env.CDK_CONVERSATION_RETENTION_PRUNE_ARMED)
+      ?? parseBooleanEnv(contextString(scope, 'conversationRetentionPruneArmed'))
+      ?? false,
     // Same precedence as managedKb above. The flat dotted read at step 2 is
     // load-bearing: `--context observability.x=y` sets context['observability.x'],
     // it does NOT build a nested object.
@@ -1410,6 +1926,13 @@ export function loadConfig(scope: cdk.App): AppConfig {
     + ` runtimeLogRetentionSweep=${config.observability.runtimeLogRetentionSweepEnabled}`
   );
 
+  console.log(
+    `   Conversation retention: ${config.conversationRetentionDays} days`
+    + ` (Memory events: ${Math.min(config.conversationRetentionDays, AGENTCORE_MEMORY_EVENT_EXPIRY_MAX_DAYS)})`
+    + ` index writes=${config.conversationIndex.enabled}`
+    + ` search=${config.conversationSearch.enabled}`
+  );
+
   // Printed because this list is a security control supplied entirely from
   // outside the repo: a deploy that ships an empty one has to say so, or a
   // forgotten `CDK_BROWSER_URL_BLOCKLIST` variable is indistinguishable in
@@ -1467,6 +1990,15 @@ export function parseListEnv(value: string | undefined): string[] | undefined {
  * @returns The parsed boolean, or undefined if unset and no default provided
  * @throws Error if the value is present but invalid
  */
+/**
+ * A context value as a string, for the env parsers: `cdk.json` may hold a
+ * real boolean or number where `--context` always gives a string.
+ */
+function contextString(scope: cdk.App, key: string): string | undefined {
+  const value = scope.node.tryGetContext(key);
+  return value === undefined || value === null ? undefined : String(value);
+}
+
 export function parseBooleanEnv(value: string | undefined): boolean | undefined;
 export function parseBooleanEnv(value: string | undefined, defaultValue: boolean): boolean;
 export function parseBooleanEnv(value: string | undefined, defaultValue?: boolean): boolean | undefined {
@@ -1498,6 +2030,28 @@ function parseIntEnv(value: string | undefined): number | undefined {
   }
   const parsed = parseInt(value, 10);
   return isNaN(parsed) ? undefined : parsed;
+}
+
+/**
+ * Pass a whole-number setting through to parseIntEnv, or fail synth.
+ *
+ * parseIntEnv is deliberately lenient (junk becomes undefined, "30.5" becomes
+ * 30) so a fallback can take over. For a setting where a typo would quietly
+ * apply a different value than the operator meant, that leniency hides the
+ * mistake, so this rejects anything other than plain digits. Unset and ''
+ * still pass through as undefined.
+ */
+function requireWholeNumber(source: string, value: unknown): string | undefined {
+  if (value === undefined || value === null || value === '') {
+    return undefined;
+  }
+  const text = String(value).trim();
+  if (!/^\d+$/.test(text)) {
+    throw new Error(
+      `Invalid ${source}: "${String(value)}". Expected a whole number.`
+    );
+  }
+  return text;
 }
 
 /**
@@ -1661,6 +2215,21 @@ export function validateAwsRegion(region: string): void {
  * Validate configuration values
  */
 function validateConfig(config: AppConfig): void {
+  // The attachments KB rides the large-document pipeline (its queue and Lambda).
+  if (config.attachmentKb.enabled && !config.largeDocumentAttachments.enabled) {
+    throw new Error(
+      'CDK_ATTACHMENT_KB_ENABLED=true requires CDK_LARGE_DOCUMENT_ATTACHMENTS_ENABLED (on by default): '
+      + 'the attachments knowledge base is fed by the large-document preparation pipeline.',
+    );
+  }
+  // A folder's files are read through the prepare Lambda's sidecars.
+  if (config.folderAttachments.enabled && !config.largeDocumentAttachments.enabled) {
+    throw new Error(
+      'CDK_FOLDER_ATTACHMENTS_ENABLED=true requires CDK_LARGE_DOCUMENT_ATTACHMENTS_ENABLED (on by default): '
+      + 'a folder\'s files are delivered by reference and read from the sidecars the large-document pipeline prepares.',
+    );
+  }
+
   // Validate project prefix
   if (!/^[a-z][a-z0-9-]{1,20}$/.test(config.projectPrefix)) {
     throw new Error(
@@ -1770,8 +2339,22 @@ function validateConfig(config: AppConfig): void {
   if (!config.appApi.desiredCount && config.appApi.desiredCount !== 0) {
     throw new Error('App API stack requires "desiredCount" to be set.');
   }
+  if (!(AGENTCORE_RUNTIME_PLATFORM_VERSIONS as readonly string[]).includes(config.inferenceApi.runtimePlatformVersion)) {
+    throw new Error(
+      `Invalid inferenceApi.runtimePlatformVersion: "${String(config.inferenceApi.runtimePlatformVersion)}". ` +
+      `Expected one of ${AGENTCORE_RUNTIME_PLATFORM_VERSIONS.join(', ')} (CDK_AGENTCORE_RUNTIME_PLATFORM_VERSION).`
+    );
+  }
   if (!config.appApi.maxCapacity) {
     throw new Error('App API stack requires "maxCapacity" to be set.');
+  }
+  // 0 would make every api-converse call a 429; the backend clamps to 1 but
+  // a deploy that asks for 0 is a mistake worth failing loudly.
+  if (!Number.isInteger(config.appApi.apiConverseMaxInFlight) || config.appApi.apiConverseMaxInFlight < 1) {
+    throw new Error(
+      `Invalid appApi.apiConverseMaxInFlight: ${String(config.appApi.apiConverseMaxInFlight)}. ` +
+      'Expected a whole number >= 1 (CDK_APP_API_CONVERSE_MAX_IN_FLIGHT).'
+    );
   }
 
   if (!config.frontend.cloudFrontPriceClass) {
@@ -1783,6 +2366,20 @@ function validateConfig(config: AppConfig): void {
   // and the respective certificate ARNs for a real deployment. Synth and
   // tests proceed without them (constructs handle the undefined case by
   // falling back to CloudFront default domains).
+
+  // ── Conversation retention ──
+  // Checked on the final value as well as the raw string (requireWholeNumber),
+  // because a config built by hand never passes through the reader. Below
+  // Memory's minimum is an error; above its maximum is not, because the
+  // archive can keep longer and Memory clamps (memory-construct.ts).
+  const retention = config.conversationRetentionDays;
+  if (!Number.isInteger(retention) || retention < AGENTCORE_MEMORY_EVENT_EXPIRY_MIN_DAYS) {
+    throw new Error(
+      `Invalid conversationRetentionDays: ${retention}. Expected a whole number of days, `
+      + `at least ${AGENTCORE_MEMORY_EVENT_EXPIRY_MIN_DAYS} (AgentCore Memory's minimum event expiry). `
+      + `Set CDK_CONVERSATION_RETENTION_DAYS, or leave it unset for ${CONVERSATION_RETENTION_DAYS_DEFAULT}.`
+    );
+  }
 
   // ── Observability ──
   // CloudWatch Logs accepts only a fixed set of retention values; an arbitrary

@@ -21,7 +21,7 @@ from apis.app_api.shares.service import (
     ProjectShareError,
     ShareService,
 )
-from apis.app_api.shares.snapshot_store import ShareSnapshotStore
+from apis.shared.shares.snapshot_store import ShareSnapshotStore
 from apis.shared.auth.models import User
 from apis.shared.projects.repository import ProjectRepository
 from apis.shared.projects.service import ProjectService
@@ -105,7 +105,7 @@ def _session(session_id: str = "s1", project_id: Optional[str] = None, title: st
 def _sources(metadata: Optional[SessionMetadata]):
     return (
         patch("apis.app_api.shares.service.get_session_metadata", new=AsyncMock(return_value=metadata)),
-        patch("apis.app_api.shares.service.get_messages", new=AsyncMock(return_value=MagicMock(messages=[]))),
+        patch("apis.app_api.shares.service.get_messages", new=AsyncMock(return_value=MagicMock(messages=[], tool_summaries=[]))),
     )
 
 
@@ -166,6 +166,67 @@ class TestCreate:
         assert _pointers(projects, project.project_id) == []
 
 
+class TestPublicShareNeedsEditRights:
+    """Only a project's owner and editors may make one of its conversations public (B2)."""
+
+    ROLES = [(OWNER, True), (AUTHOR, True), (VIEWER, False)]
+    IDS = ["owner", "editor", "viewer"]
+
+    @pytest.mark.parametrize("user,allowed", ROLES, ids=IDS)
+    def test_create(self, shares, project, user, allowed):
+        meta = _session(project_id=project.project_id)
+        if allowed:
+            assert _share(shares, meta, access="public", user=user).access_level == "public"
+            return
+        with pytest.raises(ProjectShareError) as e:
+            _share(shares, meta, access="public", user=user)
+        assert e.value.status_code == 403
+        assert shares._find_shares_by_session("s1") == []
+
+    @pytest.mark.parametrize("user,allowed", ROLES, ids=IDS)
+    def test_switch_to_public(self, shares, project, user, allowed):
+        meta = _session(project_id=project.project_id)
+        meta_patch, msgs_patch = _sources(meta)
+        with meta_patch, msgs_patch:
+            share_id = asyncio.run(shares.create_share(
+                "s1", user, CreateShareRequest(accessLevel="specific", allowedEmails=[OWNER.email]),
+            )).share_id
+        with meta_patch:
+            if allowed:
+                updated = asyncio.run(shares.update_share(share_id, user, UpdateShareRequest(accessLevel="public")))
+                assert updated.access_level == "public"
+                return
+            with pytest.raises(ProjectShareError) as e:
+                asyncio.run(shares.update_share(share_id, user, UpdateShareRequest(accessLevel="public")))
+        assert e.value.status_code == 403
+        assert shares._get_share_item(share_id)["access_level"] == "specific"
+
+    def test_a_viewer_keeps_project_sharing(self, shares, project):
+        assert _share(shares, _session(project_id=project.project_id), user=VIEWER).access_level == "project"
+
+    def test_a_viewer_keeps_specific_people(self, shares, project):
+        meta_patch, msgs_patch = _sources(_session(project_id=project.project_id))
+        request = CreateShareRequest(accessLevel="specific", allowedEmails=[OWNER.email])
+        with meta_patch, msgs_patch:
+            assert asyncio.run(shares.create_share("s1", VIEWER, request)).access_level == "specific"
+
+    def test_a_former_member_is_refused_like_a_viewer(self, shares, projects, project):
+        projects.remove_member(project.project_id, OWNER, AUTHOR.email)
+        with pytest.raises(ProjectShareError) as e:
+            _share(shares, _session(project_id=project.project_id), access="public")
+        assert e.value.status_code == 403
+
+    def test_a_conversation_outside_any_project_is_unaffected(self, shares, project):
+        assert _share(shares, _session(project_id=None), access="public", user=VIEWER).access_level == "public"
+
+    def test_refused_for_everyone_while_projects_are_switched_off(self, shares, project, monkeypatch):
+        monkeypatch.setenv("PROJECTS_ENABLED", "false")
+        with pytest.raises(ProjectShareError) as e:
+            _share(shares, _session(project_id=project.project_id), access="public", user=OWNER)
+        assert e.value.status_code == 403
+        assert _share(shares, _session(project_id=None), access="public").access_level == "public"
+
+
 class TestReadAccess:
     @pytest.mark.parametrize("user,allowed", [
         (AUTHOR, True), (OWNER, True), (VIEWER, True), (STRANGER, False),
@@ -222,7 +283,8 @@ class TestPointerFollowsTheShares:
         assert updated.project_id == project.project_id
         assert [p.share_id for p in _pointers(projects, project.project_id)] == [share_id]
 
-        updated = asyncio.run(shares.update_share(share_id, AUTHOR, UpdateShareRequest(accessLevel="public")))
+        with meta_patch:
+            updated = asyncio.run(shares.update_share(share_id, AUTHOR, UpdateShareRequest(accessLevel="public")))
         assert updated.project_id is None
         assert _pointers(projects, project.project_id) == []
 
@@ -299,3 +361,26 @@ class TestTheProjectsTrail:
             ("project.task_unshared", project.project_id, project_share),
         ]
         assert trail.records[0]["after"]["title"] == "Budget draft"
+
+
+class TestForkNeverReusesTheSessionId:
+    """A fork is the requester's own conversation under a NEW session id.
+
+    Reusing the original id would put two users on one session id, which is
+    the precondition for the cross-user exposure of 2026-08-31, when runtime
+    affinity hashed the session id alone and both users' turns shared one
+    container and its agent cache.
+    """
+
+    def test_fork_mints_a_fresh_session_id_owned_by_the_requester(self, shares, project):
+        share_id = _share(shares, _session("original-sid"), access="public").share_id
+        stored = AsyncMock()
+        copy = AsyncMock(return_value=0)
+        with patch.object(shares, "_copy_messages_to_memory", new=copy), \
+                patch("apis.app_api.shares.service.store_session_metadata", new=stored):
+            asyncio.run(shares.export_shared_conversation(share_id, VIEWER))
+
+        forked = stored.call_args.kwargs
+        assert forked["session_id"] != "original-sid"
+        assert forked["user_id"] == VIEWER.user_id
+        assert copy.call_args.args[:2] == (forked["session_id"], VIEWER.user_id)

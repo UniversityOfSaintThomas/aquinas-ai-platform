@@ -14,11 +14,16 @@ export const routes: Routes = [
         path: '',
         loadComponent: () => import('./session/session.page').then(m => m.ConversationPage),
         canActivate: [authGuard],
+        // The conversation page positions the scroll container itself (remembered
+        // offset per conversation, latest turn, stick-to-bottom while streaming),
+        // so navigation scroll handling (RouteScrollService) leaves it alone.
+        data: { scroll: 'self' },
     },
     {
         path: 's/:sessionId',
         loadComponent: () => import('./session/session.page').then(m => m.ConversationPage),
         canActivate: [authGuard],
+        data: { scroll: 'self' },
     },
     {
         path: 'auth/first-boot',
@@ -142,20 +147,13 @@ export const routes: Routes = [
         canActivate: [authGuard],
     },
     {
-        // Shared Projects (shared-projects §6). The tab is part of the URL so a link can
-        // land on Members or Settings; the bare project URL opens its Overview.
-        // `projectsEnabled` keeps every /projects URL unmatched (→ not found) in a build
-        // that has Projects off (src/environments/feature-flags.ts).
-        path: 'projects/:id/:tab',
-        loadComponent: () => import('./projects/detail/project-detail.page').then(m => m.ProjectDetailPage),
+        // One project and its settings pages (projects/projects.routes.ts).
+        // `projectsEnabled` keeps every /projects URL unmatched (→ not found) in a
+        // build that has Projects off (src/environments/feature-flags.ts).
+        path: 'projects/:id',
+        loadChildren: () => import('./projects/projects.routes').then(m => m.PROJECT_ROUTES),
         canMatch: [projectsEnabled],
         canActivate: [authGuard],
-    },
-    {
-        // No guard here (Angular runs redirects before guards): the redirect target
-        // is guarded, so with Projects off this still ends at not found.
-        path: 'projects/:id',
-        redirectTo: 'projects/:id/overview',
     },
     {
         path: 'projects',

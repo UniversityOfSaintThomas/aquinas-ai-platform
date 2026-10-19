@@ -4,40 +4,48 @@ import { Component, input } from '@angular/core';
 import { HttpErrorResponse } from '@angular/common/http';
 import { provideRouter, withComponentInputBinding } from '@angular/router';
 import { RouterTestingHarness } from '@angular/router/testing';
+import { Dialog } from '@angular/cdk/dialog';
 import { of, throwError } from 'rxjs';
 import { ProjectDetailPage } from './project-detail.page';
-import { ProjectOverviewComponent } from './project-overview.component';
+import { ProjectComposerComponent } from './project-composer.component';
+import { ProjectOutputsComponent } from './project-outputs.component';
+import { ProjectProposalsComponent } from './project-proposals.component';
 import { ProjectTasksComponent } from './project-tasks.component';
-import { ProjectFilesComponent } from './project-files.component';
-import { ProjectMembersComponent } from './project-members.component';
-import { ProjectActivityComponent } from './project-activity.component';
-import { ProjectSettingsComponent } from './project-settings.component';
+import { AgentService } from '../../agents/services/agent.service';
+import { ToastService } from '../../services/toast/toast.service';
 import { ProjectApiService } from '../services/project-api.service';
 import { Project } from '../models/project.model';
 
 /**
- * The detail page through the router: `id` and `tab` are route params bound with
+ * The detail page through the router: `id` is a route param bound with
  * `withComponentInputBinding()`, which is exactly the timing a constructed component
- * would skip. The tabs are stubbed; each has its own behavior to test.
+ * would skip. The composer and the task list are stubbed (each has its own spec);
+ * the rail is real. Where a legacy tab URL lands is `projects.routes.spec.ts`.
  */
-@Component({ selector: 'app-project-overview', template: 'overview-tab' })
-class OverviewStub { readonly project = input<Project>(); }
-@Component({ selector: 'app-project-tasks', template: 'tasks-tab' })
-class TasksStub { readonly project = input<Project>(); }
-@Component({ selector: 'app-project-files', template: 'files-tab' })
-class FilesStub { readonly project = input<Project>(); }
-@Component({ selector: 'app-project-activity', template: 'activity-tab' })
-class ActivityStub { readonly project = input<Project>(); }
-@Component({ selector: 'app-project-members', template: 'members-tab' })
-class MembersStub { readonly project = input<Project>(); }
-@Component({ selector: 'app-project-settings', template: 'settings-tab' })
-class SettingsStub { readonly project = input<Project>(); }
+@Component({ selector: 'app-project-composer', template: 'composer' })
+class ComposerStub {
+  readonly project = input<Project>();
+  readonly modelLabel = input<string | null>();
+}
+@Component({ selector: 'app-project-tasks', template: 'tasks' })
+class TasksStub {
+  readonly project = input<Project>();
+}
+@Component({ selector: 'app-project-proposals', template: '' })
+class ProposalsStub {
+  readonly project = input<Project>();
+}
+@Component({ selector: 'app-project-outputs', template: '' })
+class OutputsStub {
+  readonly project = input<Project>();
+}
 
 const PROJECT: Project = {
   projectId: 'prj_1',
   name: 'Enrollment Sync',
   description: 'The nightly sync.',
   ownerEmail: 'o@x.edu',
+  ownerName: null,
   role: 'editor',
   status: 'active',
   editorsManageMembers: true,
@@ -48,29 +56,47 @@ const PROJECT: Project = {
 };
 
 describe('ProjectDetailPage', () => {
-  const api = { get: vi.fn() };
+  const api = {
+    get: vi.fn(),
+    instructions: vi.fn(),
+    model: vi.fn(),
+    bindings: vi.fn(),
+    files: vi.fn(),
+    schedules: vi.fn(),
+  };
+  const agents = { loadBindable: vi.fn() };
+  const dialog = { open: vi.fn() };
+  const toast = { success: vi.fn(), error: vi.fn(), warning: vi.fn() };
 
   beforeEach(() => {
     TestBed.resetTestingModule();
     vi.clearAllMocks();
     api.get.mockReturnValue(of(PROJECT));
+    api.instructions.mockReturnValue(of({ instructions: 'Be terse.', version: 2, canEdit: true }));
+    api.model.mockReturnValue(of({ modelConfig: null, version: 2, canEdit: true }));
+    api.bindings.mockReturnValue(of({ bindings: [], version: 2, canEdit: true }));
+    api.files.mockReturnValue(of({ documents: [], nextToken: null, canEdit: true }));
+    api.schedules.mockReturnValue(of({ schedules: [] }));
+    agents.loadBindable.mockResolvedValue([]);
+    dialog.open.mockReturnValue({ closed: of(undefined), close: vi.fn() });
     TestBed.configureTestingModule({
       providers: [
         provideRouter(
           [
-            { path: 'projects/:id/:tab', component: ProjectDetailPage },
+            { path: 'projects/:id/overview', component: ProjectDetailPage },
             { path: 'projects/:id', redirectTo: 'projects/:id/overview' },
           ],
           withComponentInputBinding(),
         ),
         { provide: ProjectApiService, useValue: api },
+        { provide: AgentService, useValue: agents },
+        { provide: Dialog, useValue: dialog },
+        { provide: ToastService, useValue: toast },
       ],
     });
     TestBed.overrideComponent(ProjectDetailPage, {
-      remove: {
-        imports: [ProjectOverviewComponent, ProjectTasksComponent, ProjectFilesComponent, ProjectMembersComponent, ProjectSettingsComponent, ProjectActivityComponent],
-      },
-      add: { imports: [OverviewStub, TasksStub, FilesStub, MembersStub, SettingsStub, ActivityStub] },
+      remove: { imports: [ProjectComposerComponent, ProjectOutputsComponent, ProjectProposalsComponent, ProjectTasksComponent] },
+      add: { imports: [ComposerStub, OutputsStub, ProposalsStub, TasksStub] },
     });
   });
 
@@ -79,58 +105,44 @@ describe('ProjectDetailPage', () => {
     await harness.navigateByUrl(url);
     await new Promise(r => setTimeout(r, 0));
     harness.detectChanges();
+    await new Promise(r => setTimeout(r, 0));
+    harness.detectChanges();
     return { harness, el: harness.routeNativeElement as HTMLElement };
   }
 
-  it('loads the project from the route and opens Overview by default', async () => {
+  function railRows(el: HTMLElement): string[] {
+    return Array.from(el.querySelectorAll('nav[aria-label="Project settings"] li > *')).map(
+      row => row.querySelector('span > span')?.textContent?.trim() ?? '',
+    );
+  }
+
+  it('loads the project from the route: its name in the title and the breadcrumb, the composer and the tasks', async () => {
     const { el } = await open('/projects/prj_1');
     expect(api.get).toHaveBeenCalledWith('prj_1');
     expect(el.querySelector('h1')?.textContent).toContain('Enrollment Sync');
-    expect(el.textContent).toContain('Editor');
-    expect(el.textContent).toContain('overview-tab');
-    expect(el.querySelector('[aria-current=page]')?.textContent?.trim()).toBe('Overview');
+    expect(el.querySelector('nav[aria-label="Breadcrumb"] button')?.textContent).toContain('Enrollment Sync');
+    expect(el.textContent).toContain('composer');
+    expect(el.textContent).toContain('tasks');
+    expect(dialog.open).not.toHaveBeenCalled();
   });
 
-  it('lists the tabs in order, with Activity for an editor', async () => {
+  it('lists the settings rail, with Activity for an editor', async () => {
     const { el } = await open('/projects/prj_1');
-    const labels = Array.from(el.querySelectorAll('nav[aria-label="Project sections"] a')).map(a => a.textContent?.trim());
-    expect(labels).toEqual(['Overview', 'Tasks', 'Files', 'Members', 'Settings', 'Activity']);
+    expect(railRows(el)).toEqual(['Instructions', 'Files', 'Memory', 'Model', 'Tools', 'Skills', 'Schedules', 'Members', 'Activity', 'History']);
   });
 
-  it('opens Activity for an editor', async () => {
-    const { el } = await open('/projects/prj_1/activity');
-    expect(el.textContent).toContain('activity-tab');
-  });
-
-  it('gives a viewer no Activity tab, and sends /activity to Overview', async () => {
+  it('gives a viewer no Activity row', async () => {
     api.get.mockReturnValue(of({ ...PROJECT, role: 'viewer' }));
-    const { el } = await open('/projects/prj_1/activity');
-    const labels = Array.from(el.querySelectorAll('nav[aria-label="Project sections"] a')).map(a => a.textContent?.trim());
-    expect(labels).not.toContain('Activity');
-    expect(el.textContent).not.toContain('activity-tab');
-    expect(el.textContent).toContain('overview-tab');
-  });
-
-  it.each([
-    ['tasks', 'tasks-tab', 'Tasks'],
-    ['files', 'files-tab', 'Files'],
-  ])('opens %s from the URL', async (tab, content, label) => {
-    const { el } = await open(`/projects/prj_1/${tab}`);
-    expect(el.textContent).toContain(content);
-    expect(el.querySelector('[aria-current=page]')?.textContent?.trim()).toBe(label);
-  });
-
-  it('opens the tab named in the URL', async () => {
-    const { el } = await open('/projects/prj_1/members');
-    expect(el.textContent).toContain('members-tab');
-    expect(el.querySelector('[aria-current=page]')?.textContent?.trim()).toBe('Members');
+    const { el } = await open('/projects/prj_1');
+    expect(railRows(el)).not.toContain('Activity');
+    expect(el.textContent).toContain('You can view it but not change it.');
   });
 
   it('tells a non-member the project is not there, without saying whether it exists', async () => {
     api.get.mockReturnValue(throwError(() => new HttpErrorResponse({ status: 404 })));
-    const { el } = await open('/projects/prj_1/settings');
+    const { el } = await open('/projects/prj_1/overview');
     expect(el.querySelector('[role=alert]')?.textContent).toContain('doesn’t exist, or you’re not a member');
-    expect(el.textContent).not.toContain('settings-tab');
+    expect(el.querySelector('nav[aria-label="Project settings"]')).toBeNull();
   });
 
   it('shows the archived notice, with the way back for the owner', async () => {
@@ -138,6 +150,6 @@ describe('ProjectDetailPage', () => {
     const { el } = await open('/projects/prj_1/overview');
     const notice = el.querySelector('[role=status]')?.textContent ?? '';
     expect(notice).toContain('archived');
-    expect(notice).toContain('restore it from');
+    expect(notice).toContain('restore it now');
   });
 });

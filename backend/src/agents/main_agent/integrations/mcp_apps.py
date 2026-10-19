@@ -47,6 +47,7 @@ from strands.tools.mcp import MCPClient
 from strands.types import PaginatedList
 
 from agents.main_agent.config.constants import Defaults, EnvVars
+from agents.main_agent.integrations.mcp_session_end import ReleasesCallsOnSessionEnd
 from apis.shared.tools.models import ToolUIMetadata
 
 logger = logging.getLogger(__name__)
@@ -147,6 +148,38 @@ def get_ui_tool_catalog() -> UIToolCatalog:
     if _ui_tool_catalog is None:
         _ui_tool_catalog = UIToolCatalog()
     return _ui_tool_catalog
+
+
+def hidden_from_model(tool: Any) -> bool:
+    """True for a tool whose `_meta.ui.visibility` excludes the model.
+
+    Such a tool never reaches `toolConfig`: `record_and_filter_ui_tools` drops
+    it after recording it, so only an embedded MCP App can call it (Google
+    Tasks' `board_snapshot`, which the board calls to refresh). A model-facing
+    allowlist (the admin's "Available Tools" list, a per-tool selection) has
+    nothing to say about it. It must still reach the UI catalog, or
+    `app_tool_dispatch` cannot resolve the App's call. A `tool_filters`
+    `allowed` matcher, so it receives the `MCPAgentTool`.
+
+    False while the host flag is off: nothing is filtered then, so the tool
+    would reach the model and the allowlist must apply to it.
+    """
+    if not is_mcp_apps_host_enabled():
+        return False
+    mcp_tool = getattr(tool, "mcp_tool", None)
+    ui_metadata = ToolUIMetadata.from_meta(getattr(mcp_tool, "meta", None))
+    return ui_metadata is not None and not ui_metadata.visible_to_model()
+
+
+def is_app_tool(tool: Any) -> bool:
+    """True for an MCP tool that declares an App (`_meta.ui`).
+
+    Read off the tool itself (a Strands `MCPAgentTool`), not the catalog, so
+    it answers the same whether or not the host flag recorded the tool. False
+    for built-in tools and for a call the model invented (`tool` is None).
+    """
+    mcp_tool = getattr(tool, "mcp_tool", None)
+    return ToolUIMetadata.from_meta(getattr(mcp_tool, "meta", None)) is not None
 
 
 def record_and_filter_ui_tools(
@@ -747,7 +780,7 @@ def _is_transient_connect_error(exc: BaseException) -> bool:
     return False
 
 
-class UICapableMCPClient(MCPClient):
+class UICapableMCPClient(ReleasesCallsOnSessionEnd, MCPClient):
     """`MCPClient` that records `_meta.ui` and hides app-only tools.
 
     Used for external MCP servers. Construction installs the `initialize`

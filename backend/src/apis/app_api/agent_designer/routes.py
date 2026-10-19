@@ -10,9 +10,8 @@ Gating: the router is mounted unconditionally but every route depends on
 behaves as if unmounted while the feature ships incrementally. Auth is the standard SPA
 cookie dependency per the CLAUDE.md app-api rule.
 
-Deliberately excluded in Phase 1: ``test-chat`` (the only reason the assistants router is
-on the architecture import-boundary allow-list — aliasing it would force a second
-exception) and document sub-routes. Those stay on ``/assistants/*``. ``GET /agents`` lists
+Deliberately excluded in Phase 1: the document sub-routes, which stay on
+``/assistants/*``. ``GET /agents`` lists
 the caller's own + shared-with-them agents; ``include_public``/pagination parity is a
 Phase-4 concern when the Designer consumes it.
 """
@@ -58,6 +57,7 @@ from apis.shared.assistants.models import (
     CreateAssistantRequest,
     ShareAssistantRequest,
     ShareEntry,
+    ShareSkillExposureResponse,
     UnshareAssistantRequest,
     UpdateAssistantRequest,
     UpdateSharePermissionRequest,
@@ -102,6 +102,7 @@ from apis.app_api.agent_designer.services.pin_service import (
     unpin_agent,
 )
 from apis.app_api.agent_designer.services.report_service import ReportError, file_report
+from apis.app_api.agent_designer.services.share_disclosure import skills_exposed_by_sharing
 from apis.app_api.agent_designer.services.store_service import (
     browse_all,
     browse_category,
@@ -345,8 +346,8 @@ async def list_bindable_endpoint(
 ):
     """RBAC-filtered catalog of bindable primitives of ``kind`` for the caller (D4).
 
-    The Designer palette: each picker fetches ``?kind=model|tool|skill|knowledge_base|
-    memory_space`` and shows only what the user's role enables. Composes the existing
+    The Designer palette: each picker fetches ``?kind=model|tool|skill|knowledge_base``
+    and shows only what the user's role enables. Composes the existing
     per-primitive access services (see ``bindable_catalog``).
     """
     if kind not in BINDABLE_KINDS:
@@ -605,6 +606,37 @@ async def get_agent_shares_endpoint(agent_id: str, current_user: User = Depends(
         raise HTTPException(status_code=500, detail=f"Failed to get agent shares: {str(e)}")
 
 
+@router.get("/{agent_id}/shares/exposed-skills", response_model=ShareSkillExposureResponse)
+async def get_agent_share_exposure_endpoint(
+    agent_id: str, current_user: User = Depends(require_agents_enabled)
+):
+    """The skills the owner wrote that sharing this Agent hands over (§6/D7, owner only).
+
+    The share dialog's disclosure: invoke-through lets anyone with access use — and read —
+    the owner's own bound skills. Owner-only like the share mutations it accompanies; an
+    editor cannot widen who has the Agent, so there is nothing for them to be warned about.
+    Gated on the Agent surface alone, not the marketplace flag: sharing works without it.
+    """
+    try:
+        assistant, permission = await resolve_assistant_permission(
+            assistant_id=agent_id, user_id=current_user.user_id, user_email=current_user.email
+        )
+        if not assistant:
+            raise HTTPException(status_code=404, detail=f"Agent not found: {agent_id}")
+        if permission != "owner":
+            raise HTTPException(
+                status_code=403, detail="Only the owner can see what sharing this agent exposes"
+            )
+        return ShareSkillExposureResponse(
+            agent_id=agent_id, exposed_skills=await skills_exposed_by_sharing(assistant)
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error resolving agent share exposure: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to resolve share exposure: {str(e)}")
+
+
 # ------------------------------------------------------------------- marketplace (D2)
 # The author's half of the listing lifecycle. The reviewer's half lives under
 # /admin/agents/* behind require_admin.
@@ -615,7 +647,7 @@ async def agent_listing_preflight_endpoint(
     """What the submit dialog needs before the author commits (D7, owner only).
 
     A read-only rehearsal of the submit checks: the skills publication would expose, the
-    memory-space block if there is one, and whether the author still has to consent to
+    project-harness block if there is one, and whether the author still has to consent to
     going public. Declared before ``/listing/submit`` only for reading order — the paths
     are literal and do not collide.
     """
@@ -645,8 +677,7 @@ async def submit_agent_listing_endpoint(
 ):
     """Submit an Agent for marketplace review (owner only).
 
-    Runs the D7 checks first: a ``memory_space`` binding rejects the submission with 400,
-    and the response enumerates the author's own skills that publication would make
+    Runs the D7 checks first; the response enumerates the author's own skills that publication would make
     readable to anyone who runs the Agent.
     """
     try:

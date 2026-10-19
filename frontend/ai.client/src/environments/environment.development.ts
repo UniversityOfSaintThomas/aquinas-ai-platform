@@ -13,5 +13,14 @@ export const environment = {
     // with the development GitHub environment's CDK_*_ENABLED variables.
     features: {
         projects: true,
+        conversationSearch: true,
+        userGrants: true,
+        sessionPrewarm: true,
+        clientTurnTiming: true,
+        largeDocumentAttachments: true,
+        folderAttachments: true,
+        attachmentKb: true,
+        // The `development` GitHub environment sets CDK_FOLDER_SYNC_ENABLED=true.
+        folderSync: true,
     } satisfies FeatureFlags,
 };

@@ -89,11 +89,6 @@ import { isRetiring, modelRetirementDetail } from '../../../shared/utils/retirem
         class="size-4 shrink-0 text-primary-500 dark:text-slate-400"
         aria-hidden="true"
       />
-    } @else if (showNewChatHint()) {
-      <span
-        class="shrink-0 rounded-sm bg-gray-100 px-1.5 py-0.5 text-[10px]/3 font-medium text-gray-500 dark:bg-gray-700 dark:text-gray-400"
-        >New chat</span
-      >
     }
   `,
 })
@@ -113,6 +108,4 @@ export class ModelOptionComponent {
     }),
   );
   readonly selected = input<boolean>(false);
-  /** Show the "New chat" hint — picking a different model starts a new session. */
-  readonly showNewChatHint = input<boolean>(false);
 }

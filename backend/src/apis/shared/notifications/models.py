@@ -25,6 +25,17 @@ NotificationKind = Literal[
     "project_role_changed",
     "project_removed",
     "project_ownership_transferred",
+    "project_archived",
+    "project_restored",
+    "project_member_left",
+    "project_task_shared",
+    "project_proposal_pending",
+    "project_proposal_decided",
+    "project_memory_maintenance",
+    # A project schedule stopped running (3.2): payload {scheduleId, label, reason,
+    # createdBy}. ``reason`` is a run_block_reason code, a worker pause reason, or
+    # "paused_by_editor" / "deleted" when someone else stopped it.
+    "project_schedule_paused",
 ]
 
 
