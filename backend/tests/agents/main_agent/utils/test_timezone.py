@@ -3,7 +3,7 @@ Tests for timezone utilities.
 Requirements: 21.1–21.3
 
 The rendered string is part of the Bedrock prompt-cache prefix, so it must be
-byte-stable within a Pacific day: date, weekday and timezone only — no hour.
+byte-stable within a Central day (UST fork; upstream is Pacific): date, weekday and timezone only — no hour.
 """
 
 import re
@@ -23,7 +23,7 @@ DATE_FORMAT_RE = re.compile(
 
 VALID_DAYS = {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
 
-PACIFIC = ZoneInfo("America/Los_Angeles")
+CENTRAL = ZoneInfo("America/Chicago")  # UST fork: Central, see FORK_CHANGES.md
 
 
 class _FrozenDatetime(datetime):
@@ -63,36 +63,42 @@ class TestGetCurrentDatePacific:
 
 
 class TestDayStability:
-    """The rendered string must be identical for every hour of the same Pacific day
-    and change only when the Pacific calendar date changes."""
+    """The rendered string must be identical for every hour of the same Central day
+    and change only when the Central calendar date changes."""
 
     def test_identical_across_every_hour_of_a_day(self):
-        base = datetime(2026, 9, 15, 0, 0, tzinfo=PACIFIC)
+        base = datetime(2026, 9, 15, 0, 0, tzinfo=CENTRAL)
         rendered = {_at(base.replace(hour=h, minute=m)) for h in range(24) for m in (0, 59)}
-        assert rendered == {"2026-09-15 (Tuesday) PDT"}, rendered
+        assert rendered == {"2026-09-15 (Tuesday) CDT"}, rendered
 
-    def test_changes_at_pacific_midnight(self):
-        before = _at(datetime(2026, 9, 15, 23, 59, tzinfo=PACIFIC))
-        after = _at(datetime(2026, 9, 16, 0, 0, tzinfo=PACIFIC))
-        assert before == "2026-09-15 (Tuesday) PDT"
-        assert after == "2026-09-16 (Wednesday) PDT"
+    def test_changes_at_central_midnight(self):
+        before = _at(datetime(2026, 9, 15, 23, 59, tzinfo=CENTRAL))
+        after = _at(datetime(2026, 9, 16, 0, 0, tzinfo=CENTRAL))
+        assert before == "2026-09-15 (Tuesday) CDT"
+        assert after == "2026-09-16 (Wednesday) CDT"
 
-    def test_uses_pacific_date_not_utc_date(self):
-        # 03:00 UTC on the 16th is still 20:00 PDT on the 15th.
+    def test_uses_central_date_not_utc_date(self):
+        # 03:00 UTC on the 16th is still 22:00 CDT on the 15th.
         utc_instant = datetime(2026, 9, 16, 3, 0, tzinfo=ZoneInfo("UTC"))
-        assert _at(utc_instant) == "2026-09-15 (Tuesday) PDT"
+        assert _at(utc_instant) == "2026-09-15 (Tuesday) CDT"
+
+    def test_uses_central_date_not_pacific_date(self):
+        # 05:30 UTC on the 16th is 00:30 CDT on the 16th but still 22:30 PDT on the 15th:
+        # the window in which the upstream Pacific date showed UST users yesterday.
+        utc_instant = datetime(2026, 9, 16, 5, 30, tzinfo=ZoneInfo("UTC"))
+        assert _at(utc_instant) == "2026-09-16 (Wednesday) CDT"
 
 
 class TestTimezoneAbbreviation:
-    """Req 21.2: Verify timezone abbreviation is PST or PDT."""
+    """Req 21.2: Verify timezone abbreviation is CST or CDT."""
 
-    def test_timezone_is_pst_or_pdt(self):
+    def test_timezone_is_cst_or_cdt(self):
         result = get_current_date_pacific()
         tz = result.split()[-1]
-        assert tz in ("PST", "PDT"), f"Timezone '{tz}' is not PST or PDT"
+        assert tz in ("CST", "CDT"), f"Timezone '{tz}' is not CST or CDT"
 
-    def test_standard_time_renders_pst(self):
-        assert _at(datetime(2026, 1, 15, 12, 0, tzinfo=PACIFIC)) == "2026-01-15 (Thursday) PST"
+    def test_standard_time_renders_cst(self):
+        assert _at(datetime(2026, 1, 15, 12, 0, tzinfo=CENTRAL)) == "2026-01-15 (Thursday) CST"
 
 
 class TestUTCFallback:

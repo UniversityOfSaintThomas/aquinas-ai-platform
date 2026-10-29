@@ -43,14 +43,14 @@ def get_current_date_pacific() -> str:
             try:
                 # Try zoneinfo first (Python 3.9+)
                 from zoneinfo import ZoneInfo
-                pacific_tz = ZoneInfo("America/Los_Angeles")
+                pacific_tz = ZoneInfo("America/Chicago")  # UST fork: Central, see FORK_CHANGES.md
                 now = datetime.now(pacific_tz)
                 # Get timezone abbreviation (PST/PDT)
                 tz_abbr = now.strftime("%Z")
             except (ImportError, NameError):
                 # Fallback to pytz
                 import pytz
-                pacific_tz = pytz.timezone("America/Los_Angeles")
+                pacific_tz = pytz.timezone("America/Chicago")  # UST fork: Central, see FORK_CHANGES.md
                 now = datetime.now(pacific_tz)
                 # Get timezone abbreviation (PST/PDT)
                 tz_abbr = now.strftime("%Z")
