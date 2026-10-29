@@ -55,7 +55,7 @@ from apis.app_api.web_sources.url_utils import (
 
 logger = logging.getLogger(__name__)
 
-USER_AGENT = "BoiseStateAI-Assistant-Crawler/1.0 (+contact)"
+USER_AGENT = "AquinasAI-Assistant-Crawler/1.0 (+https://www.stthomas.edu)"
 PER_PAGE_TIMEOUT_SECONDS = 20.0
 CRAWL_BUDGET_SECONDS = 15 * 60  # hard ceiling: must outlive any reasonable crawl
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
