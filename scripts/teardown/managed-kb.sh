@@ -40,6 +40,16 @@ if ! declare -f log_info >/dev/null 2>&1; then
     source "${PROJECT_ROOT}/scripts/common/load-env.sh"
 fi
 
+# load-env.sh provides log_info/log_warn/log_error/log_config but NOT
+# log_success, and destroy.sh invokes this script with `bash` (a separate
+# process), so its own log_success definition is not inherited. Define it here,
+# guarded, so the three call sites below resolve in both invocation paths.
+if ! declare -f log_success >/dev/null 2>&1; then
+    log_success() {
+        echo -e "${GREEN:-}[SUCCESS]${NC:-} $1"
+    }
+fi
+
 # Deletion was measured at 2-6 minutes and is asynchronous. 480s is the
 # same tolerance the Python delete saga uses
 # (tombstones.KB_DELETE_POLL_TIMEOUT_SECONDS), so both paths wait the

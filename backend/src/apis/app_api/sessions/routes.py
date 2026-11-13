@@ -3,7 +3,7 @@
 Provides endpoints for managing session metadata.
 """
 
-from fastapi import APIRouter, HTTPException, Depends, Query, Response, BackgroundTasks, status
+from fastapi import APIRouter, HTTPException, Depends, Path, Query, Response, BackgroundTasks, status
 from typing import Optional
 import logging
 from apis.shared.sessions.models import (
@@ -18,7 +18,17 @@ from apis.shared.sessions.models import (
     BulkDeleteSessionsRequest,
     BulkDeleteSessionsResponse,
     BulkDeleteSessionResult,
-    MessagesListResponse
+    MessagesListResponse,
+    MessageFeedback,
+    MessageFeedbackRequest,
+    ImplicitSignalRequest,
+    BrowserLiveViewResponse,
+)
+from apis.shared.sessions.feedback import (
+    SessionNotOwned,
+    delete_message_feedback,
+    put_message_feedback,
+    record_implicit_signal,
 )
 from apis.shared.sessions.messages import get_messages
 from apis.shared.sessions.metadata import (
@@ -32,10 +42,17 @@ from apis.shared.sessions.metadata import (
     store_session_metadata,
 )
 from .services.session_service import SessionService
+from .services.delete_cascade import SessionDeleteCascade
 from apis.app_api.shares.service import get_share_service
 from apis.app_api.artifacts.service import get_artifact_share_service
+from apis.shared.conversation_archive import delete_session_archive
 from apis.shared.auth.dependencies import get_current_user_from_session
-from apis.shared.feature_flags import mid_turn_steering_enabled
+from apis.shared.feature_flags import (
+    attachment_kb_enabled,
+    response_feedback_enabled,
+    mid_turn_steering_enabled,
+    browser_takeover_enabled,
+)
 from apis.shared.auth.models import User
 from apis.shared.system_prompts.service import get_system_prompts_service
 
@@ -434,39 +451,16 @@ async def delete_session_endpoint(
                 detail=f"Session not found: {session_id}"
             )
 
-        # Queue cleanup tasks as background tasks (fire-and-forget)
-        # These don't block the response - cleanup happens after 204 is sent
-
-        # 1. Delete AgentCore Memory content
-        background_tasks.add_task(
-            service.delete_agentcore_memory,
-            session_id,
-            user_id
-        )
-
-        # 2. Cascade delete associated files (S3 objects + metadata)
-        background_tasks.add_task(
-            service.delete_session_files,
-            session_id
-        )
-
-        # 3. Delete share snapshots so share links stop working
-        share_service = get_share_service()
-        background_tasks.add_task(
-            share_service.delete_shares_for_session,
-            session_id
-        )
-
-        # 4. Revoke artifact shares from this session. Artifacts outlive
-        # the chat that produced them, so without this a deleted
-        # conversation leaves live links to its artifacts. Best-effort
-        # and never-raising, like the conversation cascade above — and a
-        # no-op when artifacts aren't enabled for this environment.
-        background_tasks.add_task(
-            get_artifact_share_service().delete_for_session,
-            session_id,
-            user_id
-        )
+        # The cleanups (Memory, files, shares, artifact shares, archived
+        # turns) run as background tasks after the 204 is sent. One cascade
+        # serves this route, bulk delete and the retention pruner, so they
+        # cannot drift apart (services/delete_cascade.py).
+        SessionDeleteCascade(
+            session_service=service,
+            share_service=get_share_service(),
+            artifact_share_service=get_artifact_share_service(),
+            delete_archive=delete_session_archive,
+        ).queue(background_tasks, user_id, session_id)
 
         logger.info("Successfully deleted session")
 
@@ -527,8 +521,12 @@ async def bulk_delete_sessions_endpoint(
 
     try:
         service = SessionService()
-        share_service = get_share_service()
-        artifact_share_service = get_artifact_share_service()
+        cascade = SessionDeleteCascade(
+            session_service=service,
+            share_service=get_share_service(),
+            artifact_share_service=get_artifact_share_service(),
+            delete_archive=delete_session_archive,
+        )
 
         for session_id in session_ids:
             try:
@@ -538,25 +536,7 @@ async def bulk_delete_sessions_endpoint(
                 )
 
                 if deleted:
-                    # Queue cleanup tasks as background tasks
-                    background_tasks.add_task(
-                        service.delete_agentcore_memory,
-                        session_id,
-                        user_id
-                    )
-                    background_tasks.add_task(
-                        service.delete_session_files,
-                        session_id
-                    )
-                    background_tasks.add_task(
-                        share_service.delete_shares_for_session,
-                        session_id
-                    )
-                    background_tasks.add_task(
-                        artifact_share_service.delete_for_session,
-                        session_id,
-                        user_id
-                    )
+                    cascade.queue(background_tasks, user_id, session_id)
                     results.append(BulkDeleteSessionResult(
                         session_id=session_id,
                         success=True,
@@ -601,6 +581,7 @@ async def get_session_messages_endpoint(
     session_id: str,
     limit: Optional[int] = Query(None, ge=1, le=1000, description="Maximum number of messages to return"),
     next_token: Optional[str] = Query(None, description="Pagination token for retrieving the next page of results"),
+    background_tasks: BackgroundTasks = None,
     current_user: User = Depends(get_current_user_from_session)
 ):
     """
@@ -640,6 +621,14 @@ async def get_session_messages_endpoint(
 
         logger.info("Successfully retrieved session messages")
 
+        # Opening a conversation re-indexes its evicted large documents
+        # (large-document spec §4E), after the response and only on the first
+        # page, so a scroll back through history does not re-send.
+        if next_token is None and background_tasks is not None and attachment_kb_enabled():
+            from apis.app_api.files.attachment_reindex import requeue_evicted_attachments
+
+            background_tasks.add_task(requeue_evicted_attachments, session_id, user_id)
+
         return response
 
     except ValueError as e:
@@ -660,6 +649,113 @@ async def get_session_messages_endpoint(
             status_code=500,
             detail=f"Failed to retrieve messages: {str(e)}"
         )
+
+
+def _require_message_feedback() -> None:
+    """404 while ``RESPONSE_FEEDBACK_ENABLED=false`` — the surface does not exist."""
+    if not response_feedback_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+@router.put(
+    "/{session_id}/messages/{message_id}/feedback",
+    response_model=MessageFeedback,
+    response_model_by_alias=True,
+    response_model_exclude_none=True,
+)
+async def put_message_feedback_endpoint(
+    session_id: str,
+    message_id: int = Path(..., ge=0, description="0-based message index"),
+    body: MessageFeedbackRequest = ...,
+    current_user: User = Depends(get_current_user_from_session),
+):
+    """Thumb an assistant message up (+1) or down (-1), optionally with a
+    reason code. Idempotent per (user, message): a second click replaces the
+    first. Content-free by construction — the body is a closed enum, so no
+    text can be stored (``apis.shared.sessions.feedback``).
+
+    ``message_id`` is the message's 0-based index in the conversation — the
+    trailing number of the SPA's ``msg-{sessionId}-{index}`` id, and the
+    ``messageId`` the message's cost row carries. ``retryMessageId`` in the
+    body links the user message sent as a retry-with-correction; it is kept
+    across later thumbs on the same message.
+    """
+    _require_message_feedback()
+    try:
+        return await put_message_feedback(
+            session_id=session_id,
+            user_id=current_user.user_id,
+            message_id=message_id,
+            value=body.value,
+            reason=body.reason,
+            retry_message_id=body.retry_message_id,
+        )
+    except SessionNotOwned:
+        raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except RuntimeError as e:
+        # No metadata table configured (local dev without DynamoDB).
+        logger.warning("Message feedback unavailable: %s", scrub_log(str(e)))
+        raise HTTPException(status_code=503, detail="Message feedback is not available")
+    except Exception:
+        logger.error("Error storing message feedback", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to store message feedback")
+
+
+@router.delete("/{session_id}/messages/{message_id}/feedback", status_code=204)
+async def delete_message_feedback_endpoint(
+    session_id: str,
+    message_id: int = Path(..., ge=0, description="0-based message index"),
+    current_user: User = Depends(get_current_user_from_session),
+):
+    """Withdraw this user's thumb on a message. 204 whether or not one existed."""
+    _require_message_feedback()
+    try:
+        await delete_message_feedback(
+            session_id=session_id,
+            user_id=current_user.user_id,
+            message_id=message_id,
+        )
+    except SessionNotOwned:
+        raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+    except RuntimeError as e:
+        logger.warning("Message feedback unavailable: %s", scrub_log(str(e)))
+        raise HTTPException(status_code=503, detail="Message feedback is not available")
+    except Exception:
+        logger.error("Error deleting message feedback", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to delete message feedback")
+    return Response(status_code=204)
+
+
+@router.post("/{session_id}/messages/{message_id}/signals", status_code=204)
+async def record_implicit_signal_endpoint(
+    session_id: str,
+    message_id: int = Path(..., ge=0, description="0-based message index"),
+    body: ImplicitSignalRequest = ...,
+    current_user: User = Depends(get_current_user_from_session),
+):
+    """Record an implicit signal (``copy`` / ``continue``) on an assistant
+    message — response-feedback spec §10. Fire-and-forget from the SPA:
+    always 204 once accepted, never a reason to show the user anything.
+    Content-free: the body is a closed enum."""
+    _require_message_feedback()
+    try:
+        await record_implicit_signal(
+            session_id=session_id,
+            user_id=current_user.user_id,
+            message_id=message_id,
+            kind=body.kind,
+        )
+    except SessionNotOwned:
+        raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+    except RuntimeError as e:
+        logger.warning("Message feedback unavailable: %s", scrub_log(str(e)))
+        raise HTTPException(status_code=503, detail="Message feedback is not available")
+    except Exception:
+        logger.error("Error recording implicit signal", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to record signal")
+    return Response(status_code=204)
 
 
 @router.post("/{session_id}/interrupt", status_code=204)
@@ -892,3 +988,77 @@ async def dismiss_pending_interrupt_endpoint(
             status_code=500,
             detail=f"Failed to dismiss interrupt: {str(e)}",
         )
+
+
+@router.post(
+    "/{session_id}/browser/live-view",
+    response_model=BrowserLiveViewResponse,
+    response_model_by_alias=True,
+)
+async def mint_browser_live_view_endpoint(
+    session_id: str,
+    current_user: User = Depends(get_current_user_from_session),
+):
+    """Mint a short-lived Live View URL for this conversation's browser session.
+
+    The client sends **only** the conversation id. This route looks the browser
+    session up server-side from the metadata row's `browserSession` projection
+    (spec D4) and signs a fresh URL per call, which is what makes a sign-in that
+    takes twenty minutes work against a signature that lives 300 seconds.
+
+    POST rather than GET on purpose: the response carries a live SigV4
+    signature, and a GET invites it into browser history, referrer headers and
+    access logs. Nothing sensitive goes in the path or query either way.
+
+    Ownership is the metadata read itself — `get_session_metadata` is
+    user-scoped through the GSI, so another user's conversation is
+    indistinguishable from a missing one, and both are 404.
+
+    Status codes:
+      * 404 — flag off, no such conversation for this user, or no browser
+        session on it. All three are "this surface does not exist for you".
+      * 409 — the conversation names a browser session the service will no
+        longer stream (ended, timed out, stopped). Distinct from 404 because
+        the SPA should say "the session ended", not "no viewer here".
+
+    Lives on app-api, not inference-api: the Runtime data plane proxies only
+    `/invocations` and `/ping`, so this would 404 in cloud from there.
+    """
+    if not browser_takeover_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    from .services.browser_live_view import (
+        LiveViewUnavailable,
+        mint_live_view,
+        summarize_for_log,
+    )
+
+    user_id = current_user.user_id
+    logger.info("POST /sessions/.../browser/live-view")
+
+    metadata = await get_session_metadata(session_id, user_id)
+    if not metadata:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    ref = metadata.browser_session
+    if not ref:
+        raise HTTPException(
+            status_code=404,
+            detail="This conversation has no browser session to view.",
+        )
+
+    try:
+        minted = await mint_live_view(ref)
+    except LiveViewUnavailable as exc:
+        logger.info(
+            "browser live view unavailable for %s (%s): %s",
+            scrub_log(session_id), summarize_for_log(ref), exc.message,
+        )
+        raise HTTPException(status_code=exc.code, detail=exc.message)
+    except Exception:
+        # Deliberately generic: the exception text from a signing failure can
+        # contain the partially-built URL.
+        logger.error("Error minting browser live view", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to mint live view")
+
+    return BrowserLiveViewResponse.model_validate(minted)

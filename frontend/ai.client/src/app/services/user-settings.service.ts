@@ -4,9 +4,39 @@ import { firstValueFrom } from 'rxjs';
 import { ConfigService } from './config.service';
 import { SUPPRESS_ERROR_TOAST } from '../auth/error.interceptor';
 
+/**
+ * One sidebar navigation entry's place and visibility. The entries themselves
+ * are defined in `components/sidenav/sidebar-items.ts`; mirrors
+ * `SidebarItemPreference` in `apis/shared/user_settings/models.py`.
+ */
+export interface SidebarItemPreference {
+  id: string;
+  visible: boolean;
+}
+
 export interface UserSettings {
   defaultModelId: string | null;
+  /**
+   * Standing preferences added to the system prompt of every conversation
+   * (not agent previews). Agent and project instructions win a conflict.
+   * Blank clears; the backend caps it at {@link MAX_PERSONAL_INSTRUCTIONS}.
+   */
+  personalInstructions?: string | null;
+  /**
+   * The Nova 2 Sonic voice heard in voice mode — an id from
+   * `session/services/voice/voice-catalog.ts`. Null means the platform
+   * default; blank clears. The backend refuses an id not in the catalog.
+   */
+  voiceId?: string | null;
+  /**
+   * The user's order and visibility for the sidebar's navigation entries.
+   * Null (or an empty list) means the default layout.
+   */
+  sidebarItems?: SidebarItemPreference[] | null;
 }
+
+/** `MAX_PERSONAL_INSTRUCTIONS_CHARS` in `apis/shared/user_settings/models.py`. */
+export const MAX_PERSONAL_INSTRUCTIONS = 4000;
 
 @Injectable({
   providedIn: 'root'

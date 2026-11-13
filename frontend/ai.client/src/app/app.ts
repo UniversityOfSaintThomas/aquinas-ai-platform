@@ -12,9 +12,13 @@ import { HeaderService } from './services/header/header.service';
 import { TooltipDirective } from './components/tooltip/tooltip.directive';
 import { SessionService } from './auth/session.service';
 import { SessionService as SessionListService } from './session/services/session/session.service';
-import { ArtifactStateService } from './session/services/artifacts/artifact-state.service';
-import { isMinimalChromeRoute } from './shared/utils/route-chrome';
+import { DockedPaneService } from './session/services/docked-pane/docked-pane.service';
+import { isAdminChromeRoute, isMinimalChromeRoute } from './shared/utils/route-chrome';
 import { BrandingService } from '../branding/branding.service';
+import { FEATURES } from './services/features';
+import { SearchDialogService } from './components/search/search-dialog.service';
+import { KeyboardShortcutsService } from './components/shortcuts/keyboard-shortcuts.service';
+import { shortcutAria, withShortcut } from './components/shortcuts/shortcuts';
 
 @Component({
   selector: 'app-root',
@@ -28,6 +32,9 @@ import { BrandingService } from '../branding/branding.service';
   ],
   templateUrl: './app.html',
   styleUrl: './app.css',
+  host: {
+    '(document:keydown)': 'onDocumentKeydown($event)',
+  },
 })
 export class App {
   protected readonly title = signal('boisestate.ai');
@@ -36,9 +43,18 @@ export class App {
   private router = inject(Router);
   private session = inject(SessionService);
   private sessionList = inject(SessionListService);
-  private artifactState = inject(ArtifactStateService);
+  private dockedPane = inject(DockedPaneService);
   private titleService = inject(Title);
   private branding = inject(BrandingService);
+  private searchDialog = inject(SearchDialogService);
+  private shortcuts = inject(KeyboardShortcutsService);
+  protected readonly conversationSearchOn = inject(FEATURES).conversationSearch;
+  protected readonly searchTooltip = withShortcut('Search', 'search');
+  protected readonly searchShortcutAria = shortcutAria('search');
+  protected readonly newChatTooltip = withShortcut('New chat', 'newConversation');
+  protected readonly newChatShortcutAria = shortcutAria('newConversation');
+  protected readonly expandSidebarTooltip = withShortcut('Expand sidebar', 'toggleSidebar');
+  protected readonly sidebarShortcutAria = shortcutAria('toggleSidebar');
 
   /** Re-read on every completed navigation; the value itself is unused,
    *  it exists so `minimalChrome` recomputes when the route changes. */
@@ -64,6 +80,19 @@ export class App {
   });
 
   /**
+   * True when the active route is inside the admin console.
+   *
+   * The console keeps the sidenav — the nav inside it is swapped for the
+   * admin one — but drops the centred `max-w-7xl` content box. That cap is a
+   * reading width for prose; a cost table or a role matrix read inside it
+   * while a conversation list it cannot use held 18rem to its left.
+   */
+  protected readonly adminChrome = computed(() => {
+    this.navigated();
+    return isAdminChromeRoute(this.router.routerState.snapshot.root);
+  });
+
+  /**
    * Whether the sidenav and its floating controls are suppressed —
    * either because a page hid them imperatively or because the active
    * route asked for a minimal shell.
@@ -72,17 +101,19 @@ export class App {
     () => this.sidenavService.isHidden() || this.minimalChrome(),
   );
 
-  /** True while an artifact pane is docked — content reserves right-side
-   *  space for it (desktop only) so the fixed panel doesn't occlude chat. */
-  protected readonly artifactPanelOpen = computed(
-    () => this.artifactState.openArtifact() !== null,
-  );
+  /** True while any pane is docked — an artifact or a .docx preview.
+   *  Content reserves right-side space for it (desktop only) so the
+   *  fixed panel doesn't occlude chat. The class name is unchanged from
+   *  when the artifact pane was the only tenant; the rail is one gutter
+   *  whatever is in it, and renaming it would churn seven templates for
+   *  no behavioural gain. */
+  protected readonly artifactPanelOpen = this.dockedPane.isOpen;
 
   /** Exposed as a CSS var on the content wrapper so the desktop-only
    *  media-query rules (here and in chat-container) reserve exactly the
    *  user-chosen pane width. */
   protected readonly artifactPaneWidthCss = computed(
-    () => `${this.artifactState.paneWidth()}px`,
+    () => `${this.dockedPane.width()}px`,
   );
 
   constructor() {
@@ -108,7 +139,21 @@ export class App {
     }
   }
 
+  protected openSearch(): void {
+    void this.searchDialog.open();
+  }
+
   newChat() {
     this.router.navigate(['']);
+  }
+
+  /**
+   * Every document keydown goes to the shortcut table (`components/shortcuts`):
+   * Cmd/Ctrl+K search, Cmd/Ctrl+Shift+O new conversation, Shift+Esc focus the
+   * composer, Cmd/Ctrl+Shift+S sidebar, Cmd/Ctrl+Shift+C copy the last
+   * response, Cmd/Ctrl+/ this list.
+   */
+  onDocumentKeydown(event: KeyboardEvent): void {
+    this.shortcuts.handle(event, { chromeHidden: this.chromeHidden() });
   }
 }

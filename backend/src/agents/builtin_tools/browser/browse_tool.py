@@ -27,6 +27,7 @@ import os
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
+from apis.shared.security import is_forbidden_ip_literal
 from strands import tool
 from strands.types.tools import ToolContext
 
@@ -41,6 +42,7 @@ MAX_EVAL_CHARS = int(os.environ.get("BROWSER_MAX_EVAL_CHARS", 4000))
 MAX_LINKS = int(os.environ.get("BROWSER_MAX_LINKS", 50))
 
 _ALLOWED_SCHEMES = ("http", "https")
+_BLOCKED_HOSTNAMES = frozenset({"localhost", "metadata.google.internal", "instance-data", "instance-data.ec2.internal"})
 
 # Page text, preferring the main content region over site chrome.
 _EXTRACT_TEXT_JS = """
@@ -102,10 +104,17 @@ def _validate_url(url: str) -> Optional[str]:
     if not host:
         return "❌ URL has no host."
     # The browser runs in AWS with PUBLIC network mode, so it cannot reach our
-    # VPC — but blocking the obvious loopback/metadata targets keeps the tool
-    # honest if the network mode ever changes.
-    if host in ("localhost", "127.0.0.1", "::1", "169.254.169.254", "metadata.google.internal"):
-        return "❌ Refusing to browse loopback or instance-metadata addresses."
+    # VPC, and its execution role can only write logs. Blocking loopback,
+    # link-local (instance metadata) and private targets still matters: a
+    # prompt-injected page should not be able to point the browser at the
+    # sandbox's own metadata endpoint. The browser resolves DNS in AWS's
+    # network, not ours, so only IP literals are checked here (in every
+    # spelling Chromium accepts). This does not cover a hostname that
+    # resolves to a blocked address, or a page or `script` that navigates
+    # on its own; the session URL policy (`session_pool`) is RECOMMENDED,
+    # not mandated, so it does not close those either.
+    if host in _BLOCKED_HOSTNAMES or host.endswith(".localhost") or is_forbidden_ip_literal(host):
+        return "❌ Refusing to browse loopback, private or instance-metadata addresses."
     return None
 
 
@@ -145,7 +154,6 @@ async def browse_web(
                               `[...document.querySelectorAll('h2')].map(e => e.innerText)`.
             `screenshot`    — capture the viewport as an image. Expensive in
                               tokens; only use it when you must SEE the layout.
-            `live_view`     — get a URL where the user can watch the session.
             `close`         — end the browser session.
         url: Target URL for `navigate` (http/https).
         selector: CSS selector for `click` and `type`.
@@ -281,13 +289,14 @@ async def _dispatch(
             [{"image": {"format": "png", "source": {"bytes": base64.b64decode(encoded)}}}],
         )
 
-    if action == "live_view":
-        view_url = await session_pool.live_view_url(agent)
-        if not view_url:
-            return _err("❌ No live view available for this session.")
-        return _ok(f"Watch the browser session here (expires shortly):\n{view_url}")
+    # `live_view` used to live here. It returned a presigned URL as tool-result
+    # text, which the model re-emits truncated at the `?` (PR #1101), and which
+    # expires in at most 300 seconds — dead before a human can react and dead
+    # again on every reload of the thread. Watching (and now driving) the
+    # session is `request_user_login` plus app-api's live-view route, where the
+    # URL is minted per request and never becomes model-visible.
 
     return _err(
         f"❌ Unknown action '{action}'. Valid actions: navigate, extract_text, "
-        "extract_links, click, type, evaluate, screenshot, live_view, close."
+        "extract_links, click, type, evaluate, screenshot, close."
     )

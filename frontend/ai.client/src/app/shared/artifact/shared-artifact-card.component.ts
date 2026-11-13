@@ -21,7 +21,7 @@ import {
   type SharedArtifactDialogData,
 } from './shared-artifact-dialog.component';
 
-interface TypeStyle {
+export interface TypeStyle {
   readonly label: string;
   readonly icon: string;
   readonly bg: string;
@@ -35,37 +35,37 @@ const TYPE_STYLES: Record<string, TypeStyle> = {
     label: 'Markdown',
     icon: 'heroDocumentText',
     bg: 'bg-filetype-markdown-100 dark:bg-filetype-markdown-900/60',
-    text: 'text-filetype-markdown-600 dark:text-filetype-markdown-300',
+    text: 'text-filetype-markdown-700 dark:text-filetype-markdown-300',
   },
   'text/x-markdown': {
     label: 'Markdown',
     icon: 'heroDocumentText',
     bg: 'bg-filetype-markdown-100 dark:bg-filetype-markdown-900/60',
-    text: 'text-filetype-markdown-600 dark:text-filetype-markdown-300',
+    text: 'text-filetype-markdown-700 dark:text-filetype-markdown-300',
   },
   'text/html': {
     label: 'Web page',
     icon: 'heroCodeBracket',
     bg: 'bg-filetype-code-100 dark:bg-filetype-code-900/60',
-    text: 'text-filetype-code-600 dark:text-filetype-code-300',
+    text: 'text-filetype-code-700 dark:text-filetype-code-300',
   },
   'application/xhtml+xml': {
     label: 'Web page',
     icon: 'heroCodeBracket',
     bg: 'bg-filetype-code-100 dark:bg-filetype-code-900/60',
-    text: 'text-filetype-code-600 dark:text-filetype-code-300',
+    text: 'text-filetype-code-700 dark:text-filetype-code-300',
   },
   'text/csv': {
     label: 'CSV',
     icon: 'heroTableCells',
     bg: 'bg-filetype-sheet-100 dark:bg-filetype-sheet-900/60',
-    text: 'text-filetype-sheet-600 dark:text-filetype-sheet-300',
+    text: 'text-filetype-sheet-700 dark:text-filetype-sheet-300',
   },
   'image/svg+xml': {
     label: 'SVG',
     icon: 'heroPhoto',
     bg: 'bg-filetype-image-100 dark:bg-filetype-image-900/60',
-    text: 'text-filetype-image-600 dark:text-filetype-image-300',
+    text: 'text-filetype-image-700 dark:text-filetype-image-300',
   },
 };
 
@@ -75,6 +75,11 @@ const DEFAULT_TYPE_STYLE: TypeStyle = {
   bg: 'bg-gray-100 dark:bg-gray-700',
   text: 'text-gray-600 dark:text-gray-300',
 };
+
+/** How an artifact of ``contentType`` is labelled and coloured; shared with the project Outputs cards. */
+export function artifactTypeStyle(contentType: string): TypeStyle {
+  return TYPE_STYLES[contentType.split(';')[0].trim().toLowerCase()] ?? DEFAULT_TYPE_STYLE;
+}
 
 /**
  * An artifact inside a shared conversation, as its recipient sees it.

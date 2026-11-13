@@ -49,6 +49,12 @@ export interface AppApiIamGrantsProps {
    */
   agentCoreMemoryArn: string;
   /**
+   * AgentCore Runtime CloudWatch log group name. Feedback eval sampling runs
+   * Logs Insights queries against it (and `aws/spans`) to collect a
+   * conversation's spans for AgentCore Evaluations.
+   */
+  agentCoreRuntimeLogGroupName: string;
+  /**
    * SageMaker fine-tuning execution role ARN. Created by a sibling
    * construct in wireCompute() — passed in here.
    */
@@ -130,6 +136,21 @@ export function grantAppApiPermissions(props: AppApiIamGrantsProps): void {
     }),
   );
 
+  // ── Agent templates (create-agent picker catalog) ──
+  // Admin-managed CRUD; per-user reads (the enabled catalog) go through the
+  // user-facing `/templates` endpoint, which uses the same table.
+  taskRole.addToPrincipalPolicy(
+    new iam.PolicyStatement({
+      sid: 'AgentTemplatesTableAccess',
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem',
+        'dynamodb:DeleteItem', 'dynamodb:Query', 'dynamodb:Scan',
+      ],
+      resources: [props.refs.agentTemplatesTable.tableArn, `${props.refs.agentTemplatesTable.tableArn}/index/*`],
+    }),
+  );
+
   // ── RAG assistants table ──
   taskRole.addToPrincipalPolicy(
     new iam.PolicyStatement({
@@ -174,6 +195,30 @@ export function grantAppApiPermissions(props: AppApiIamGrantsProps): void {
     }),
   );
 
+  // ── Conversation archive bucket ──
+  // app-api writes a forked conversation's turns (shares export), deletes a
+  // session's turns when the session is deleted, and reads them back for the
+  // messages route when Memory's events have expired; deleting and reading both
+  // list the session's prefix first. Scoped to the `conversations/` prefix.
+  const conversationArchiveBucketArn = props.refs.conversationArchiveBucket.bucketArn;
+  taskRole.addToPrincipalPolicy(
+    new iam.PolicyStatement({
+      sid: 'ConversationArchiveObjects',
+      effect: iam.Effect.ALLOW,
+      actions: ['s3:GetObject', 's3:PutObject', 's3:DeleteObject'],
+      resources: [`${conversationArchiveBucketArn}/conversations/*`],
+    }),
+  );
+  taskRole.addToPrincipalPolicy(
+    new iam.PolicyStatement({
+      sid: 'ConversationArchiveList',
+      effect: iam.Effect.ALLOW,
+      actions: ['s3:ListBucket'],
+      resources: [conversationArchiveBucketArn],
+      conditions: { StringLike: { 's3:prefix': ['conversations/*'] } },
+    }),
+  );
+
   // ── Core tables (OIDC, Users, Roles, API Keys, OAuth) ──
   const coreTables = [
     { sid: 'OidcStateAccess', arn: props.refs.oidcStateTable.tableArn },
@@ -194,6 +239,7 @@ export function grantAppApiPermissions(props: AppApiIamGrantsProps): void {
     { sid: 'VoiceTicketReplayAccess', arn: props.refs.voiceTicketReplayTable.tableArn },
     { sid: 'UserFilesTableAccess', arn: props.refs.fileUploadTable.tableArn },
     { sid: 'SharedConversationsAccess', arn: props.refs.sharedConversationsTable.tableArn },
+    { sid: 'ProjectsTableAccess', arn: props.refs.projectsTable.tableArn },
   ];
 
   for (const { sid, arn } of coreTables) {
@@ -224,9 +270,22 @@ export function grantAppApiPermissions(props: AppApiIamGrantsProps): void {
     }),
   );
 
+  // ── Transcribe Streaming (composer dictation) ──
+  // The `/dictation/stream` proxy presigns a Transcribe WebSocket URL with the
+  // task role's credentials. Streaming transcription has no resource-level
+  // permissions, so the resource is `*`. Granted regardless of
+  // DICTATION_ENABLED so flipping the kill switch never needs an IAM deploy.
+  taskRole.addToPrincipalPolicy(
+    new iam.PolicyStatement({
+      sid: 'TranscribeStreamingDictation',
+      effect: iam.Effect.ALLOW,
+      actions: ['transcribe:StartStreamTranscriptionWebSocket'],
+      resources: ['*'],
+    }),
+  );
+
   // ── Secrets Manager ──
   const secrets = [
-    props.refs.oauthClientSecretsSecret.secretArn,
     props.refs.authProviderSecretsSecret.secretArn,
     props.refs.voiceTicketSigningSecret.secretArn,
     props.refs.bffCookieDataKeySecret.secretArn,
@@ -260,10 +319,12 @@ export function grantAppApiPermissions(props: AppApiIamGrantsProps): void {
   // ── KMS (OAuth token encryption + BFF cookie signing) ──
   // Two separate statements because the access patterns differ:
   //
-  //   - OAuth token encryption key: the app encrypts external-MCP
-  //     OAuth tokens before persisting them to DDB and decrypts on
-  //     read. Needs the full Encrypt + Decrypt + GenerateDataKey
-  //     trio.
+  //   - OAuth token encryption key: the CMK on the oauth-user-tokens
+  //     table. The app never calls KMS on it directly (tokens live in
+  //     the AgentCore Identity vault since 1.0.0-beta.23), but the
+  //     /connectors disconnect flag is a row in that table, and
+  //     DynamoDB calls Encrypt/Decrypt/GenerateDataKey on the
+  //     caller's behalf for every read and write.
   //   - BFF cookie signing key: the app NEVER calls KMS directly
   //     on this key. The plaintext data key lives in Secrets
   //     Manager (BFF_COOKIE_DATA_KEY_SECRET_ARN); the cookie codec
@@ -286,6 +347,63 @@ export function grantAppApiPermissions(props: AppApiIamGrantsProps): void {
       effect: iam.Effect.ALLOW,
       actions: ['kms:Decrypt'],
       resources: [props.refs.bffCookieSigningKey.keyArn],
+    }),
+  );
+
+  // ── AgentCore Browser: Live View only ──
+  // app-api mints the short-lived Live View URL for a browser takeover
+  // (docs/specs/authenticated-web-assessment.md D2). The URL is SigV4
+  // query-signed and lives at most 300 seconds, so it cannot be minted once
+  // by the agent and reused — app-api signs a fresh one per request, which
+  // is why these actions are needed here and not only on the Runtime role.
+  //
+  // Deliberately NARROWER than the Runtime's BrowserAccess statement: no
+  // Start/Stop, no ConnectBrowserAutomationStream. app-api never drives the
+  // browser and must not be able to — the agent owns the session lifecycle.
+  // UpdateBrowserStream is included because releasing a takeover from the
+  // API side is the next thing this route will need (an explicit "give the
+  // browser back" control), and GetBrowserSession so an ended session can be
+  // reported as such rather than surfacing a signing failure.
+  taskRole.addToPrincipalPolicy(
+    new iam.PolicyStatement({
+      sid: 'BrowserLiveViewAccess',
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'bedrock-agentcore:UpdateBrowserStream',
+        'bedrock-agentcore:GetBrowserSession',
+      ],
+      resources: [props.refs.agentCoreBrowserArn],
+    }),
+  );
+
+  // ⚠️ `ConnectBrowserLiveViewStream` MUST be granted on `*`. AWS's own
+  // service reference lists NO resource types for it, while the two actions
+  // above list `browser` / `browser-custom`:
+  //
+  //   GetBrowserSession            -> ['browser', 'browser-custom']
+  //   UpdateBrowserStream          -> ['browser', 'browser-custom']
+  //   ConnectBrowserLiveViewStream -> []          <- no resource types
+  //
+  // An action with no resource types NEVER matches a resource-scoped
+  // statement, so scoping it alongside the others was an implicit deny. It
+  // failed silently and late: `generate_live_view_url` only signs locally and
+  // makes no API call, so a URL was minted happily and the browser's
+  // WebSocket was closed by the service — surfacing as DCV auth code 10
+  // ("Failed to communicate with server"), which reads like a service fault
+  // rather than a missing permission. Verified with
+  // `iam simulate-principal-policy`: allowed for the two above and
+  // implicitDeny for this one, from the SAME statement on the SAME ARN.
+  //
+  // `*` is as narrow as this action can be expressed; there is no
+  // browser-scoped form to fall back to. It is bounded by what the action
+  // itself permits — attaching to a live view stream — and app-api still
+  // cannot start, stop, or drive a browser.
+  taskRole.addToPrincipalPolicy(
+    new iam.PolicyStatement({
+      sid: 'BrowserLiveViewConnect',
+      effect: iam.Effect.ALLOW,
+      actions: ['bedrock-agentcore:ConnectBrowserLiveViewStream'],
+      resources: ['*'],
     }),
   );
 
@@ -386,6 +504,46 @@ export function grantAppApiPermissions(props: AppApiIamGrantsProps): void {
       resources: [memorySpacesTableArn, `${memorySpacesTableArn}/index/*`],
     }),
   );
+
+  // ── Large-document preparation (large-document-attachments §4C) ──
+  // complete_upload sends one message per reference-class upload. Only while
+  // the feature is on; the queue does not exist otherwise.
+  //
+  // Granted on the QUEUE's resource policy, not on this role: the role's
+  // statements already spill into CDK overflow managed policies, and this one
+  // pushed the fullest to ~6,160 of IAM's 6,144 characters (the trap that
+  // rolled back the 2.6a deploy). The queue policy exists anyway (enforceSSL),
+  // so this costs no resource, and same-account access needs only one side.
+  props.refs.largeDocumentPrepareQueue?.addToResourcePolicy(
+    new iam.PolicyStatement({
+      sid: 'AppApiSendsPrepareMessages',
+      effect: iam.Effect.ALLOW,
+      principals: [new iam.ArnPrincipal(taskRole.roleArn)],
+      actions: ['sqs:SendMessage'],
+      resources: [props.refs.largeDocumentPrepareQueue.queueArn],
+    }),
+  );
+
+  // ── Memory maintenance (Shared Projects 2.6) ──
+  // Starting a run async-invokes the worker (InvocationType=Event); nothing else.
+  //
+  // Its own managed policy, NOT `grantInvoke(taskRole)`: that statement lands in
+  // the role's CDK overflow policies, which CDK packs by a size it estimates
+  // before ARNs resolve. On dev the resolved OverflowPolicy3 was already 5,921 of
+  // IAM's 6,144 characters, so the grant failed the deploy (ServiceLimitExceeded)
+  // and rolled the stack back. A role may attach 10 managed policies; it has 3.
+  new iam.ManagedPolicy(scope, 'AppApiMemoryMaintenanceInvokePolicy', {
+    roles: [taskRole],
+    description: 'app-api: async-invoke the memory maintenance worker (Shared Projects 2.6)',
+    statements: [
+      new iam.PolicyStatement({
+        sid: 'MemoryMaintenanceWorkerInvoke',
+        effect: iam.Effect.ALLOW,
+        actions: ['lambda:InvokeFunction'],
+        resources: [props.refs.memoryMaintenanceWorker.functionArn],
+      }),
+    ],
+  });
 
   // ── Fine-tuning ──
   // Sourced from typed PlatformStack refs.
@@ -508,6 +666,44 @@ export function grantAppApiPermissions(props: AppApiIamGrantsProps): void {
     }),
   );
 
+  // ── AgentCore Evaluations (feedback eval sampling, spec §11 PR-4) ──
+  // The admin batch judges down-thumbed conversations with the built-in
+  // evaluators. Two halves: the SDK's span collector runs Logs Insights
+  // queries over the runtime log group and `aws/spans` (StartQuery is
+  // resource-scoped; GetQueryResults/StopQuery are not), then calls the
+  // data-plane Evaluate with the spans and the control-plane GetEvaluator
+  // to learn each evaluator's level. Built-in evaluators are AWS-owned, so
+  // the bedrock-agentcore actions cannot be resource-scoped. The flag
+  // (FEEDBACK_EVAL_SAMPLING_ENABLED) defaults OFF; the grant is inert until
+  // an environment opts in.
+  taskRole.addToPrincipalPolicy(
+    new iam.PolicyStatement({
+      sid: 'FeedbackEvalSpanQueries',
+      effect: iam.Effect.ALLOW,
+      actions: ['logs:StartQuery'],
+      resources: [
+        `arn:aws:logs:${config.awsRegion}:${config.awsAccount}:log-group:${props.agentCoreRuntimeLogGroupName}:*`,
+        `arn:aws:logs:${config.awsRegion}:${config.awsAccount}:log-group:aws/spans:*`,
+      ],
+    }),
+  );
+  taskRole.addToPrincipalPolicy(
+    new iam.PolicyStatement({
+      sid: 'FeedbackEvalSpanQueryResults',
+      effect: iam.Effect.ALLOW,
+      actions: ['logs:GetQueryResults', 'logs:StopQuery'],
+      resources: ['*'],
+    }),
+  );
+  taskRole.addToPrincipalPolicy(
+    new iam.PolicyStatement({
+      sid: 'FeedbackEvalEvaluate',
+      effect: iam.Effect.ALLOW,
+      actions: ['bedrock-agentcore:Evaluate', 'bedrock-agentcore:GetEvaluator', 'bedrock-agentcore:ListEvaluators'],
+      resources: ['*'],
+    }),
+  );
+
   // ── Bedrock model invocation ──
   // Used by both title generation and the API-key `/chat/api-converse`
   // handler (apis/app_api/chat/converse_routes.py), which calls Bedrock
@@ -525,11 +721,16 @@ export function grantAppApiPermissions(props: AppApiIamGrantsProps): void {
   // `bedrock:InvokeModel` on the account's DEFAULT PROJECT —
   // `arn:aws:bedrock:<region>:<account>:project/default`, already matched by
   // the `:*` suffix. Do not narrow this to `inference-profile/*`.
+  //
+  // CountTokens sizes a memory file once per save (Shared Projects 2.3,
+  // apis/shared/memory/tokens.py) against the base foundation-model id,
+  // which the foundation-model resource below already covers. Without it
+  // every save falls back to the chars/4 estimate (the save still succeeds).
   taskRole.addToPrincipalPolicy(
     new iam.PolicyStatement({
       sid: 'BedrockInvokeModel',
       effect: iam.Effect.ALLOW,
-      actions: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'],
+      actions: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream', 'bedrock:CountTokens'],
       resources: [
         `arn:aws:bedrock:*::foundation-model/*`,
         `arn:aws:bedrock:${config.awsRegion}:${config.awsAccount}:*`,

@@ -1,5 +1,6 @@
 {
   "tables": {
+    "agent-templates": [],
     "announcements": [],
     "api-keys": [
       "KeyHashIndex"
@@ -39,6 +40,10 @@
       "ProviderUsersIndex"
     ],
     "oidc-state": [],
+    "projects": [
+      "MemberIndex",
+      "OwnerIndex"
+    ],
     "quota-events": [
       "TierEventIndex"
     ],
@@ -53,6 +58,7 @@
     ],
     "sessions-metadata": [
       "DueScheduleIndex",
+      "ProjectSessionIndex",
       "SessionLookupIndex",
       "SessionRecencyIndex",
       "UserTimestampIndex"

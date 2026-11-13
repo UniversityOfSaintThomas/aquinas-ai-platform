@@ -42,6 +42,7 @@ import type {
   OAuthRequiredEvent,
   ToolApprovalRequiredEvent,
   UserQuestionRequiredEvent,
+  BrowserLoginRequiredEvent,
   UserQuestion,
   QuestionOption,
   CompactionEvent,
@@ -51,6 +52,7 @@ import type {
   SessionTitleEvent,
   SteeringAppliedEvent,
   ModelRetryEvent,
+  AgentNoticeEvent,
 } from './stream-parser-types';
 import type { MetadataEvent } from '../../../session/services/models/content-types';
 
@@ -98,6 +100,9 @@ export interface StreamParserCallbacks {
   // The agent paused to ask the user structured clarifying questions
   onUserQuestionRequired?: (data: UserQuestionRequiredEvent) => void;
 
+  // The agent paused so the user can sign in to a site it cannot reach
+  onBrowserLoginRequired?: (data: BrowserLoginRequiredEvent) => void;
+
   // What the agent is doing right now (model/tool boundaries from the
   // runtime's AgentStatusHook). Drives the live status line and supplies the
   // event-loop-measured duration for each finished tool row.
@@ -139,6 +144,11 @@ export interface StreamParserCallbacks {
   // Advisory only — the turn continues; this exists so the resulting silence
   // reads as "working" instead of "hung".
   onModelRetry?: (data: ModelRetryEvent) => void;
+
+  // A project's agent is running this turn without some of its tools, skills,
+  // model or memory (the member can't use them). Informational: the turn
+  // continues. Arrives before message_start.
+  onAgentNotice?: (data: AgentNoticeEvent) => void;
 
   // Error handling
   onError?: (data: StreamErrorEvent | ConversationalStreamErrorEvent | string) => void;
@@ -513,6 +523,57 @@ export function validateUserQuestionRequiredEvent(
 }
 
 /**
+ * Validate BrowserLoginRequiredEvent structure.
+ *
+ * `viewport` is required and must be two positive numbers: it becomes DCV's
+ * `remoteWidth`/`remoteHeight`, and a missing or zero value silently produces
+ * a cropped or blank stream rather than an error the user could report.
+ *
+ * Deliberately rejects any event carrying a `url`-ish field. Nothing upstream
+ * should ever put one here (the backend asserts that too), so if one appears
+ * it means a contract regression shipped, and failing loudly beats framing a
+ * URL of unknown provenance.
+ */
+export function validateBrowserLoginRequiredEvent(
+  data: unknown,
+): data is BrowserLoginRequiredEvent {
+  if (!data || typeof data !== 'object') {
+    return false;
+  }
+
+  const event = data as Partial<BrowserLoginRequiredEvent> & {
+    url?: unknown;
+    liveViewUrl?: unknown;
+  };
+
+  if (event.url !== undefined || event.liveViewUrl !== undefined) {
+    return false;
+  }
+
+  const viewport = event.viewport;
+  const viewportOk =
+    !!viewport &&
+    typeof viewport === 'object' &&
+    typeof viewport.width === 'number' &&
+    typeof viewport.height === 'number' &&
+    viewport.width > 0 &&
+    viewport.height > 0;
+
+  return (
+    event.type === 'browser_login_required' &&
+    typeof event.interruptId === 'string' &&
+    event.interruptId.length > 0 &&
+    typeof event.toolUseId === 'string' &&
+    typeof event.sessionId === 'string' &&
+    typeof event.browserSessionId === 'string' &&
+    event.browserSessionId.length > 0 &&
+    typeof event.browserId === 'string' &&
+    event.browserId.length > 0 &&
+    viewportOk
+  );
+}
+
+/**
  * Validate CompactionEvent structure
  */
 export function validateCompactionEvent(data: unknown): data is CompactionEvent {
@@ -679,8 +740,20 @@ export function validateAgentStatusEvent(data: unknown): data is AgentStatusEven
 
   const event = data as Partial<AgentStatusEvent>;
 
+  if (event.type !== 'agent_status') {
+    return false;
+  }
+
+  // `preparing` precedes the event loop, so it carries no cycle to check. It
+  // is also the only phase emitted by the chat route rather than the status
+  // hook — requiring `cycle` here would have dropped every one of them
+  // silently, which is exactly the failure mode this validator exists to
+  // avoid on the OTHER phases.
+  if (event.phase === 'preparing' || event.phase === 'prepared') {
+    return true;
+  }
+
   return (
-    event.type === 'agent_status' &&
     (event.phase === 'thinking' ||
       event.phase === 'tool_start' ||
       event.phase === 'tool_end') &&
@@ -710,6 +783,29 @@ export function validateToolGroupSummaryEvent(
     event.summary.trim().length > 0 &&
     Array.isArray(event.toolUseIds) &&
     event.toolUseIds.length > 0
+  );
+}
+
+/**
+ * Validate an `agent_notice` event. `message` is what the user reads, so an
+ * empty one is rejected rather than rendered as a blank notice.
+ */
+export function validateAgentNoticeEvent(data: unknown): data is AgentNoticeEvent {
+  if (!data || typeof data !== 'object') {
+    return false;
+  }
+
+  const event = data as Partial<AgentNoticeEvent>;
+
+  return (
+    event.type === 'agent_notice' &&
+    typeof event.sessionId === 'string' &&
+    event.sessionId.length > 0 &&
+    typeof event.agentId === 'string' &&
+    typeof event.message === 'string' &&
+    event.message.trim().length > 0 &&
+    Array.isArray(event.unavailableTools) &&
+    Array.isArray(event.unavailableSkills)
   );
 }
 
@@ -906,6 +1002,14 @@ export function processStreamEvent(
         }
         break;
 
+      case 'browser_login_required':
+        if (validateBrowserLoginRequiredEvent(data)) {
+          callbacks.onBrowserLoginRequired?.(data);
+        } else {
+          callbacks.onParseError?.('browser_login_required: invalid data structure');
+        }
+        break;
+
       case 'compaction':
         if (validateCompactionEvent(data)) {
           callbacks.onCompaction?.(data);
@@ -961,6 +1065,14 @@ export function processStreamEvent(
           callbacks.onModelRetry?.(data);
         } else {
           callbacks.onParseError?.('model_retry: invalid data structure');
+        }
+        break;
+
+      case 'agent_notice':
+        if (validateAgentNoticeEvent(data)) {
+          callbacks.onAgentNotice?.(data);
+        } else {
+          callbacks.onParseError?.('agent_notice: invalid data structure');
         }
         break;
 

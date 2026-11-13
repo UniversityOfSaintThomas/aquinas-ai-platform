@@ -18,6 +18,8 @@ const MOCK_ANATOMY: SessionCostAnatomy = {
   wastedUsd: 0.03,
   agentSwitchMissCount: 0,
   agentSwitchUsd: 0,
+  modelSwitchMissCount: 0,
+  modelSwitchUsd: 0,
   cacheEfficiency: 0.8,
   calls: [
     {
@@ -242,6 +244,76 @@ describe('SessionCostAnatomyPage', () => {
       expect(page.profileNotFound()).toBe(false);
     });
 
+    it('summarises compaction decisions by kind with the latest summary size', async () => {
+      const profile = vi.fn().mockReturnValue(
+        of({
+          ...MOCK_PROFILE,
+          dataCoverage: { ...MOCK_PROFILE.dataCoverage, compactionCount: true, compactionEvents: true, windowTrim: true, prefixTokens: true },
+          compactionEventCounts: { forced: 1, applied: 3 },
+          lastSummaryTokens: 2_300,
+          prefixTokens: { system: 12_000, tools: 48_000 },
+          windowTrimCalls: 4,
+          windowRemovedMessages: 16,
+        }),
+      );
+      const page = setup(vi.fn().mockReturnValue(of(MOCK_ANATOMY)), profile).componentInstance;
+      await vi.waitFor(() => expect(page.profileResource.hasValue()).toBe(true));
+      expect(page.compactionEventsLine()).toBe('3 applied · 1 forced · summary 2.3K');
+    });
+
+    it('describes one compaction event from its numbers only', () => {
+      const page = setup(vi.fn().mockReturnValue(of(MOCK_ANATOMY))).componentInstance;
+      expect(
+        page.compactionEventTitle({ kind: 'floor_unreachable', checkpoint: 12, summaryTokens: 900, retainedMessages: 30 }),
+      ).toBe('floor unreachable · checkpoint 12 · summary 900 · 30 messages retained');
+      expect(page.compactionEventTitle({ kind: 'checkpoint' })).toBe('checkpoint');
+      expect(
+        page.compactionEventTitle({ kind: 'document_offload', documents: 1, documentTokens: 9_000, cacheGapSeconds: 420 }),
+      ).toBe('document offload · 1 document · ~9.0K tokens · cache gap 7m');
+    });
+
+    it('summarises how the documents were consumed, or falls back when untracked', async () => {
+      const profile = vi.fn().mockReturnValue(
+        of({
+          ...MOCK_PROFILE,
+          dataCoverage: { ...MOCK_PROFILE.dataCoverage, documents: true },
+          fullDocumentCalls: 2,
+          digestOnlyCalls: 1,
+          documentReadCalls: 1,
+          documentReadPages: 4,
+          peakDocumentTokens: 12_000,
+        }),
+      );
+      const page = setup(vi.fn().mockReturnValue(of(MOCK_ANATOMY)), profile).componentInstance;
+      await vi.waitFor(() => expect(page.profileResource.hasValue()).toBe(true));
+      expect(page.documentsLine()).toBe('2 full · 1 digest-only · read 4 pages in 1 calls · peak ~12.0K');
+
+      const untracked = setup(vi.fn().mockReturnValue(of(MOCK_ANATOMY))).componentInstance;
+      await vi.waitFor(() => expect(untracked.profileResource.hasValue()).toBe(true));
+      expect(untracked.documentsLine()).toBe('');
+    });
+
+    it('badges a call by what the model had of the documents', () => {
+      const page = setup(vi.fn().mockReturnValue(of(MOCK_ANATOMY))).componentInstance;
+      const base = MOCK_ANATOMY.calls[0];
+      expect(page.documentBadge({ ...base })).toBe('');
+      expect(page.documentBadge({ ...base, hasDocuments: true, documentCount: 1 })).toBe('doc');
+      expect(page.documentBadge({ ...base, hasDocuments: false, documentDigests: 2 })).toBe('digest');
+      expect(page.documentBadge({ ...base, hasDocuments: false, documentReads: { calls: 1, pages: 4, bytes: 9 } })).toBe('+4p');
+      expect(page.documentDetail({ ...base })).toBe('');
+      expect(
+        page.documentDetail({
+          ...base,
+          hasDocuments: true,
+          documentCount: 2,
+          documentTokens: 12_000,
+          documentMime: { pdf: 2 },
+          documentsAttached: 2,
+          documentReads: { calls: 1, pages: 4, bytes: 9 },
+        }),
+      ).toBe('2 inline ~12.0K (pdf×2) · 2 attached this turn · document_read ×1 → 4 pages');
+    });
+
     it('survives a missing profile without touching the anatomy', async () => {
       const page = setup(
         vi.fn().mockReturnValue(of(MOCK_ANATOMY)),
@@ -351,6 +423,29 @@ describe('SessionCostAnatomyPage', () => {
       // a nonsense pair must not render as "-4 unexplained".
       const page = await loadWith({ avoidableMissCount: 1, agentSwitchMissCount: 5 });
       expect(page.unexplainedMisses()).toBe(0);
+    });
+
+    it('subtracts model switches as well as agent switches', async () => {
+      // The pairs are disjoint (a miss with both flags counts as an agent switch), so
+      // subtracting both never double-counts.
+      const page = await loadWith({ avoidableMissCount: 4, agentSwitchMissCount: 1, modelSwitchMissCount: 2 });
+      expect(page.unexplainedMisses()).toBe(1);
+    });
+
+    it('names each explained source under the count', async () => {
+      const page = await loadWith({ avoidableMissCount: 4, agentSwitchMissCount: 1, modelSwitchMissCount: 2 });
+      expect(page.explainedMissNote()).toBe('1 from an agent switch, 2 from a model switch');
+    });
+
+    it('names a model switch alone', async () => {
+      const page = await loadWith({ avoidableMissCount: 1, modelSwitchMissCount: 1 });
+      expect(page.explainedMissNote()).toBe('1 from a model switch');
+      expect(page.unexplainedMisses()).toBe(0);
+    });
+
+    it('says nothing when no miss is explained', async () => {
+      const page = await loadWith({ avoidableMissCount: 2 });
+      expect(page.explainedMissNote()).toBeNull();
     });
 
     it('is zero before the resource resolves', async () => {

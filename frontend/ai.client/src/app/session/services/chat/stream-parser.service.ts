@@ -19,23 +19,29 @@ import {
 import { OAuthConsentService } from '../../../services/oauth-consent/oauth-consent.service';
 import { ToolApprovalService } from '../../../services/tool-approval/tool-approval.service';
 import { UserQuestionService } from '../../../services/user-question/user-question.service';
+import { BrowserLoginService } from '../../../services/browser-login/browser-login.service';
 import { CompactionSummaryService } from './compaction-summary.service';
 import { SteeringService } from './steering.service';
 import { buildSteeringMessage } from './steering';
 import { ArtifactStateService } from '../artifacts/artifact-state.service';
+import { FilePreviewStateService } from '../file-preview/file-preview-state.service';
+import { isPreviewableFilename } from '../file-preview/file-preview.model';
 import { McpAppStateService } from '../mcp-apps/mcp-app-state.service';
 import { ToolInsightService } from './tool-insight.service';
 import { SessionService } from '../session/session.service';
+import { AgentNoticeService } from '../agent-notice/agent-notice.service';
 import type {
   OAuthRequiredEvent,
   ToolApprovalRequiredEvent,
   UserQuestionRequiredEvent,
+  BrowserLoginRequiredEvent,
   CompactionEvent,
   ArtifactEvent,
   UiResourceEvent,
   ToolInputPartialEvent,
   SessionTitleEvent,
   ModelRetryEvent,
+  AgentNoticeEvent,
 } from '../../../shared/utils/stream-parser';
 import {
   processStreamEvent,
@@ -130,8 +136,22 @@ interface ParserSessionState {
   /** Error state */
   error: WritableSignal<string | null>;
 
-  /** Stream completion state */
+  /**
+   * Parser-side completion: true once `done` was handled OR the parser gave
+   * up on the stream (`setError`). Drives rendering only — a client parse
+   * error says nothing about whether the server's turn is still running.
+   */
   isStreamComplete: WritableSignal<boolean>;
+
+  /**
+   * True once the server sent this stream's `done` frame — the turn is over
+   * server-side, whatever the parser made of it. Recorded before the state
+   * gate, so a parser already in `Error` still learns the turn ended.
+   * Read by the Stop path: a Stop after this point must not mark the
+   * finished turn interrupted. Reset with the rest of the state on every
+   * new stream.
+   */
+  doneReceived: boolean;
 
   /** Metadata (usage, metrics) from the stream */
   metadata: WritableSignal<MetadataEvent | null>;
@@ -165,12 +185,15 @@ export class StreamParserService {
   private oauthConsentService = inject(OAuthConsentService);
   private toolApprovalService = inject(ToolApprovalService);
   private userQuestionService = inject(UserQuestionService);
+  private browserLoginService = inject(BrowserLoginService);
   private compactionSummary = inject(CompactionSummaryService);
   private steering = inject(SteeringService);
   private artifactState = inject(ArtifactStateService);
+  private filePreview = inject(FilePreviewStateService);
   private mcpAppState = inject(McpAppStateService);
   private sessionService = inject(SessionService);
   private toolInsight = inject(ToolInsightService);
+  private agentNotice = inject(AgentNoticeService);
 
   // =========================================================================
   // Per-Session State
@@ -189,7 +212,6 @@ export class StreamParserService {
   private readonly lastEventAtCache = new Map<string, Signal<number>>();
   private readonly citationsCache = new Map<string, Signal<Citation[]>>();
   private readonly errorCache = new Map<string, Signal<string | null>>();
-  private readonly isStreamCompleteCache = new Map<string, Signal<boolean>>();
 
   // =========================================================================
   // Public API
@@ -239,9 +261,16 @@ export class StreamParserService {
     return this.cachedAccessor(this.errorCache, sessionId, (state) => state.error(), null);
   }
 
-  /** Stream completion state for a session. */
-  isStreamCompleteFor(sessionId: string): Signal<boolean> {
-    return this.cachedAccessor(this.isStreamCompleteCache, sessionId, (state) => state.isStreamComplete(), false);
+  /**
+   * Whether a session's CURRENT stream has received the server's `done`.
+   *
+   * Scoped to the stream the parser was last reset for, so a new turn reads
+   * false until its own `done`. Deliberately not derived from
+   * `isStreamComplete`, which a client-side parse error also sets while the
+   * server turn keeps running — a Stop then is a real interruption.
+   */
+  hasReceivedDone(sessionId: string): boolean {
+    return this.states().get(sessionId)?.doneReceived ?? false;
   }
 
   /**
@@ -295,6 +324,12 @@ export class StreamParserService {
     // Placed after the stale-stream guard so a superseded stream can't keep
     // its replacement looking alive.
     state.lastEventAt.set(Date.now());
+
+    // Like liveness, the end of the server's turn is a transport fact the
+    // state gate below must not swallow (a parser in `Error` drops `done`).
+    if (event === 'done') {
+      state.doneReceived = true;
+    }
 
     // Validate inputs
     if (!event || typeof event !== 'string') {
@@ -420,6 +455,7 @@ export class StreamParserService {
       lastEventAt: signal<number>(Date.now()),
       error: signal<string | null>(null),
       isStreamComplete,
+      doneReceived: false,
       metadata: signal<MetadataEvent | null>(null),
       pendingCitations: signal<Citation[]>([]),
       currentMessage: computed<Message | null>(() => {
@@ -483,6 +519,48 @@ export class StreamParserService {
    * and re-hydrate from the server, so a background stream must not push
    * into them while another conversation is on screen.
    */
+  /**
+   * Surface a file the turn just produced in the docked preview pane.
+   *
+   * Parity with artifacts, which pop their panel from `onArtifact`. The
+   * office tools have no SSE event of their own — the download card is
+   * just a `file_download` inline visual inside the tool result — so the
+   * hook lives here instead. That is the right place for a second reason:
+   * `tool_result` only ever arrives mid-stream, so reopening an old
+   * conversation replays the card without reopening the pane, matching
+   * `seedFromHydration` on the artifact side.
+   *
+   * Viewed-session only, for the same reason as `onArtifact`: a
+   * conversation streaming in the background must never seize the rail.
+   *
+   * A turn that writes several files opens each in turn and the last one
+   * wins, which is also how the artifact panel behaves. Formats the pane
+   * cannot render (.xlsx today) are skipped, so the card is left to speak
+   * for itself rather than opening a pane that would only show an error.
+   */
+  private maybeOpenFilePreview(
+    state: ParserSessionState,
+    resultContent: ReadonlyArray<{ json?: unknown }>,
+  ): void {
+    if (!this.isViewedSession(state)) return;
+
+    for (const entry of resultContent) {
+      const json = entry.json as
+        | { ui_type?: string; payload?: { filename?: string; upload_id?: string } }
+        | undefined;
+      if (!json || json.ui_type !== 'file_download') continue;
+
+      const filename = json.payload?.filename;
+      const uploadId = json.payload?.upload_id;
+      // `upload_id` is the current contract; cards persisted before it
+      // carry only an expired presigned URL, and those never stream live.
+      if (!filename || !uploadId) continue;
+      if (!isPreviewableFilename(filename)) continue;
+
+      this.filePreview.open({ uploadId, filename });
+    }
+  }
+
   private isViewedSession(state: ParserSessionState): boolean {
     return this.chatStateService.viewedSessionId() === state.sessionId;
   }
@@ -530,6 +608,10 @@ export class StreamParserService {
         // conversation instead of leaking into the one on screen.
         state.modelRetry.set(data);
       },
+
+      // Keyed by this stream's session, like model_retry: a background
+      // task's notice stays with that task.
+      onAgentNotice: (data: AgentNoticeEvent) => this.agentNotice.set(state.sessionId, data),
 
       onMetadata: (data) => this.handleMetadata(state, data),
       onReasoning: (data) => this.handleReasoning(state, data),
@@ -660,6 +742,26 @@ export class StreamParserService {
         });
       },
 
+      onBrowserLoginRequired: (data: BrowserLoginRequiredEvent) => {
+        const lastAssistantId = this.findLastAssistantId(state);
+        // `data.sessionId` is the conversation the backend named; prefer the
+        // parser's own state so a late event from a previous conversation
+        // cannot point the viewer at the wrong thread.
+        this.browserLoginService.requestLogin({
+          interruptId: data.interruptId,
+          toolUseId: data.toolUseId,
+          sessionId: state.sessionId || data.sessionId,
+          browserSessionId: data.browserSessionId,
+          browserId: data.browserId,
+          viewport: data.viewport,
+          deadlineAt: data.deadlineAt,
+          targetUrl: data.targetUrl,
+          reason: data.reason,
+          sandboxOrigin: data.sandboxOrigin,
+          messageId: lastAssistantId,
+        });
+      },
+
       onError: (data) => this.handleError(state, data),
       onStreamError: (data) => {
         const streamError = data as ConversationalStreamError;
@@ -749,6 +851,9 @@ export class StreamParserService {
 
     const blockType: 'text' | 'tool_use' = data.type === 'tool_use' ? 'tool_use' : 'text';
 
+    // Output is starting, so any thinking that preceded it is over.
+    this.closeReasoningSpan(state);
+
     state.currentMessageBuilder.update((builder) => {
       if (!builder) return builder;
 
@@ -778,6 +883,10 @@ export class StreamParserService {
     }
 
     const inferredType = inferContentBlockType(data);
+
+    // The accurate end of thinking for a model that skips content_block_start
+    // for text (Claude does), which is the common case.
+    this.closeReasoningSpan(state);
 
     state.currentMessageBuilder.update((builder) => {
       if (!builder) return builder;
@@ -858,12 +967,20 @@ export class StreamParserService {
     const toolUseId = data.tool_result.toolUseId;
     const content = data.tool_result.content || [];
     const status = data.tool_result.status || 'success';
+    const structuredContent = data.tool_result.structuredContent;
 
     const currentBuilder = state.currentMessageBuilder();
     if (!currentBuilder) {
       this.setError(state, 'tool_result: received without active message');
       return;
     }
+
+    // Parsed before the block lookup, and the pane opened from it, so
+    // surfacing a file the turn produced does not depend on the block
+    // bookkeeping below finding its tool_use — an unmatched result still
+    // means the file exists.
+    const resultContent = parseToolResultContent(content);
+    this.maybeOpenFilePreview(state, resultContent);
 
     // Find the tool_use block
     let foundIndex: number | null = null;
@@ -881,8 +998,6 @@ export class StreamParserService {
       return; // Tool use block not found
     }
 
-    const resultContent = parseToolResultContent(content);
-
     state.currentMessageBuilder.update((builder) => {
       if (!builder) return builder;
 
@@ -894,6 +1009,9 @@ export class StreamParserService {
         result: {
           content: resultContent,
           status: status,
+          // Kept so an MCP App's "waiting for you" result is not read as a
+          // failure (`isAwaitingUserSubmission`).
+          ...(structuredContent !== undefined ? { structuredContent } : {}),
         },
         status: status === 'error' ? 'error' : 'complete',
       };
@@ -914,6 +1032,10 @@ export class StreamParserService {
 
     this.chatStateService.setStopReason(state.sessionId, data.stopReason);
 
+    // Backstop for a cycle that reasoned and emitted nothing else — without it
+    // that block would keep the live "Thinking" header forever.
+    this.closeReasoningSpan(state);
+
     state.currentMessageBuilder.update((builder) => {
       if (!builder) return builder;
       return { ...builder, isComplete: true };
@@ -928,6 +1050,7 @@ export class StreamParserService {
   private handleDone(state: ParserSessionState): void {
     this.finalizeCurrentMessage(state);
     state.isStreamComplete.set(true);
+    state.doneReceived = true;
     state.modelRetry.set(null);
     // "Using list_courses" on a finished turn is a lie, not a stale nicety.
     // Durations and summaries already recorded are untouched.
@@ -1016,8 +1139,54 @@ export class StreamParserService {
         usage.inputTokens +
         (usage.cacheReadInputTokens ?? 0) +
         (usage.cacheWriteInputTokens ?? 0);
-      this.chatStateService.setContext(state.sessionId, totalContext, data.contextWindow);
+      this.chatStateService.setContext(
+        state.sessionId,
+        totalContext,
+        data.contextWindow,
+        data.contextBreakdown ?? null,
+      );
     }
+  }
+
+  /**
+   * Stamp the end of an open reasoning span, if there is one.
+   *
+   * Called from every point where the model has demonstrably switched from
+   * thinking to producing output: a non-reasoning `content_block_start`, a
+   * non-reasoning `content_block_delta`, and `message_stop` as the backstop
+   * for a cycle that reasoned and then ended without emitting anything else.
+   *
+   * Idempotent and cheap: it reads the builder first and returns without
+   * touching the signal unless there is an open span to close. That matters
+   * because the delta path calls it on every token of the answer.
+   */
+  private closeReasoningSpan(state: ParserSessionState): void {
+    const builder = state.currentMessageBuilder();
+    if (!builder) return;
+
+    let openIndex = -1;
+    for (const [index, block] of builder.contentBlocks.entries()) {
+      if (
+        block.type === 'reasoningContent' &&
+        block.reasoningStartedAt !== undefined &&
+        block.reasoningEndedAt === undefined
+      ) {
+        openIndex = index;
+        break;
+      }
+    }
+    if (openIndex === -1) return;
+
+    const endedAt = Date.now();
+    state.currentMessageBuilder.update((current) => {
+      if (!current) return current;
+      const block = current.contentBlocks.get(openIndex);
+      if (!block || block.reasoningEndedAt !== undefined) return current;
+
+      const newBlocks = new Map(current.contentBlocks);
+      newBlocks.set(openIndex, { ...block, reasoningEndedAt: endedAt });
+      return { ...current, contentBlocks: newBlocks };
+    });
   }
 
   private handleReasoning(state: ParserSessionState, data: { reasoningText?: string }): void {
@@ -1056,6 +1225,10 @@ export class StreamParserService {
           inputChunks: [],
           reasoningChunks: [],
           isComplete: false,
+          // Opens the span the header's "Thought for 17s" reports. Closed by
+          // `closeReasoningSpan` at the first non-reasoning content, or at
+          // message_stop. See docs/specs/agent-state-feedback.md PR-1.
+          reasoningStartedAt: Date.now(),
         };
       }
 
@@ -1226,6 +1399,13 @@ export class StreamParserService {
       };
     }
 
+    // Turn-level: how long the whole turn took, server-measured. Kept
+    // separate from `latency.endToEndLatency` because the persisted form of
+    // that field is the provider's API-call time, so the two disagree.
+    if (metadataEvent.turnDurationMs !== undefined) {
+      result['turnDurationMs'] = metadataEvent.turnDurationMs;
+    }
+
     if (metadataEvent.cost !== undefined) {
       result['cost'] = metadataEvent.cost;
     }
@@ -1244,7 +1424,7 @@ export class StreamParserService {
   private buildContentBlock(state: ParserSessionState, builder: ContentBlockBuilder): ContentBlock {
     // Handle reasoning content blocks
     if (builder.type === 'reasoningContent') {
-      return {
+      const block: ContentBlock = {
         type: 'reasoningContent',
         reasoningContent: {
           reasoningText: {
@@ -1252,6 +1432,21 @@ export class StreamParserService {
           },
         },
       } as ContentBlock;
+
+      // Only once the span is closed. A duration that ticked upward while the
+      // model was still thinking would be a stopwatch, not the summary the
+      // header is for — and the live state is already conveyed by the label.
+      if (
+        builder.reasoningStartedAt !== undefined &&
+        builder.reasoningEndedAt !== undefined
+      ) {
+        block.reasoningDurationMs = Math.max(
+          0,
+          builder.reasoningEndedAt - builder.reasoningStartedAt,
+        );
+      }
+
+      return block;
     }
 
     // Handle tool use blocks
