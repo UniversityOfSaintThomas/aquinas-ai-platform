@@ -14,7 +14,7 @@ A promotion is the pull request from `develop` into `production`. Each branch's 
 
 **Maintained on `develop`.** This file reaches `production` with the next promotion. It is kept off `main`, because a local commit there means `main` no longer matches upstream, and *Sync fork* can then hit conflicts that GitHub asks you to resolve with a pull request.
 
-**Not every entry is on every branch.** Entry 1 exists only on `production`, so a reader on `develop` will not find it in their working tree, and that is expected. Entries 2 to 9 exist on `develop` and reach `production` at the next promotion.
+**Not every entry is on every branch.** Entry 1 exists only on `production`, so a reader on `develop` will not find it in their working tree, and that is expected. Entries 2 to 10 exist on `develop` and reach `production` at the next promotion.
 
 ## Summary
 
@@ -29,6 +29,7 @@ A promotion is the pull request from `develop` into `production`. Each branch's 
 | 7 | St. Thomas web crawler user agent | `crawler.py` (1 line) | `develop`, both after promotion | Not applicable; a configurable user agent is an issue candidate | Upstream makes it configurable |
 | 8 | System prompt date in Central time | `timezone.py` (2 lines), `test_timezone.py` | `develop`, both after promotion | A configurable timezone is an issue candidate | Upstream makes it configurable |
 | 9 | Backport: attachment eviction tests | `test_attachment_index.py` (test only) | `develop`, both after promotion | Fixed upstream in `e4b1961` (v1.31.0) | The 1.35.0 upgrade |
+| 10 | Backport: conversation search tests | `test_conversation_search_route.py` (test only) | `develop`, both after promotion | Fixed upstream in `12643da3` (v1.34.0) | The 1.35.0 upgrade |
 
 ---
 
@@ -273,6 +274,22 @@ An upstream defect in a test, not in the product, and already fixed upstream. `T
 Upstream fixed it on `develop` on 2026-10-21, three days after v1.30.0 was tagged. The fix pins the rows' creation time to the same `NOW`-relative instant. Production code is unchanged.
 
 **Temporary.** Upstream's copy of the file at v1.31.0 and v1.35.0 is identical to ours, so the upgrade merge should apply cleanly or report the change as already present. After the 1.35.0 upgrade, confirm the file matches upstream and delete this entry and its summary row.
+
+---
+
+## 10. Backport: conversation search tests no longer expire on a calendar date
+
+**Branches:** `develop`; reaches `production` at the next promotion
+
+**File:** `backend/tests/shared/test_conversation_search_route.py` (+7 −1, test only)
+
+**Commit:** `3a6dc678` on `develop`, cherry-picked with `-x` from upstream `12643da3` ("test(search): date the fake KB turns relative to now", upstream author kept)
+
+An upstream defect in a test, not in the product, and already fixed upstream. The fake knowledge base document's default `created_at` was a fixed 2026-10-07. With the test's 30-day retention it aged past the window on 2026-11-06, and `test_turns_past_retention_are_dropped` failed. Because every Backend deploy job depends on `test-backend`, this blocked all Backend deploys on v1.30.0, including production's first (2026-11-13).
+
+Upstream fixed it on `develop` on 2026-11-06, and released it in v1.34.0. The fix dates the fake turns an hour before now. Production code is unchanged.
+
+**Temporary.** With this backport, our copy of the file is identical to upstream's at v1.34.0 and v1.35.0, so the upgrade merge should apply cleanly. After the 1.35.0 upgrade, confirm the file matches upstream and delete this entry and its summary row.
 
 ---
 
