@@ -33,11 +33,12 @@
           class="group relative min-w-0"
           role="group"
           aria-label="Assistant message with metadata">
-            <div class="rounded-2xl bg-gray-50 px-4 py-3 text-base/6 text-gray-800 dark:bg-gray-900 dark:text-gray-200 overflow-hidden">
+            <div class="rounded-2xl bg-gray-50 px-0 sm:px-4 py-3 text-base/6 text-gray-800 dark:bg-gray-900 dark:text-gray-200 overflow-hidden">
                 <app-assistant-message
                   class="min-w-0 block"
                   [messages]="segment.messages"
-                  [streamingMessageId]="streamingMessageId()"></app-assistant-message>
+                  [streamingMessageId]="streamingMessageId()"
+                  [insightSessionId]="insightSessionId()"></app-assistant-message>
             </div>
             <!-- Per-response affordances anchor to the run's LAST message:
                  that is the one a Continue resumes and the one whose cost
@@ -45,6 +46,7 @@
             <div class="mt-1 flex justify-start">
                 <app-message-actions
                   [messages]="segment.messages"
+                  [latest]="segment.key === latestResponseKey()"
                   [canContinue]="canContinueFor(segment.last.id)"
                   [interruptedReason]="interruptedReasonFor(segment.last.id)"
                   (continueRequested)="continueRequested.emit()"></app-message-actions>
@@ -54,7 +56,7 @@
                     <app-message-metadata-badges [metadata]="segment.last.metadata"></app-message-metadata-badges>
                 }
                 @if (segment.last.citations && segment.last.citations.length > 0) {
-                    <app-citation-display [citations]="segment.last.citations"></app-citation-display>
+                    <app-citation-display [citations]="segment.last.citations" [allowDownload]="allowDownload()"></app-citation-display>
                 }
             </div>
         </div>
@@ -107,6 +109,7 @@
     }
 
   }
+
 
   <!-- End-of-conversation sections render INSIDE the last turn's reserved
        space so they stay adjacent to the response instead of landing a
@@ -211,7 +214,26 @@
     <app-user-question-prompt [request]="request" />
   }
 
-  <!-- Loading indicator -->
+  <!-- Browser sign-in card: the agent paused so the user can authenticate a
+       site it cannot reach. The card opens the live browser in the docked
+       side panel below. Survives a refresh via the same PendingInterrupt
+       breadcrumb replay. -->
+  @for (request of pendingBrowserLogins(); track request.interruptId) {
+    <app-browser-login-prompt [request]="request" />
+  }
+
+  <!-- What the turn is doing, and then what it did.
+
+       These are ONE slot, not two. The recap is the `@else` of the loading
+       line and carries the same `py-4`, so when a turn ends the live line is
+       replaced in place by its own settled form — same position, same orb,
+       same bullet, nothing moves. Rendering the recap inside the turn instead
+       (where it started) put it on screen while the loader was still running
+       below it, which read as a second unrelated thing rather than as the
+       first one finishing.
+
+       Only the last turn has either, which is why both live here in the tail
+       rather than in the `@for` over turns. -->
   @if (isChatLoading()) {
     <div class="py-4">
       <app-pulsating-loader
@@ -219,6 +241,18 @@
       [status]="loaderStatus()"
       [statusTool]="loaderStatusTool()"
       [startedAt]="loaderStartedAt()" />
+    </div>
+  } @else if (lastTurnRecap(); as recap) {
+    <div class="py-4 flex items-center justify-start gap-2">
+      <!-- The loading line's orb, at rest — same size, same hue, muted, and
+           with the halo gone. The turn is over, so the thing that said
+           "still going" stops saying it without vanishing.
+
+           The bullet is the loader's own separator, kept so the finished line
+           keeps the shape the user was just reading. -->
+      <span class="turn-recap-dot" aria-hidden="true"></span>
+      <span class="turn-recap-sep" aria-hidden="true">&bull;</span>
+      <span class="text-xs tabular-nums text-gray-400 dark:text-gray-500">{{ recap }}</span>
     </div>
   }
 
@@ -248,4 +282,8 @@
 
   <!-- Fixed-position slide-over; renders only when an artifact is open. -->
   <app-artifact-panel />
+  <app-file-preview-panel />
+  <!-- The live sign-in browser, on the same rail. Mounted once so its
+       iframe never moves in the DOM (a moved iframe reloads its stream). -->
+  <app-browser-panel />
 </div>

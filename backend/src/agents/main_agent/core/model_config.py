@@ -224,65 +224,66 @@ def _apply_canonical_params(
 class RetryConfig:
     """Configuration for model invocation retry behavior.
 
-    Controls two independent retry layers:
-    1. Botocore layer - HTTP-level retries before the Strands SDK sees errors
-    2. Strands SDK layer - Agent event loop retries on ModelThrottledException
+    The agent's retry strategy (``TransientModelRetryStrategy``) is the only
+    retry layer, for every provider. The transport underneath makes a single
+    attempt: botocore is configured with ``max_attempts=1`` and the OpenAI
+    client with ``max_retries=0``. They used to retry on their own as well,
+    and the layers multiplied: up to 3 botocore x 4 SDK = 12 Bedrock calls
+    per invocation. Now a call is tried at most ``sdk_max_attempts`` times.
 
     When all retries are exhausted, the exception propagates to StreamCoordinator
     which streams it to the client as a conversational error message.
 
     Can be loaded from environment variables or passed directly.
     """
-    # Botocore layer (HTTP-level retries, fires first)
-    boto_max_attempts: int = 3          # Total attempts including initial call
-    boto_retry_mode: str = "standard"   # "legacy", "standard", or "adaptive"
+    # Transport timeouts (botocore). Retries happen only in the SDK layer.
     connect_timeout: int = 5            # Seconds to wait for connection
     read_timeout: int = 120             # Seconds to wait for response
 
-    # Strands SDK layer (agent event loop retries on ModelThrottledException)
+    # SDK layer (agent event loop) — the only retry layer
     # Backoff sequence with defaults: 2s, 4s, 8s (3 retries before giving up)
     # Total worst-case wait: ~14s — fast enough for conversational UX
     sdk_max_attempts: int = 4           # Total attempts including initial call
     sdk_initial_delay: float = 2.0      # Seconds before first retry, doubles each retry
     sdk_max_delay: float = 16.0         # Cap on exponential backoff
 
-    # Widen the SDK layer beyond ModelThrottledException to Bedrock's
-    # transient PRE-STREAM faults (ServiceUnavailableException,
-    # InternalServerException, ModelNotReadyException, ...). Without this,
-    # a 503 on the first attempt reaches the user as a conversational error
-    # with no retry at all — see BedrockTransientRetryStrategy. Default on;
-    # set RETRY_TRANSIENT_SERVICE_ERRORS=false for stock Strands behavior.
-    retry_transient_service_errors: bool = True
-
     @classmethod
     def from_env(cls) -> "RetryConfig":
         """Load configuration from environment variables.
 
         Environment variables (all optional, defaults shown):
-            RETRY_BOTO_MAX_ATTEMPTS=3
-            RETRY_BOTO_MODE=standard
             RETRY_CONNECT_TIMEOUT=5
             RETRY_READ_TIMEOUT=120
             RETRY_SDK_MAX_ATTEMPTS=4
             RETRY_SDK_INITIAL_DELAY=2.0
             RETRY_SDK_MAX_DELAY=16.0
-            RETRY_TRANSIENT_SERVICE_ERRORS=true
         """
         return cls(
-            boto_max_attempts=int(os.environ.get(EnvVars.RETRY_BOTO_MAX_ATTEMPTS, str(Defaults.RETRY_BOTO_MAX_ATTEMPTS))),
-            boto_retry_mode=os.environ.get(EnvVars.RETRY_BOTO_MODE, Defaults.RETRY_BOTO_MODE),
             connect_timeout=int(os.environ.get(EnvVars.RETRY_CONNECT_TIMEOUT, str(Defaults.RETRY_CONNECT_TIMEOUT))),
             read_timeout=int(os.environ.get(EnvVars.RETRY_READ_TIMEOUT, str(Defaults.RETRY_READ_TIMEOUT))),
             sdk_max_attempts=int(os.environ.get(EnvVars.RETRY_SDK_MAX_ATTEMPTS, str(Defaults.RETRY_SDK_MAX_ATTEMPTS))),
             sdk_initial_delay=float(os.environ.get(EnvVars.RETRY_SDK_INITIAL_DELAY, str(Defaults.RETRY_SDK_INITIAL_DELAY))),
             sdk_max_delay=float(os.environ.get(EnvVars.RETRY_SDK_MAX_DELAY, str(Defaults.RETRY_SDK_MAX_DELAY))),
-            # Default-on kill switch: only the literal "false" disables it, so
-            # an unset var and a workflow that injects an empty string both
-            # keep the widened retry set.
-            retry_transient_service_errors=(
-                os.environ.get(EnvVars.RETRY_TRANSIENT_SERVICE_ERRORS, "").lower() != "false"
-            ),
         )
+
+
+# Bedrock's long cache TTL. Only "1h" is a change from the default; anything
+# else (unset, "5m", garbage) means "today's shape" — no ttl key on any point,
+# which is what keeps the static prefix bytes identical across the flip.
+LONG_CACHE_TTL = "1h"
+
+
+def static_prefix_cache_ttl() -> Optional[str]:
+    """The long TTL to put on the tools + system cachePoints, or ``None``.
+
+    Read from ``AGENTCORE_PROMPT_CACHE_STATIC_PREFIX_TTL`` at agent
+    construction (a cached agent keeps the arm it was built under). See
+    docs/specs/compaction-model-relative-thresholds.md §3.6 PR-5 for the
+    economics: 2x write premium on the static segments in exchange for
+    reading them, rather than re-writing them, on every 5–60 minute pause.
+    """
+    raw = os.environ.get(EnvVars.PROMPT_CACHE_STATIC_PREFIX_TTL, "").strip().lower()
+    return LONG_CACHE_TTL if raw == LONG_CACHE_TTL else None
 
 
 @dataclass
@@ -315,6 +316,11 @@ class ModelConfig:
     # it was added. The wire/persisted field is already the transport-neutral
     # `region`, so only this Python name lags.
     mantle_region: Optional[str] = None
+    # The catalog row declares TEXT input only. The factory then shows the
+    # model its history through `text_only_input`, which replaces image,
+    # document and video blocks with text. Not a cache-key element: it is a
+    # function of `model_id`, which already is.
+    text_only: bool = False
 
     def get_provider(self) -> ModelProvider:
         """
@@ -341,6 +347,15 @@ class ModelConfig:
 
         # Default to configured provider
         return self.provider
+
+    def long_ttl_static_prefix(self) -> bool:
+        """True when this model's tools + system cachePoints carry the 1h TTL.
+
+        The cost path uses it to bill the static segment's cache writes at
+        Bedrock's 1h premium (2x base) instead of the 5m one (1.25x) — the
+        correction that keeps the experiment arm's own cost rows honest.
+        """
+        return bool(self.caching_enabled and self.bedrock_cache_points_supported() and static_prefix_cache_ttl())
 
     def bedrock_cache_points_supported(self) -> bool:
         """Whether a hand-placed Bedrock system cachePoint may be sent.
@@ -387,22 +402,43 @@ class ModelConfig:
         )
 
     def to_bedrock_config(self) -> Dict[str, Any]:
-        """Convert to BedrockModel kwargs, translating canonical inference params."""
+        """Convert to BedrockModel kwargs, translating canonical inference params.
+
+        With ``agent_build_shared_session_enabled`` (default on) the model is
+        built on the process-wide boto3 session instead of the fresh
+        ``boto3.Session()`` Strands would otherwise construct (and re-parse
+        the bedrock-runtime model on). Nothing here reaches the prompt.
+        """
         config: Dict[str, Any] = {"model_id": self.model_id}
+
+        from apis.shared.feature_flags import agent_build_shared_session_enabled
+
+        if agent_build_shared_session_enabled():
+            from apis.shared.aws_clients import shared_boto_session
+
+            # Never alongside `region_name`: BedrockModel.__init__ raises when
+            # both are given (strands-agents 1.55.0). This config sets no
+            # region either way; the session resolves it from the
+            # environment exactly as Strands' own fresh session would.
+            config["boto_session"] = shared_boto_session()
         _apply_canonical_params(
             config, self.inference_params, _BEDROCK_PARAM_MAP, "bedrock", self.model_id
         )
 
-        # Native Bedrock CountTokens. With this on, Strands' per-turn estimate
-        # (BeforeModelCallEvent.projected_input_tokens) and agent.model.count_tokens()
-        # return authoritative Bedrock counts instead of the chars/4 heuristic —
-        # the foundation for per-turn context attribution (decomposing the
+        # Native Bedrock CountTokens is available to this model — the
+        # foundation for per-call context attribution (decomposing the
         # otherwise-aggregate inputTokens into system / tools / messages via the
-        # CountTokens differential). Every catalog model is Claude family and
-        # supports the API; the runtime-role IAM grant landed in #428. Strands
-        # falls back to the heuristic and caches the skip if a model ever
-        # AccessDenies or doesn't support counting, so this is safe to set
-        # unconditionally on the Bedrock path.
+        # CountTokens differential). The runtime-role IAM grant landed in #428.
+        # Strands' pre-call estimate stays the heuristic regardless: the
+        # factory builds the model with `native_projection=False`, so no count
+        # ever sits in front of a model call (see bedrock_count_tokens.py).
+        # Not every model supports the API — Claude Sonnet 5's base id is
+        # rejected as unsupported — and the count falls back to the heuristic
+        # and caches the skip when a model AccessDenies or doesn't support
+        # counting, so this is safe to set unconditionally on the Bedrock
+        # path. The attribution hook reads that skip
+        # (`token_count_is_authoritative`) and records nothing rather than a
+        # heuristic split.
         config["use_native_token_count"] = True
 
         # Bedrock prompt caching — three cachePoints per request (Bedrock
@@ -471,19 +507,30 @@ class ModelConfig:
         # that reaches Bedrock without going through that factory.
         if self.caching_enabled:
             from strands.models import CacheConfig
+
+            # PR-5 (thresholds spec §3.6): an explicit "1h" on the two STATIC
+            # points only. system_prompt_ttl as a string is "honored as
+            # written" by _apply_system_cache_ttl, which rewrites the TTL on
+            # the hand-placed, TTL-less system point AgentFactory places;
+            # tools_ttl as a string sets the tools point's own TTL. The
+            # message-level auto point carries no ttl (cache_config.ttl stays
+            # unset) and so stays at 5m — tools(1h) → system(1h) → messages(5m)
+            # is the non-increasing order Bedrock requires. Off (the default)
+            # emits exactly today's bytes.
+            supported = self.bedrock_cache_points_supported()
+            long_ttl = static_prefix_cache_ttl() if supported else None
             config["cache_config"] = CacheConfig(
                 strategy="auto",
-                system_prompt_ttl=True,
-                tools_ttl=self.bedrock_cache_points_supported(),
+                system_prompt_ttl=long_ttl or True,
+                tools_ttl=(long_ttl or True) if supported else False,
             )
 
         if self.retry_config:
             from botocore.config import Config as BotocoreConfig
             config["boto_client_config"] = BotocoreConfig(
-                retries={
-                    "max_attempts": self.retry_config.boto_max_attempts,
-                    "mode": self.retry_config.boto_retry_mode,
-                },
+                # One attempt: TransientModelRetryStrategy is the only
+                # retry layer, so botocore retrying too would multiply them.
+                retries={"max_attempts": 1, "mode": "standard"},
                 connect_timeout=self.retry_config.connect_timeout,
                 read_timeout=self.retry_config.read_timeout,
             )
@@ -593,6 +640,7 @@ class ModelConfig:
             "inference_params": dict(self.inference_params),
             "mantle_api_mode": self.mantle_api_mode.value,
             "mantle_region": self.mantle_region,
+            "text_only": self.text_only,
         }
 
     @classmethod
@@ -604,6 +652,7 @@ class ModelConfig:
         inference_params: Optional[Dict[str, Any]] = None,
         mantle_api_mode: Optional[str] = None,
         mantle_region: Optional[str] = None,
+        text_only: bool = False,
     ) -> "ModelConfig":
         """Create ModelConfig from optional parameters.
 
@@ -620,6 +669,7 @@ class ModelConfig:
                 back to Chat Completions.
             mantle_region: Bedrock Mantle region override. Only consulted on the
                 MANTLE provider path; ``None`` falls back to the agent's region.
+            text_only: The model's catalog row declares TEXT input only.
         """
         provider_enum = ModelProvider.BEDROCK
         if provider:
@@ -642,4 +692,5 @@ class ModelConfig:
             inference_params=dict(inference_params) if inference_params else {},
             mantle_api_mode=api_mode,
             mantle_region=mantle_region,
+            text_only=text_only,
         )

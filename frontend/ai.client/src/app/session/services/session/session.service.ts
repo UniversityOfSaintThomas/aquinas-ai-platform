@@ -1,11 +1,23 @@
 import { inject, Injectable, signal, WritableSignal, resource, computed, effect } from '@angular/core';
-import { HttpClient, HttpParams } from '@angular/common/http';
+import { HttpClient, HttpContext, HttpParams } from '@angular/common/http';
 import { firstValueFrom } from 'rxjs';
 import { ConfigService } from '../../../services/config.service';
 import { SessionService as BffSessionService } from '../../../auth/session.service';
-import { SessionMetadata, UpdateSessionMetadataRequest } from '../models/session-metadata.model';
+import { SUPPRESS_ERROR_TOAST } from '../../../auth/error.interceptor';
+import { SessionMetadata, SessionPreferences, UpdateSessionMetadataRequest } from '../models/session-metadata.model';
 import { Message } from '../models/message.model';
 import type { UiResourceEvent } from '../../../shared/utils/stream-parser';
+
+/**
+ * Sessions the sidebar asks for at a time: the first load, and each page
+ * fetched as the user scrolls toward the end of the list. A little more than
+ * a tall window shows, so the first screen is full without front-loading a
+ * user's whole history.
+ */
+export const SIDEBAR_PAGE_SIZE = 30;
+
+/** `GET /sessions` rejects a `limit` above this (`le=1000` on the route). */
+const MAX_SESSIONS_LIMIT = 1000;
 
 /**
  * Query parameters for listing sessions.
@@ -97,6 +109,13 @@ export interface MessagesListResponse {
    * Present only on the first page.
    */
   toolSummaries?: { batchId?: string; toolUseIds?: string[]; summary?: string }[];
+  /**
+   * True when Memory's events for this session have expired and these
+   * messages are the conversation archive's text-only copy. The agent cannot
+   * restore from the archive, and a new turn would overwrite the archived
+   * first turn, so the session is offered read-only. Absent on older servers.
+   */
+  fromArchive?: boolean;
 }
 
 /**
@@ -173,12 +192,26 @@ export class SessionService {
   });
 
   /**
-   * Signal for pagination parameters used by the sessions resource.
-   * Update this signal to trigger a refetch with new parameters.
-   * Angular's resource API automatically tracks signals read within the loader,
-   * so reading this signal inside the loader makes it reactive.
+   * How many sessions the sidebar holds from the API — one page to start,
+   * growing by a page each time `loadMoreSessions` appends one.
+   *
+   * Every reload re-fetches this whole window in one request rather than
+   * just the first page. Reloads happen constantly (new session, delete,
+   * rename, tab focus, mark unread), and a first-page-only refetch would
+   * drop rows: a new session pushes page one's last row down past the page
+   * boundary, where the pages already appended below it — cut from the old
+   * cursor — do not have it either.
    */
-  private sessionsParams = signal<ListSessionsParams>({});
+  private sessionsWindow = signal(SIDEBAR_PAGE_SIZE);
+
+  /** A scroll-triggered page is in flight. */
+  readonly isLoadingMoreSessions = signal(false);
+
+  /**
+   * The last scroll-triggered page failed. Stops the sidebar re-requesting it
+   * in a loop while the sentinel stays on screen; cleared by the next attempt.
+   */
+  readonly loadMoreSessionsError = signal(false);
 
   /**
    * Signal to control when the sessions resource should load.
@@ -217,10 +250,22 @@ export class SessionService {
   private newSessionIds = new Set<string>();
 
   /**
+   * Sessions started in this tab whose server row has not been read back yet.
+   * Their cache row is written before the backend binds the session to an agent
+   * or a project, and `currentSession` is that row (the metadata resource skips
+   * new sessions). The `session_title` event takes a session out of
+   * `newSessionIds` without fetching anything, so without this nothing reads the
+   * server's `preferences` before a reload or a list refetch.
+   */
+  private unreadServerRowIds = new Set<string>();
+
+  /**
    * Reactive resource for fetching sessions.
    *
-   * This resource automatically refetches when `sessionsParams` or `sessionsRequest` signals change
-   * because Angular's resource API tracks signals read within the loader function.
+   * The loader runs untracked, so nothing it reads triggers a fetch — loads
+   * happen through `reload()` (see `enableSessionsLoading` and `refreshSessions`).
+   * Each load fetches the sidebar's current window (`sessionsWindow`); further
+   * pages are appended by `loadMoreSessions`.
    * Provides reactive signals for data, loading state, and errors.
    *
    * The resource ensures the user is authenticated before making the HTTP request.
@@ -252,14 +297,11 @@ export class SessionService {
    * // Handle errors
    * const error = sessionService.sessionsResource.error();
    *
-   * // Update pagination to trigger refetch
-   * sessionService.updateSessionsParams({ limit: 50 });
-   *
-   * // Get next page
-   * sessionService.updateSessionsParams({ limit: 50, next_token: nextToken });
+   * // Append the next page
+   * await sessionService.loadMoreSessions();
    *
    * // Manually refetch
-   * sessionService.sessionsResource.refetch();
+   * sessionService.sessionsResource.reload();
    * ```
    */
   readonly sessionsResource = resource({
@@ -269,12 +311,8 @@ export class SessionService {
         return null;
       }
 
-      // Read params signal to make resource reactive to pagination changes
-      const params = this.sessionsParams();
-
-      // Ensure user is authenticated before making the request
       // Fetch sessions from API (without merging cache here)
-      return this.getSessions(params);
+      return this.getSessions({ limit: Math.min(this.sessionsWindow(), MAX_SESSIONS_LIMIT) });
     }
   });
 
@@ -331,23 +369,43 @@ export class SessionService {
    */
   disableSessionsLoading(): void {
     this.sessionsRequest.set(false);
+    // The next user to sign in starts from one page, not this one's scroll depth.
+    this.sessionsWindow.set(SIDEBAR_PAGE_SIZE);
+    this.loadMoreSessionsError.set(false);
   }
 
   /**
-   * Updates the pagination parameters for the sessions resource.
-   * This will automatically trigger a refetch of the resource.
+   * Appends the next page of sessions to the sidebar list.
    *
-   * @param params - New pagination parameters
+   * No-op while a load or reload is running, while another page is in
+   * flight, or once the list is exhausted. A page that lands after a reload
+   * has started is dropped: writing it would abort that reload (`set()`
+   * cancels the in-progress load), and it was cut from a cursor the reload is
+   * about to replace. The caller asks again once the reload settles.
    */
-  updateSessionsParams(params: Partial<ListSessionsParams>): void {
-    this.sessionsParams.update(current => ({ ...current, ...params }));
-  }
+  async loadMoreSessions(): Promise<void> {
+    if (this.isLoadingMoreSessions() || this.sessionsResource.isLoading()) return;
+    const token = this.sessionsResource.hasValue() ? this.sessionsResource.value()?.nextToken : null;
+    if (!token) return;
 
-  /**
-   * Resets pagination parameters to default values and triggers a refetch.
-   */
-  resetSessionsParams(): void {
-    this.sessionsParams.set({});
+    this.isLoadingMoreSessions.set(true);
+    this.loadMoreSessionsError.set(false);
+    try {
+      const page = await this.getSessions({ limit: SIDEBAR_PAGE_SIZE, next_token: token });
+
+      const latest = this.sessionsResource.hasValue() ? this.sessionsResource.value() : null;
+      if (this.sessionsResource.isLoading() || !latest || latest.nextToken !== token) return;
+
+      const seen = new Set(latest.sessions.map(s => s.sessionId));
+      const sessions = [...latest.sessions, ...page.sessions.filter(s => !seen.has(s.sessionId))];
+      this.sessionsResource.set({ ...latest, sessions, nextToken: page.nextToken });
+      this.sessionsWindow.set(Math.max(SIDEBAR_PAGE_SIZE, sessions.length));
+    } catch (error) {
+      console.error('Failed to load more sessions:', error);
+      this.loadMoreSessionsError.set(true);
+    } finally {
+      this.isLoadingMoreSessions.set(false);
+    }
   }
 
   /**
@@ -417,6 +475,39 @@ export class SessionService {
    */
   isNewSession(sessionId: string): boolean {
     return this.newSessionIds.has(sessionId);
+  }
+
+  /**
+   * Whether a session started in this tab is still shown from its optimistic
+   * row, i.e. `adoptServerPreferences` has not run for it yet.
+   */
+  awaitsServerRow(sessionId: string): boolean {
+    return this.unreadServerRowIds.has(sessionId);
+  }
+
+  /**
+   * Fills a session started in this tab with the preferences the backend bound
+   * on its first turn (its agent, its project), on both the list cache row and
+   * `currentSession`. That is what groups a project conversation under its
+   * project and offers "Project members" sharing without a reload.
+   *
+   * Keys this tab already holds win: they were written here after the row was
+   * created and may be newer than the read.
+   */
+  adoptServerPreferences(sessionId: string, preferences: SessionPreferences | undefined): void {
+    this.unreadServerRowIds.delete(sessionId);
+    if (!preferences) return;
+
+    const fill = (session: SessionMetadata): SessionMetadata => ({
+      ...session,
+      preferences: { ...preferences, ...session.preferences },
+    });
+    this.localSessionsCache.update(sessions =>
+      sessions.map(session => (session.sessionId === sessionId ? fill(session) : session))
+    );
+    if (this.currentSession().sessionId === sessionId) {
+      this.currentSession.update(fill);
+    }
   }
 
   /**
@@ -565,6 +656,10 @@ export class SessionService {
    * Fetches metadata for a specific session from the Python API.
    * 
    * @param sessionId - UUID of the session
+   * @param options.quiet - Skip the global error toast. For best-effort
+   *   background reads whose caller already tolerates failure. A first turn
+   *   refused before the session row exists (model access) leaves no row, so
+   *   the post-stream title fallback 404s there by design.
    * @returns Promise resolving to SessionMetadata object
    * @throws Error if the API request fails
    * 
@@ -575,13 +670,16 @@ export class SessionService {
    * );
    * ```
    */
-  async getSessionMetadata(sessionId: string): Promise<SessionMetadata> {
+  async getSessionMetadata(
+    sessionId: string,
+    options: { quiet?: boolean } = {},
+  ): Promise<SessionMetadata> {
     // Ensure user is authenticated before making the request
     try {
       const response = await firstValueFrom(
-        this.http.get<SessionMetadata>(
-          `${this.baseUrl()}/${sessionId}/metadata`
-        )
+        this.http.get<SessionMetadata>(`${this.baseUrl()}/${sessionId}/metadata`, {
+          context: new HttpContext().set(SUPPRESS_ERROR_TOAST, options.quiet ?? false),
+        })
       );
 
       return response;
@@ -863,6 +961,7 @@ export class SessionService {
 
     // Mark this session as new to skip metadata fetches
     this.newSessionIds.add(sessionId);
+    this.unreadServerRowIds.add(sessionId);
 
     // Add to local cache (will be merged with API data on next load)
     this.localSessionsCache.update(sessions => {
@@ -891,8 +990,18 @@ export class SessionService {
     // Filter out API sessions that are already in local cache
     const uniqueApiSessions = apiSessions.filter(s => !localSessionIds.has(s.sessionId));
 
+    // An optimistic row is created before the backend has bound the session to an
+    // agent or a project, so it carries no preferences. Once the API row has them,
+    // use them: the list opens the row on its agent and groups a project task
+    // under its project without waiting for a reload.
+    const apiById = new Map(apiSessions.map(s => [s.sessionId, s] as const));
+    const merged = localSessions.map(local => {
+      const api = apiById.get(local.sessionId);
+      return api?.preferences && !local.preferences ? { ...local, preferences: api.preferences } : local;
+    });
+
     // Return local sessions first (most recent), then unique API sessions
-    return [...localSessions, ...uniqueApiSessions];
+    return [...merged, ...uniqueApiSessions];
   }
 
   /**
@@ -949,6 +1058,7 @@ export class SessionService {
    */
   clearSessionCache(): void {
     this.localSessionsCache.set([]);
+    this.unreadServerRowIds.clear();
   }
 
   /**

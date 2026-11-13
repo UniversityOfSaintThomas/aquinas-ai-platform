@@ -36,7 +36,7 @@ import {
  */
 export const BRAND_CONFIG: BrandConfig = {
   logo: DEFAULT_LOGO,
-  appName: DEFAULT_APP_NAME,
+  appName: "Aquinas AI",
   greetingTemplates: [...DEFAULT_GREETING_TEMPLATES],
   fallbackGreetings: [...DEFAULT_FALLBACK_GREETINGS],
 
@@ -56,8 +56,12 @@ export const BRAND_CONFIG: BrandConfig = {
     evening: [...DEFAULT_TIME_OF_DAY_FALLBACK_GREETINGS.evening],
     night: [...DEFAULT_TIME_OF_DAY_FALLBACK_GREETINGS.night],
   },
-  colors: DEFAULT_COLORS,
-  pageTitle: DEFAULT_PAGE_TITLE,
+  colors: {
+    primary: '#510c76',
+    secondary: '#8348ad',
+    tertiary: '#4c9c2e',
+  },
+  pageTitle: "Aquinas AI",
   
   // Surface anchors for the neutral ramp. Each value must fall inside a
   // per-role OKLCH band (see SURFACE_BANDS in brand-config.normalize.ts) or

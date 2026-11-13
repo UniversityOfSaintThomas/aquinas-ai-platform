@@ -41,8 +41,8 @@ describe('DynamoDB per-table alarms', () => {
 
   // Tied to the real table count, so a new table without an alarm fails here.
   it('covers every table in the stack — one throttle alarm each', () => {
-    expect(tableCount).toBe(27);
-    // 27 per-table throttle alarms + 1 account-level UserErrors alarm.
+    expect(tableCount).toBe(29);
+    // 29 per-table throttle alarms + 1 account-level UserErrors alarm.
     expect(ddbAlarmNames()).toHaveLength(tableCount + 1);
   });
 
@@ -126,9 +126,11 @@ describe('DynamoDB per-table alarms', () => {
   });
 
   // Single-stack architecture against a hard 500-resource CFN limit, so the
-  // ceiling is asserted while there is still room to react.
+  // ceiling is asserted while there is still room to react. Raised from 460 to
+  // 465 (2026-10-08, Shared Projects 2.6b) for the Runtime's own STATS# grant
+  // policy, which stays out of the role's CDK overflow policies on purpose.
   it('stack stays clear of the 500-resource CloudFormation limit', () => {
     const total = Object.keys(template.toJSON().Resources).length;
-    expect(total).toBeLessThan(460);
+    expect(total).toBeLessThan(465);
   });
 });

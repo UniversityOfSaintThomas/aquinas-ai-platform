@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   # Deploy on pushes to the SPA or its deploy plumbing.
   push:
-    branches: [develop, main]
+    branches: [develop, production]
     paths:
       - 'frontend/**'
       - 'scripts/frontend/**'
@@ -42,6 +42,11 @@ jobs:
 
       - name: Build SPA
         run: bash scripts/frontend/build.sh
+        env:
+          # Must match the deploy job's environment below: main → production, else
+          # development. Picks environment.production.ts or environment.development.ts,
+          # which carry the front-end feature switches (src/environments/feature-flags.ts).
+          SPA_BUILD_CONFIGURATION: ${{ (github.ref == 'refs/heads/production' && 'production') || 'dev-deploy' }}
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -53,7 +58,7 @@ jobs:
     name: Deploy to S3 + CloudFront
     needs: [build, test-frontend]
     runs-on: ubuntu-24.04
-    environment: ${{ (github.ref == 'refs/heads/main' && 'production') || 'development' }}
+    environment: ${{ (github.ref == 'refs/heads/production' && 'production') || 'development' }}
 
     permissions:
       id-token: write

@@ -1,4 +1,4 @@
-import { Component, ChangeDetectionStrategy, computed, effect, inject, input, signal } from '@angular/core';
+import { Component, ChangeDetectionStrategy, computed, effect, inject, input, signal, untracked } from '@angular/core';
 import { NgIcon, provideIcons } from '@ng-icons/core';
 import {
   heroDocument,
@@ -8,10 +8,22 @@ import {
   heroPhoto,
   heroPresentationChartBar,
   heroArrowTopRightOnSquare,
+  heroEye,
 } from '@ng-icons/heroicons/outline';
 import { MarkdownComponent } from 'ngx-markdown';
-import { formatBytes, FileUploadService } from '../../../../../services/file-upload';
+import {
+  AttachmentSearchStatusService,
+  formatBytes,
+  FileUploadService,
+  isReferenceDocument,
+  largeDocumentChip,
+  LARGE_DOCUMENT_CHIP_COPY,
+  type LargeDocumentChip,
+} from '../../../../../services/file-upload';
+import { FEATURES } from '../../../../../services/features';
 import { FileAttachmentData } from '../../../../services/models/message.model';
+import { FilePreviewStateService } from '../../../../services/file-preview/file-preview-state.service';
+import { isPreviewableFilename } from '../../../../services/file-preview/file-preview.model';
 import { MarkdownPreviewModalComponent } from './markdown-preview-modal.component';
 
 interface FileTypeStyle {
@@ -34,13 +46,13 @@ export const FILE_TYPE_STYLES: Record<string, FileTypeStyle> = {
   'application/pdf': {
     icon: 'heroDocument',
     label: 'PDF',
-    accent_text: 'text-filetype-pdf-600 dark:text-filetype-pdf-300',
+    accent_text: 'text-filetype-pdf-700 dark:text-filetype-pdf-300',
     header_bg: 'bg-filetype-pdf-50 dark:bg-filetype-pdf-950/40',
   },
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': {
     icon: 'heroDocumentText',
     label: 'DOCX',
-    accent_text: 'text-filetype-doc-600 dark:text-filetype-doc-300',
+    accent_text: 'text-filetype-doc-700 dark:text-filetype-doc-300',
     header_bg: 'bg-filetype-doc-50 dark:bg-filetype-doc-950/40',
   },
   'text/plain': {
@@ -52,25 +64,25 @@ export const FILE_TYPE_STYLES: Record<string, FileTypeStyle> = {
   'text/html': {
     icon: 'heroCodeBracket',
     label: 'HTML',
-    accent_text: 'text-filetype-code-600 dark:text-filetype-code-300',
+    accent_text: 'text-filetype-code-700 dark:text-filetype-code-300',
     header_bg: 'bg-filetype-code-50 dark:bg-filetype-code-950/40',
   },
   'text/csv': {
     icon: 'heroTableCells',
     label: 'CSV',
-    accent_text: 'text-filetype-sheet-600 dark:text-filetype-sheet-300',
+    accent_text: 'text-filetype-sheet-700 dark:text-filetype-sheet-300',
     header_bg: 'bg-filetype-sheet-50 dark:bg-filetype-sheet-950/40',
   },
   'application/vnd.ms-excel': {
     icon: 'heroTableCells',
     label: 'XLS',
-    accent_text: 'text-filetype-sheet-600 dark:text-filetype-sheet-300',
+    accent_text: 'text-filetype-sheet-700 dark:text-filetype-sheet-300',
     header_bg: 'bg-filetype-sheet-50 dark:bg-filetype-sheet-950/40',
   },
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': {
     icon: 'heroTableCells',
     label: 'XLSX',
-    accent_text: 'text-filetype-sheet-600 dark:text-filetype-sheet-300',
+    accent_text: 'text-filetype-sheet-700 dark:text-filetype-sheet-300',
     header_bg: 'bg-filetype-sheet-50 dark:bg-filetype-sheet-950/40',
   },
   // filetype-presentation is PowerPoint's orange brand association, which makes
@@ -80,37 +92,37 @@ export const FILE_TYPE_STYLES: Record<string, FileTypeStyle> = {
   'application/vnd.openxmlformats-officedocument.presentationml.presentation': {
     icon: 'heroPresentationChartBar',
     label: 'PPTX',
-    accent_text: 'text-filetype-presentation-600 dark:text-filetype-presentation-300',
+    accent_text: 'text-filetype-presentation-700 dark:text-filetype-presentation-300',
     header_bg: 'bg-filetype-presentation-50 dark:bg-filetype-presentation-950/40',
   },
   'text/markdown': {
     icon: 'heroDocumentText',
     label: 'MD',
-    accent_text: 'text-filetype-markdown-600 dark:text-filetype-markdown-300',
+    accent_text: 'text-filetype-markdown-700 dark:text-filetype-markdown-300',
     header_bg: 'bg-filetype-markdown-50 dark:bg-filetype-markdown-950/40',
   },
   'image/png': {
     icon: 'heroPhoto',
     label: 'PNG',
-    accent_text: 'text-filetype-image-600 dark:text-filetype-image-300',
+    accent_text: 'text-filetype-image-700 dark:text-filetype-image-300',
     header_bg: 'bg-filetype-image-50 dark:bg-filetype-image-950/40',
   },
   'image/jpeg': {
     icon: 'heroPhoto',
     label: 'JPG',
-    accent_text: 'text-filetype-image-600 dark:text-filetype-image-300',
+    accent_text: 'text-filetype-image-700 dark:text-filetype-image-300',
     header_bg: 'bg-filetype-image-50 dark:bg-filetype-image-950/40',
   },
   'image/gif': {
     icon: 'heroPhoto',
     label: 'GIF',
-    accent_text: 'text-filetype-image-600 dark:text-filetype-image-300',
+    accent_text: 'text-filetype-image-700 dark:text-filetype-image-300',
     header_bg: 'bg-filetype-image-50 dark:bg-filetype-image-950/40',
   },
   'image/webp': {
     icon: 'heroPhoto',
     label: 'WEBP',
-    accent_text: 'text-filetype-image-600 dark:text-filetype-image-300',
+    accent_text: 'text-filetype-image-700 dark:text-filetype-image-300',
     header_bg: 'bg-filetype-image-50 dark:bg-filetype-image-950/40',
   },
 };
@@ -137,7 +149,9 @@ const SLIDE_BULLET_WIDTHS = [78, 92, 60];
  * excerpt (for txt/md/csv/html) or skeleton lines (for binary docs), a
  * folded top-right corner detail, and a footer with filename + size.
  *
- * Clicking opens the file in a new tab via a short-lived presigned URL.
+ * Clicking previews the file where we can render one — Markdown in a modal,
+ * `.docx` / `.pptx` in the docked pane — and otherwise opens it in a new tab
+ * via a short-lived presigned URL.
  */
 @Component({
   selector: 'app-file-attachment-badge',
@@ -152,6 +166,7 @@ const SLIDE_BULLET_WIDTHS = [78, 92, 60];
       heroPhoto,
       heroPresentationChartBar,
       heroArrowTopRightOnSquare,
+      heroEye,
     }),
   ],
   host: { class: 'contents' },
@@ -235,32 +250,53 @@ const SLIDE_BULLET_WIDTHS = [78, 92, 60];
       type="button"
       (click)="openFile()"
       class="group flex w-60 shrink-0 flex-col overflow-hidden rounded-xl border border-gray-200 bg-white text-left shadow-sm transition-all hover:-translate-y-0.5 hover:shadow-md focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 dark:border-gray-700 dark:bg-gray-800"
-      [attr.aria-label]="'Open ' + attachment().filename"
+      [attr.aria-label]="actionLabel() + ' ' + attachment().filename"
     >
       <!-- Header strip -->
       <div
         class="flex items-center justify-between border-b border-gray-200 px-3 py-2 dark:border-gray-700"
         [class]="style().header_bg"
       >
-        <div class="flex items-center gap-2">
-          <ng-icon
-            [name]="style().icon"
-            class="size-4"
-            [class]="style().accent_text"
-            aria-hidden="true"
-          />
-          <span
-            class="text-[10px] font-bold tracking-wider"
-            [class]="style().accent_text"
-          >
+        <!-- The accent colour goes on this wrapper, not on the two children.
+             A text-<colour> utility placed directly on an <ng-icon> does not
+             paint it -- the component's own host rule outranks a plain class,
+             so the chip icon rendered black in both themes while the label
+             beside it, carrying the identical class, came out correctly.
+             ng-icon *does* inherit, so colouring the parent reaches both. -->
+        <div class="flex items-center gap-2" [class]="style().accent_text">
+          <ng-icon [name]="style().icon" class="size-4" aria-hidden="true" />
+          <span class="text-[10px] font-bold tracking-wider">
             {{ style().label }}
           </span>
         </div>
-        <ng-icon
-          name="heroArrowTopRightOnSquare"
-          class="size-4 text-gray-400 opacity-0 transition-opacity group-hover:opacity-100"
-          aria-hidden="true"
-        />
+        <!-- The affordance has to be legible at rest, not on hover. A card
+             that only reveals what it does when the pointer is over it says
+             nothing to someone reading the thread, and nothing at all on a
+             touch screen. For anything the pane can render we therefore
+             spell it out — eye + "Preview", the same pairing the generated
+             file's download card uses, so the two read as one feature, and
+             it takes the file type's own accent so the strip reads as one
+             unit. Deliberately the same colour and weight as the type chip
+             rather than a dimmed version: the accent already measures
+             3.37:1 on its own light-mode tint, so anything held further back
+             would be worse than a label that is itself under AA.
+             Everything else keeps the quieter hover hint, because "opens in
+             a new tab" is a weaker promise not worth the ink. -->
+        @if (isPanePreviewable()) {
+          <span
+            class="flex items-center gap-1 text-[10px] font-bold tracking-wider"
+            [class]="style().accent_text"
+          >
+            <ng-icon name="heroEye" class="size-3.5" aria-hidden="true" />
+            PREVIEW
+          </span>
+        } @else {
+          <ng-icon
+            name="heroArrowTopRightOnSquare"
+            class="size-4 text-gray-400 opacity-0 transition-opacity group-hover:opacity-100"
+            aria-hidden="true"
+          />
+        }
       </div>
 
       <!-- Paper page area -->
@@ -357,6 +393,21 @@ const SLIDE_BULLET_WIDTHS = [78, 92, 60];
         <p class="text-xs text-gray-500 dark:text-gray-400">
           {{ formattedSize() }}
         </p>
+        <!-- A large document is attached by reference: the model reads the
+             parts it needs through document_read, not the whole file. Shown
+             while it is being prepared and after; the SPA classifies on size
+             alone, the same thresholds the backend's is_reference_document
+             uses. With the attachments KB it follows the search index:
+             indexing, then searchable. -->
+        @if (isReference()) {
+          <p
+            class="mt-1 inline-flex items-center rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-medium text-gray-700 dark:bg-gray-700 dark:text-gray-200"
+            data-testid="reference-chip"
+            [attr.data-chip]="chip()"
+          >
+            {{ chipCopy().full }}
+          </p>
+        }
       </div>
     </button>
 
@@ -373,6 +424,9 @@ export class FileAttachmentBadgeComponent {
   readonly attachment = input.required<FileAttachmentData>();
 
   private readonly fileUploadService = inject(FileUploadService);
+  private readonly filePreview = inject(FilePreviewStateService);
+  /** Present only while the deployment has the attachments KB. */
+  private readonly searchStatus = inject(FEATURES).attachmentKb ? inject(AttachmentSearchStatusService) : null;
 
   protected readonly skeletonWidths = SKELETON_LINE_WIDTHS;
   protected readonly slideBulletWidths = SLIDE_BULLET_WIDTHS;
@@ -396,10 +450,33 @@ export class FileAttachmentBadgeComponent {
 
   protected readonly hasSnippet = computed(() => this.snippet().trim().length > 0);
 
+  protected readonly isReference = computed(() =>
+    isReferenceDocument(this.attachment().mimeType, this.attachment().sizeBytes),
+  );
+
+  /** What the large-document chip says: read on demand, indexing, or searchable. */
+  protected readonly chip = computed<LargeDocumentChip>(() =>
+    this.searchStatus ? largeDocumentChip(this.searchStatus.statusFor(this.attachment().uploadId)) : 'read-on-demand',
+  );
+
+  protected readonly chipCopy = computed(() => LARGE_DOCUMENT_CHIP_COPY[this.chip()]);
+
   protected readonly isMarkdown = computed(() => this.attachment().mimeType === 'text/markdown');
 
   protected readonly isPresentation = computed(
     () => this.attachment().mimeType === PRESENTATION_MIME,
+  );
+
+  /** Whether clicking opens the docked preview pane rather than a new tab.
+   *  Keyed off the filename, the same gate the generated-file download card
+   *  uses, so the two surfaces can never disagree about what is previewable. */
+  protected readonly isPanePreviewable = computed(() =>
+    isPreviewableFilename(this.attachment().filename),
+  );
+
+  /** What the click will do, for the button's accessible name. */
+  protected readonly actionLabel = computed(() =>
+    this.isPanePreviewable() || this.isMarkdown() ? 'Preview' : 'Open',
   );
 
   /** Cap chars so very long unbroken lines don't blow out the card. */
@@ -409,6 +486,14 @@ export class FileAttachmentBadgeComponent {
   });
 
   constructor() {
+    // A large document follows its search index (one poll per upload, shared
+    // with the composer card).
+    effect(() => {
+      const service = this.searchStatus;
+      if (!service || !this.isReference()) return;
+      const id = this.attachment().uploadId;
+      untracked(() => service.track(id));
+    });
     effect(() => {
       const att = this.attachment();
       if (TEXT_PREVIEW_MIMES.has(att.mimeType)) {
@@ -460,6 +545,14 @@ export class FileAttachmentBadgeComponent {
   protected async openFile(): Promise<void> {
     if (this.isMarkdown()) {
       this.markdownModalOpen.set(true);
+      return;
+    }
+    // An uploaded .docx/.pptx gets the same docked pane as a generated one.
+    // Falling through to the presigned URL would just hand the browser an
+    // OOXML file it cannot render, which downloads it instead of showing it.
+    if (this.isPanePreviewable()) {
+      const att = this.attachment();
+      this.filePreview.open({ uploadId: att.uploadId, filename: att.filename });
       return;
     }
     try {
