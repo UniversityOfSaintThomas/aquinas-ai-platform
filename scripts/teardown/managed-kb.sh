@@ -40,10 +40,10 @@ if ! declare -f log_info >/dev/null 2>&1; then
     source "${PROJECT_ROOT}/scripts/common/load-env.sh"
 fi
 
-# load-env.sh provides log_info/log_warn/log_error/log_config but NOT
-# log_success, and destroy.sh invokes this script with `bash` (a separate
-# process), so its own log_success definition is not inherited. Define it here,
-# guarded, so the three call sites below resolve in both invocation paths.
+# load-env.sh defines no log_success, and destroy.sh's copy does not reach
+# this script: destroy.sh runs it as a child process (`bash managed-kb.sh`),
+# which inherits no shell functions. Without this the first success message
+# exited 127 and aborted every teardown before any stack was deleted.
 if ! declare -f log_success >/dev/null 2>&1; then
     log_success() {
         echo -e "${GREEN:-}[SUCCESS]${NC:-} $1"

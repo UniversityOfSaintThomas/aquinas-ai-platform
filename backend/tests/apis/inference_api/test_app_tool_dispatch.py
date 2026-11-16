@@ -54,10 +54,10 @@ class _FakeCatalog:
         self._meta = meta
         self._client = client
 
-    def get(self, _name):
+    def get(self, _name, _user_id=None):
         return self._meta
 
-    def get_client(self, _name):
+    def get_client(self, _name, _user_id=None):
         return self._client
 
 
@@ -107,6 +107,50 @@ async def test_rejects_unknown_tool(monkeypatch):
     assert ei.value.message == (
         "Tool 'ui_get' is not offered by this conversation's MCP servers"
     )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_runs_on_the_callers_own_client(monkeypatch):
+    """Two users' per-user clients for one tool name must never cross.
+
+    Uses the REAL process-global catalog: Bob's client is recorded after
+    Alice's (as a later agent build would), and Alice's app-initiated call
+    must still run on Alice's client — not Bob's, which carries his token.
+    """
+    monkeypatch.setattr(mcp_apps_mod, "is_mcp_apps_host_enabled", lambda: True)
+    catalog = mcp_apps_mod.UIToolCatalog()
+    monkeypatch.setattr(mcp_apps_mod, "get_ui_tool_catalog", lambda: catalog)
+
+    alice, bob = _FakeClient(_FakeResult("alice")), _FakeClient(_FakeResult("bob"))
+    alice.owner_user_id, bob.owner_user_id = "alice", "bob"
+    catalog.record("widget_tool", _ui(["app"]), client=alice)
+    catalog.record("widget_tool", _ui(["app"]), client=bob)
+
+    payload = await dispatch_app_tool_call(
+        agent=None,
+        session_id="disp-cross",
+        user_id="alice",
+        tool_use_id="tu-x",
+        tool_name="widget_tool",
+        arguments={},
+    )
+
+    assert payload["result"]["content"] == [{"type": "text", "text": "alice"}]
+    assert len(alice.calls) == 1
+    assert bob.calls == []
+
+    # A user with no client of their own is refused, not served someone else's.
+    with pytest.raises(AppToolCallError) as ei:
+        await dispatch_app_tool_call(
+            agent=None,
+            session_id="disp-cross",
+            user_id="carol",
+            tool_use_id="tu-y",
+            tool_name="widget_tool",
+            arguments={},
+        )
+    assert ei.value.code == 403
+    assert bob.calls == []
 
 
 @pytest.mark.asyncio
@@ -370,7 +414,8 @@ async def test_leaves_a_live_client_session_alone(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_connection_lost_mid_call_reports_an_unknown_outcome(monkeypatch):
+@pytest.mark.parametrize("failure", ["503", "dropped"])
+async def test_a_connection_lost_mid_call_reports_an_unknown_outcome(monkeypatch, failure):
     """A write the server performed must not come back as a plain failure.
 
     The dev sequence: an agent's tool provider owns a live session, the App
@@ -378,9 +423,14 @@ async def test_a_connection_lost_mid_call_reports_an_unknown_outcome(monkeypatch
     `isError: false` with "Tool execution failed: Connection to the MCP server
     was closed", and the shared client was left dead — the next press 502'd
     and every agent built over it got the dead session's tool list.
+
+    On mcp 2.x the 503 leaves the session up; a dropped response still ends
+    it. Both are an unknown outcome, and both leave a client the next press
+    can use.
     """
     monkeypatch.setattr(dispatch_mod, "_schedule_ui_resource_refresh", lambda *a: None)
-    with FlakyMCPServer() as server:
+    with FlakyMCPServer(fail_calls=failure == "503") as server:
+        server.drop_calls = failure == "dropped"
         client = server.client()
         # As the agent build does: the tool provider starts the session.
         await client.load_tools()
@@ -402,9 +452,10 @@ async def test_a_connection_lost_mid_call_reports_an_unknown_outcome(monkeypatch
             assert "may have completed" in text
             assert "issue_write" in text
 
-            # The crashed session was reset, so the client reconnects: the
+            # A crashed session was reset, so the client reconnects: the
             # next press works...
             server.fail_calls = False
+            server.drop_calls = False
             again = await dispatch_app_tool_call(
                 agent=None,
                 session_id="disp-lost",
@@ -441,14 +492,15 @@ async def test_a_crashed_session_is_reset_before_it_is_revived(monkeypatch):
     not running.
     """
     monkeypatch.setattr(dispatch_mod, "_schedule_ui_resource_refresh", lambda *a: None)
-    with FlakyMCPServer() as server:
+    with FlakyMCPServer(fail_calls=False) as server:
+        server.drop_calls = True
         client = server.client()
         client.start()
         # Crash it outside the dispatch, the way a model-driven call would.
         client.call_tool_sync("t-1", "issue_write", {"title": "model"})
         assert mcp_session.session_crashed(client)
 
-        server.fail_calls = False
+        server.drop_calls = False
         _patch(monkeypatch, enabled=True, meta=_ui(["model", "app"]), client=client)
         try:
             payload = await dispatch_app_tool_call(
@@ -744,8 +796,9 @@ def test_refresh_rereads_the_producing_tool_and_preserves_the_anchor(monkeypatch
     )
     seen = {}
 
-    def _fetch(tool_name, tool_use_id):
+    def _fetch(tool_name, tool_use_id, user_id=None):
         seen["tool_name"] = tool_name
+        seen["user_id"] = user_id
         return {
             "resourceUri": "ui://tasks/board",
             "html": "<html>fresh</html>",
@@ -764,6 +817,8 @@ def test_refresh_rereads_the_producing_tool_and_preserves_the_anchor(monkeypatch
     # Re-read is keyed on the tool that PRODUCED the frame, not whatever the
     # App just called — the resourceUri hangs off the producing tool.
     assert seen["tool_name"] == "view_task_board"
+    # Resolved for the calling user, so a per-user server's own client is used.
+    assert seen["user_id"] == "u1"
     assert len(store.stored) == 1
     written = store.stored[0]
     assert written["html"] == "<html>fresh</html>"

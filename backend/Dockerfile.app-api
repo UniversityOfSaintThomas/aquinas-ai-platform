@@ -72,6 +72,10 @@ RUN useradd -m -u 1000 -s /bin/bash appuser
 # is the regression guard; if it fails, this image stops booting.
 COPY --from=builder /app/.venv /app/.venv
 COPY backend/src /app/src
+# The committed per-tool spec-token measurement, read by the release ledger's
+# tools table (apis/shared/costs/ledger_reader.spec_tokens resolves
+# /app/evals/ from /app/src/). Hashed as a manifest in build-one.sh.
+COPY backend/evals/tool_spec_tokens.json /app/evals/tool_spec_tokens.json
 
 # Precompile our own source the same way the venv was (see UV_COMPILE_BYTECODE
 # above). `-q` keeps the layer log quiet; a syntax error still fails the build,
@@ -83,12 +87,23 @@ RUN python -m compileall -q /app/src
 # Switch to non-root user
 USER appuser
 
-# Version injection (defaults to "unknown" if not provided via --build-arg)
+# Version injection (defaults to "unknown" if not provided via --build-arg).
+# APP_BUILD is the image's own content-hash tag; scripts/build/build-one.sh
+# passes both. Baked, not a Runtime variable: docs/specs/release-ledger.md D2.
 ARG APP_VERSION=unknown
+ARG APP_BUILD=unknown
 ENV APP_VERSION=${APP_VERSION}
+ENV APP_BUILD=${APP_BUILD}
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
+# Print every thread's Python stack to stderr when the interpreter dies on a
+# native fault (SIGSEGV, SIGABRT, SIGBUS, SIGFPE). Without it a segfault leaves
+# only "exit 139" in the task's stopped reason and nothing in the logs: that is
+# how the 2026-10-30 pypdfium2 crash (two PDF digests parsed concurrently on
+# threads) had to be reconstructed from timing alone. stderr reaches CloudWatch
+# like stdout does. Free: it costs nothing until a fault happens.
+ENV PYTHONFAULTHANDLER=1
 ENV PYTHONPATH=/app/src
 ENV PATH="/app/.venv/bin:$PATH"
 
@@ -99,5 +114,10 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Run the application
-CMD ["uvicorn", "apis.app_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run the application.
+# --timeout-keep-alive is longer than the ALB's 60 s idle timeout, so the ALB,
+# not uvicorn, is always the side that closes an idle connection. At uvicorn's
+# 5 s default the ALB can reuse a connection uvicorn has just closed and return
+# a 502. Kept in step with ALB_IDLE_TIMEOUT_SECONDS in
+# infrastructure/lib/constructs/network/alb-construct.ts; a CDK test checks it.
+CMD ["uvicorn", "apis.app_api.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "75"]

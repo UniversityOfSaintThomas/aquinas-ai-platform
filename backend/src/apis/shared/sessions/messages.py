@@ -9,6 +9,9 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple, TypeVar
 
+from apis.shared.files.attachment_handle import handle_of, strip_handles_for_display
+from apis.shared.models.assistant_prefill import is_continuation_prompt
+
 # Relative imports from shared sessions module
 from .models import Message, MessageContent, MessageResponse, MessagesListResponse, MessageMetadata, Citation
 
@@ -34,6 +37,12 @@ def _ensure_image_base64(image_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not image_data:
         return image_data
+
+    # A handle in place of the bytes (unified-attachment-delivery §6.2). No
+    # client renders a user message's image from these bytes (the web app
+    # shows the upload's own preview), so the format is all that is returned.
+    if handle_of(image_data) is not None:
+        return {"format": image_data.get("format", "png")}
 
     # Check for source.bytes pattern (from Code Interpreter tool)
     source = image_data.get("source", {})
@@ -78,6 +87,11 @@ def _ensure_document_base64(document_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not document_data:
         return document_data
+
+    # A handle in place of the bytes (unified-attachment-delivery §6.2): the
+    # name and format, which is all a client reads.
+    if handle_of(document_data) is not None:
+        return strip_handles_for_display(document_data)
 
     # Check for source.bytes pattern (from multimodal document input)
     source = document_data.get("source", {})
@@ -230,8 +244,16 @@ def _convert_message_to_response(msg: Message, session_id: str, sequence_number:
                     logger.warning(f"Failed to parse citations for message {computed_id}: {e}")
                     citations = None
 
+    continuation = is_continuation_prompt(msg.role, [block.text if block.type == "text" else None for block in msg.content])
+
     return MessageResponse(
-        id=computed_id, role=msg.role, content=msg.content, created_at=msg.timestamp or "", metadata=metadata_dict, citations=citations
+        id=computed_id,
+        role=msg.role,
+        content=msg.content,
+        created_at=msg.timestamp or "",
+        metadata=metadata_dict,
+        citations=citations,
+        continuation=True if continuation else None,
     )
 
 
@@ -527,6 +549,82 @@ async def get_messages_from_cloud(
                 user_id=user_id,
             )
 
+        async def fetch_source_provenance():
+            """Fetch persisted source-provenance verdicts.
+
+            Sync DynamoDB query off the session GSI; runs in a thread pool.
+            Empty when the table is absent (dev), the flag is off, or nothing
+            was verified.
+            """
+            from apis.shared.feature_flags import source_provenance_enabled
+
+            if not source_provenance_enabled():
+                return []
+            from apis.shared.files.provenance_store import get_source_provenance_store
+
+            return await asyncio.to_thread(
+                get_source_provenance_store().list_for_session,
+                session_id=session_id,
+                user_id=user_id,
+            )
+
+        async def fetch_extractions():
+            """Fetch persisted structured-extraction runs.
+
+            Sync DynamoDB query off the session GSI; runs in a thread pool.
+            Empty when the table is absent (dev), the flag is off, or nothing
+            was extracted.
+            """
+            from apis.shared.feature_flags import document_extract_enabled
+
+            if not document_extract_enabled():
+                return []
+            from apis.shared.extraction.extraction_store import get_extraction_store
+
+            return await asyncio.to_thread(
+                get_extraction_store().list_for_session,
+                session_id=session_id,
+                user_id=user_id,
+            )
+
+        async def fetch_handoffs():
+            """Handoff rows on a source and ``spawnedFrom`` on a target (handoffs spec §4.3).
+
+            Reads the raw META row: the ``SessionMetadata`` model behind
+            ``get_pending_interrupts`` doesn't carry ``spawnedFrom``. Nothing
+            at all while ``HANDOFFS_ENABLED`` is off.
+            """
+            from apis.shared.feature_flags import handoffs_enabled
+
+            if not handoffs_enabled():
+                return [], None, []
+            from apis.shared.handoff.replay import load_delivery_replay, load_handoff_replay
+
+            from .metadata import load_session_meta
+
+            async def handoff_rows():
+                meta = await load_session_meta(session_id, user_id)
+                return await load_handoff_replay(session_id, user_id, meta.row)
+
+            (handoffs, spawned), deliveries = await asyncio.gather(
+                handoff_rows(), load_delivery_replay(session_id, user_id)
+            )
+            return handoffs, spawned, deliveries
+
+        async def fetch_rewind():
+            """Which stored messages a rewind has hidden (rewind spec §4).
+
+            ``None`` while the flag is off, so the response carries no
+            ``nextMessageIndex`` and every message shows, exactly as before.
+            """
+            from apis.shared.feature_flags import session_rewind_enabled
+
+            if not session_rewind_enabled():
+                return None
+            from .metadata import get_session_rewind
+
+            return await get_session_rewind(session_id, user_id)
+
         # Run fetches in parallel
         (
             messages_raw,
@@ -534,12 +632,20 @@ async def get_messages_from_cloud(
             pending_interrupts,
             ui_resource_rows,
             tool_summary_rows,
+            source_provenance_rows,
+            extraction_rows,
+            handoff_replay,
+            rewind_state,
         ) = await asyncio.gather(
             fetch_messages(),
             fetch_metadata(),
             fetch_pending_interrupts(),
             fetch_ui_resources(),
             fetch_tool_summaries(),
+            fetch_source_provenance(),
+            fetch_extractions(),
+            fetch_handoffs(),
+            fetch_rewind(),
         )
 
         messages_raw = list(messages_raw or [])
@@ -553,9 +659,15 @@ async def get_messages_from_cloud(
         logger.info(f"Metadata index contains {len(metadata_index)} entries")
         logger.info(f"🔑 Metadata index keys: {sorted(metadata_index.keys())}")
 
+        # Hidden messages keep their physical index out of the response but
+        # never out of the numbering: ids stay ``msg-{session}-{physical}``, so
+        # a rewound message's feedback, cost row and displayText can never
+        # attach to the message that later takes its place on screen.
+        visible_raw = rewind_state.visible(messages_raw) if rewind_state is not None else list(enumerate(messages_raw))
+
         # Convert to our Message model
         messages = []
-        for idx, msg in enumerate(messages_raw):
+        for idx, msg in visible_raw:
             try:
                 # Look up metadata: try plain index first (text chat),
                 # then "voice:<idx>" prefix (voice chat metadata).
@@ -572,7 +684,7 @@ async def get_messages_from_cloud(
                 else:
                     logger.warning(f"⚠️ No metadata found for assistant message {idx}")
 
-                messages.append(_convert_message(msg, metadata=metadata))
+                messages.append((idx, _convert_message(msg, metadata=metadata)))
             except Exception as e:
                 logger.error(f"Error converting message {idx}: {e}", exc_info=True)
                 continue
@@ -582,16 +694,10 @@ async def get_messages_from_cloud(
         # Apply pagination
         paginated_messages, next_page_token = _apply_pagination(messages, limit, next_token)
 
-        # Convert to MessageResponse format
-        start_seq = 0
-        if next_token:
-            try:
-                decoded = base64.b64decode(next_token).decode("utf-8")
-                start_seq = int(decoded)
-            except Exception:
-                start_seq = 0
-
-        message_responses = [_convert_message_to_response(msg, session_id, start_seq + idx) for idx, msg in enumerate(paginated_messages)]
+        # Convert to MessageResponse format. Each message carries its own
+        # physical index, which is the page offset plus its position only
+        # while nothing is hidden.
+        message_responses = [_convert_message_to_response(msg, session_id, idx) for idx, msg in paginated_messages]
 
         # MCP Apps (SEP-1865): replay persisted UI resources so the
         # `mcp-app-frame` survives a reload. The inline `ui_resource` event
@@ -638,17 +744,87 @@ async def get_messages_from_cloud(
                 if row.get("summary")
             ]
 
+        # Source provenance: the `source_provenance` SSE is emitted once
+        # mid-turn and never re-streams. Without this replay a reloaded
+        # conversation shows the cited values with no provenance at all, and the
+        # state a reader most needs is `quote_unsupported` — a verdict that
+        # vanishes on refresh reads as a clean answer. First page only, same
+        # reasoning as toolSummaries above.
+        source_provenance: List[Dict[str, Any]] = []
+        if not next_token:
+            source_provenance = [
+                {
+                    "toolUseId": row.get("toolUseId", ""),
+                    "claims": row.get("claims") or [],
+                }
+                for row in source_provenance_rows
+                if row.get("claims")
+            ]
+
+        # Structured extraction: the `document_extraction` SSE is emitted once
+        # mid-turn and never re-streams. Without this replay a reloaded
+        # conversation mentions values with no table and no provenance behind
+        # them — and a `quote_unsupported` that vanishes on refresh reads as a
+        # clean answer, exactly as above. First page only, same reasoning.
+        extractions: List[Dict[str, Any]] = []
+        if not next_token:
+            extractions = [row for row in extraction_rows if row.get("fields")]
+
+        # Handoffs: the rows a source thread shows after `sourceMessageIndex`,
+        # and the link a target's first bubble labels. First page only, like
+        # the replays above; the SPA places rows by index, not by page.
+        # Pending deliveries are composer cards, not thread content, so they ride
+        # the first page with the rest.
+        handoff_rows, spawned_from, deliveries = handoff_replay if not next_token else ([], None, [])
+
         return MessagesListResponse(
             messages=message_responses,
             next_token=next_page_token,
             pending_interrupts=pending_interrupts,
             ui_resources=ui_resources,
             tool_summaries=tool_summaries,
+            source_provenance=source_provenance,
+            extractions=extractions,
+            handoffs=handoff_rows,
+            spawned_from=spawned_from,
+            deliveries=deliveries,
+            next_message_index=len(messages_raw) if rewind_state is not None else None,
         )
 
     except Exception as e:
         logger.error(f"Error retrieving messages from AgentCore Memory: {e}")
         raise
+
+
+def list_stored_messages(session_id: str, user_id: str) -> List[Dict[str, Any]]:
+    """Every stored message of a session as ``{role, content}``, in physical order. Blocking.
+
+    The same ``list_messages`` read ``get_messages_from_cloud`` does, without
+    the metadata joins, so its positions are the message ids' indices. Raises
+    on misconfiguration; a failed read comes back empty, as the SDK swallows it.
+    """
+    if not AGENTCORE_MEMORY_AVAILABLE:
+        raise RuntimeError("bedrock_agentcore package is required")
+    memory_id = os.environ.get("AGENTCORE_MEMORY_ID")
+    if not memory_id:
+        raise ValueError("AGENTCORE_MEMORY_ID environment variable not set")
+    config = AgentCoreMemoryConfig(
+        memory_id=memory_id,
+        session_id=session_id,
+        actor_id=user_id,
+        enable_prompt_caching=False,
+    )
+    session_manager = AgentCoreMemorySessionManager(
+        agentcore_memory_config=config, region_name=os.environ.get("AWS_REGION", "us-west-2")
+    )
+    stored: List[Dict[str, Any]] = []
+    for msg in session_manager.list_messages(session_id, "default"):
+        inner = msg if isinstance(msg, dict) else getattr(msg, "message", None)
+        if isinstance(inner, dict):
+            stored.append({"role": inner.get("role"), "content": inner.get("content") or []})
+        else:
+            stored.append({"role": getattr(inner, "role", None), "content": getattr(inner, "content", None) or []})
+    return stored
 
 
 # The Memory SDK keeps its own records in a session's event stream beside the

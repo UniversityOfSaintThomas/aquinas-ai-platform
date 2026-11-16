@@ -15,6 +15,9 @@ import { BrowserLoginPromptComponent } from './components/browser-login-prompt/b
 import { BrowserPanelComponent } from './components/browser-panel/browser-panel.component';
 import { CompactionSummaryComponent } from './components/compaction-summary/compaction-summary.component';
 import { ArtifactCardComponent } from './components/artifact/artifact-card.component';
+import { HandoffRowComponent } from '../handoff/handoff-row.component';
+import { HandoffStateService } from '../../services/handoff/handoff-state.service';
+import { HandoffView } from '../../services/handoff/handoff.models';
 import { ArtifactPanelComponent } from './components/artifact/artifact-panel.component';
 import { FilePreviewPanelComponent } from './components/file-preview/file-preview-panel.component';
 import { ArtifactStateService } from '../../services/artifacts/artifact-state.service';
@@ -45,6 +48,7 @@ import {
 } from '../../../services/browser-login/browser-login.service';
 import { CompactionSummaryService } from '../../services/chat/compaction-summary.service';
 import { ChatStateService } from '../../services/chat/chat-state.service';
+import { OutageOffer, outageLabel } from '../../services/chat/provider-outage';
 import { ToolInsightService } from '../../services/chat/tool-insight.service';
 import { StreamParserService } from '../../services/chat/stream-parser.service';
 
@@ -89,12 +93,18 @@ interface Turn {
  * tool call, which is precisely the grouping this component is trying to do,
  * and they start a spurious turn group on top of that.
  *
+ * The stored continue prompt (`continuation`) is scaffolding too: on a model
+ * that refuses assistant prefill, Continue sends a fixed user turn the user
+ * never typed. Rendered, it split one answer into two around a bubble the
+ * user did not write; skipped, the partial and its continuation are one run.
+ *
  * A mid-turn steer is the case this must NOT catch: that is a real user
  * message with real text, and the words on either side of it are answers to
  * different things, so it genuinely should break the run.
  */
 function isProtocolScaffolding(message: Message): boolean {
   if (message.role !== 'user') return false;
+  if (message.continuation) return true;
   return message.content.every((block) => block.type === 'toolResult');
 }
 
@@ -138,6 +148,7 @@ function segmentTurn(messages: readonly Message[]): TurnSegment[] {
     SharedArtifactCardComponent,
     McpAppActionsComponent,
     AgentFeedbackLinkComponent,
+    HandoffRowComponent,
   ],
   templateUrl: './message-list.component.html',
   styleUrl: './message-list.component.css',
@@ -151,21 +162,32 @@ export class MessageListComponent {
   private readonly SCROLL_PADDING = 16;
 
   /**
-   * Silence thresholds for the "still working" notice.
+   * Silence thresholds for the loader's quiet hint and its warning.
    *
    * A model call that produces nothing looks exactly like a hung one. In prod
    * session 5f34d2b0 two turns went ~95 seconds with no output and the user
    * abandoned both — the second one while the request was, as far as the
    * telemetry shows, still in flight.
    *
-   * 30s is comfortably past a normal first token (~5-7s) and past most tool
-   * calls, so a healthy turn rarely trips it. 90s is past anything routine and
-   * is where the phrasing stops reassuring and starts admitting something is
-   * wrong. The tick is coarse because the thresholds are: the notice appears
-   * within one tick of crossing them.
+   * But silence is usually the hard case, not the broken one: a long tool
+   * call and a model thinking without streaming a summary both send nothing
+   * for as long as they run. So silence on its own earns a muted hint under
+   * the status, never the amber warning:
+   *
+   * - 30s is comfortably past a normal first token (~5-7s) and past most tool
+   *   calls, so a healthy turn rarely trips it. It sets an expectation.
+   * - 3 minutes adds that the user can stop it, without claiming it is stuck.
+   * - 90s turns amber only when no `agent_status` has told us what the turn is
+   *   doing. With a known phase the server owns the hang case: a silent model
+   *   call ends at the read timeout (`RETRY_READ_TIMEOUT`, 600s) with an
+   *   explicit error, so an amber line here would only be guessing earlier.
+   *
+   * The tick is coarse because the thresholds are: each appears within one
+   * tick of crossing them.
    */
-  private readonly STALL_NOTICE_MS = 30_000;
-  private readonly LONG_STALL_NOTICE_MS = 90_000;
+  private readonly STALL_HINT_MS = 30_000;
+  private readonly LONG_STALL_HINT_MS = 180_000;
+  private readonly UNEXPLAINED_STALL_MS = 90_000;
   private readonly STALL_TICK_MS = 5_000;
 
   /**
@@ -232,8 +254,11 @@ export class MessageListComponent {
    *  assistant message. The page reuses the normal submit path with a
    *  canned prompt. */
   continueRequested = output<void>();
+  /** Bubbled up when the user clicks "Try again" after a provider outage. */
+  outageRetryRequested = output<void>();
 
   private consentService = inject(OAuthConsentService);
+  private handoffState = inject(HandoffStateService);
   private toolApprovalService = inject(ToolApprovalService);
   private userQuestionService = inject(UserQuestionService);
   private browserLoginService = inject(BrowserLoginService);
@@ -307,7 +332,8 @@ export class MessageListComponent {
   }
 
   /**
-   * Copy for a response that has gone quiet for long enough to look broken.
+   * How long the viewed turn's stream has been silent, in ms, or null when
+   * no turn is pending.
    *
    * Deliberately client-side. The server cannot say anything during a stalled
    * model call without racing the agent stream against a timer, and that
@@ -318,7 +344,7 @@ export class MessageListComponent {
    * silence, so silence on an open stream really is "the server has not sent
    * anything yet".
    */
-  protected readonly stallNotice = computed<string | null>(() => {
+  private readonly silentForMs = computed<number | null>(() => {
     const sessionId = this.sessionId();
     if (!sessionId || !this.isChatLoading()) {
       return null;
@@ -327,12 +353,67 @@ export class MessageListComponent {
     if (!lastEventAt) {
       return null;
     }
-    const silentFor = this.nowMs() - lastEventAt;
-    if (silentFor >= this.LONG_STALL_NOTICE_MS) {
-      return 'Still working \u2014 this is taking longer than usual.';
+    return this.nowMs() - lastEventAt;
+  });
+
+  /**
+   * Whether this turn has told us what it is doing: the runtime has reported
+   * a phase, a tool is running, or the model is reasoning on screen.
+   *
+   * The status is cleared on every turn's falling edge, so a phase here always
+   * belongs to the turn that is running now, never the one before it.
+   */
+  private readonly hasKnownPhase = computed<boolean>(() => {
+    const sessionId = this.sessionId();
+    if (!sessionId) return false;
+    return (
+      !!this.toolInsight.status(sessionId) ||
+      !!this.loaderStatusTool() ||
+      this.isReasoningNow()
+    );
+  });
+
+  /**
+   * The amber warning for silence: only when nothing has said what the turn is
+   * doing. A turn in a known phase that goes quiet is working, not stuck, and
+   * gets `stallHint` instead (see the thresholds above).
+   */
+  protected readonly stallNotice = computed<string | null>(() => {
+    const silentFor = this.silentForMs();
+    if (silentFor === null || this.hasKnownPhase()) {
+      return null;
     }
-    if (silentFor >= this.STALL_NOTICE_MS) {
-      return 'Still working\u2026';
+    if (silentFor >= this.UNEXPLAINED_STALL_MS) {
+      return 'No response yet — still waiting…';
+    }
+    return null;
+  });
+
+  /**
+   * A muted line under the status while a turn is quiet for a long time.
+   *
+   * It adds to the status rather than replacing it: "Running
+   * document_extract…" stays on screen, because that is still the truest thing
+   * we can say, and the elapsed timer already shows the work going on. The copy
+   * claims nothing about what is normal for this request — we do not measure
+   * that — only that big requests take time and that Stop is there.
+   *
+   * Never shown beside an amber notice: a retry or an unexplained stall says
+   * something more specific, and two lines would contradict each other.
+   */
+  protected readonly stallHint = computed<string | null>(() => {
+    if (this.loaderNotice()) {
+      return null;
+    }
+    const silentFor = this.silentForMs();
+    if (silentFor === null) {
+      return null;
+    }
+    if (silentFor >= this.LONG_STALL_HINT_MS) {
+      return 'Large tasks can take several minutes. You can stop it at any time.';
+    }
+    if (silentFor >= this.STALL_HINT_MS) {
+      return 'Large tasks can take a few minutes.';
     }
     return null;
   });
@@ -352,9 +433,9 @@ export class MessageListComponent {
   });
 
   /**
-   * What the loading indicator says. A retry is a specific, known fact and
-   * outranks the generic stall notice, which is only ever an inference from
-   * elapsed silence.
+   * The amber line on the loading indicator. A retry is a specific, known fact
+   * and outranks the unexplained-stall notice, which is only ever an inference
+   * from elapsed silence.
    */
   protected readonly loaderNotice = computed<string | null>(
     () => this.retryNotice() ?? this.stallNotice(),
@@ -404,11 +485,44 @@ export class MessageListComponent {
       return this.preparingSettled() ? 'Getting ready' : 'Thinking';
     }
 
+    // The model's reasoning summary is streaming right above this line, so
+    // "Waiting for the model" would contradict what the user can read. Like
+    // `hasStreamedText`, this is first-hand from the content stream.
+    if (this.isReasoningNow()) {
+      return 'Reasoning';
+    }
+
     if (phase === 'thinking' && !this.hasStreamedText()) {
       return 'Waiting for the model';
     }
 
     return 'Thinking';
+  });
+
+  /**
+   * Whether the model is mid-reasoning right now: the newest assistant
+   * message ends in a reasoning block with text whose span is still open.
+   *
+   * The LAST block, not any block: once the model moves on to a tool call or
+   * the answer, a new block starts and this goes false, so the label never
+   * claims reasoning while the model is writing tool arguments. The duration
+   * is the stream parser's own "span closed" mark. Only models that stream a
+   * reasoning summary (adaptive Claude with `display: "summarized"`) ever set
+   * this; every other model keeps the labels below.
+   */
+  private readonly isReasoningNow = computed<boolean>(() => {
+    const messages = this.messages();
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (message.role !== 'assistant') continue;
+      const last = message.content[message.content.length - 1];
+      return (
+        last?.type === 'reasoningContent' &&
+        !!last.reasoningContent?.reasoningText?.text?.trim() &&
+        typeof last.reasoningDurationMs !== 'number'
+      );
+    }
+    return false;
   });
 
   /**
@@ -527,6 +641,20 @@ export class MessageListComponent {
   protected readonly showFeedbackLink = computed(
     () => !!this.feedbackAgent() && this.messages().length > 0 && !this.isChatLoading(),
   );
+
+  /** What the retry row under a provider-outage reply shows, once per outage;
+   *  gated per message by `outageOfferFor`. */
+  private readonly outageOffer = computed<OutageOffer | null>(() => {
+    const outage = this.chatStateService.lastTurnProviderOutage();
+    return outage ? { label: outageLabel(outage.provider), modelName: outage.modelName } : null;
+  });
+
+  /** The retry row for this message: only the final message of a turn the
+   *  provider failed, and never while a new response is streaming. */
+  protected outageOfferFor(messageId: string): OutageOffer | null {
+    if (this.isChatLoading() || messageId !== this.lastMessageId()) return null;
+    return this.outageOffer();
+  }
 
   /** Only the final message of a recoverable max_tokens turn gets the
    *  "Continue" affordance. Live-only state, never shown while a new
@@ -731,6 +859,40 @@ export class MessageListComponent {
   }
 
   // ----------------------------------------------------------------
+  // Handoff rows (handoffs spec §4.3): UI only, never part of the
+  // conversation the model reads. Anchored like artifacts, after the
+  // message that was last when the handoff was sent.
+  // ----------------------------------------------------------------
+
+  private readonly handoffRows = computed<readonly HandoffView[]>(() =>
+    this.handoffState.rowsFor(this.sessionId()),
+  );
+
+  private readonly handoffRowsByMessageIndex = computed<ReadonlyMap<number, HandoffView[]>>(() => {
+    const loaded = this.loadedMessageIndices();
+    const map = new Map<number, HandoffView[]>();
+    for (const row of this.handoffRows()) {
+      if (!loaded.has(row.sourceMessageIndex)) continue;
+      const list = map.get(row.sourceMessageIndex);
+      if (list) list.push(row);
+      else map.set(row.sourceMessageIndex, [row]);
+    }
+    return map;
+  });
+
+  /** Rows whose anchor isn't in the loaded page (or a conversation that was empty), at the tail. */
+  protected readonly unanchoredHandoffRows = computed<readonly HandoffView[]>(() => {
+    const loaded = this.loadedMessageIndices();
+    return this.handoffRows().filter((row) => !loaded.has(row.sourceMessageIndex));
+  });
+
+  protected handoffRowsForMessageId(id: string): readonly HandoffView[] {
+    const n = this.parseMessageIndex(id);
+    if (n === null) return [];
+    return this.handoffRowsByMessageIndex().get(n) ?? [];
+  }
+
+  // ----------------------------------------------------------------
   // Shared-conversation artifacts (recipient view)
   // ----------------------------------------------------------------
 
@@ -792,7 +954,15 @@ export class MessageListComponent {
    *  affordance instead of a silently stalled tool call. */
   protected unanchoredInterrupts = computed<OAuthConsentRequest[]>(() => {
     const ids = new Set(this.messages().map((m) => m.id));
-    return this.consentService.pending().filter((req) => !req.messageId || !ids.has(req.messageId));
+    // Scoped to THIS list's session (handoffs spec §4.3): a handoff's target streams in the
+    // background, and its `oauth_required` anchors to a message id that is never in this list,
+    // so without the session check it rendered here as though this thread were waiting on it.
+    // A list bound to no session keeps the old behaviour.
+    const sessionId = this.sessionId();
+    return this.consentService
+      .pending()
+      .filter((req) => !sessionId || !req.sessionId || req.sessionId === sessionId)
+      .filter((req) => !req.messageId || !ids.has(req.messageId));
   });
 
   /** Pending tool-approval prompts, rendered at the end of the conversation.
@@ -950,7 +1120,8 @@ export class MessageListComponent {
    */
   scrollToLastUserMessage(behavior: ScrollBehavior = 'smooth'): void {
     const msgs = this.messages();
-    const lastUserMsg = [...msgs].reverse().find(m => m.role === 'user');
+    // Scaffolding never renders, so it has no element to scroll to.
+    const lastUserMsg = [...msgs].reverse().find(m => m.role === 'user' && !isProtocolScaffolding(m));
     if (lastUserMsg) {
       this.scrollToMessage(lastUserMsg.id, behavior);
     }

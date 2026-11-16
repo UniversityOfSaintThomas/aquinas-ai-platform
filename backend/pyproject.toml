@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentcore-stack"
-version = "1.30.0"
-requires-python = ">=3.10"
+version = "1.36.1"
+requires-python = ">=3.11"
 description = "Multi-agent conversational AI system with AWS Bedrock AgentCore"
 readme = "README.md"
 license = {text = "MIT"}
@@ -27,15 +27,14 @@ dependencies = [
     # Authentication (for shared auth module)
     "pyjwt[crypto]==2.15.0",
 
-    # OAuth provider management
-    "authlib==1.7.1",
+    # In-process TTL cache for BFF session lookups (apis/shared/sessions_bff/cache.py)
     "cachetools==6.2.4",
 
     # Security: pin starlette to fix Dependabot alert (transitive via fastapi)
     "starlette==1.3.1",
 
     # Security: pin transitive deps to fix Dependabot alerts
-    "pillow==12.3.0",
+    "pillow==13.0.0",
     # Reads .xlsx workbooks into rows for the UI's spreadsheet preview
     # (apis/app_api/files/sheet_preview.py). MIT, pure Python, one
     # dependency (et-xmlfile). Already the library our own
@@ -45,15 +44,19 @@ dependencies = [
     "openpyxl==3.1.5",
     "cryptography==50.0.1",
     "python-multipart==0.0.31",
-    "aiohttp==3.14.3",
+    "aiohttp==3.14.4",
     "urllib3==2.8.0",
-    "idna==3.15",
-    "pyasn1==0.6.4",
+    "idna==3.20",
+    "pyasn1==0.6.5",
     "soupsieve==2.9.0",
     # Transitive via starlette/httpx/fastapi. Pinned to 4.14.2 for
     # GHSA-82r6-8w77-94w6 (TLSStream IDNA 2003 host-name encoding allowed
     # TLS certificate spoofing for internationalized domain names).
     "anyio==4.14.2",
+    # Transitive via requests/httpx/botocore. Pinned to 2026.10.19 for
+    # GHSA-6q48-6c7w-9gw2 (bundled emSign root CAs whose intermediate CA keys
+    # were compromised).
+    "certifi==2026.10.19",
 
     # PDF page-1 rasterization for attachment thumbnails (Apache 2.0 / BSD).
     # Bundles PDFium (no system poppler/ghostscript needed).
@@ -67,11 +70,11 @@ dependencies = [
 [project.optional-dependencies]
 # AgentCore-specific dependencies (for inference_api)
 agentcore = [
-    "strands-agents==1.57.2",
+    "strands-agents==1.63.0",
     "strands-agents-tools==0.8.8",
 
-    "aws-opentelemetry-distro==0.19.0",
-    "bedrock-agentcore==1.24.0",
+    "aws-opentelemetry-distro==0.22.0",
+    "bedrock-agentcore==1.24.2",
     # Multi-provider LLM support
     "openai==2.32.0",  # For OpenAI models
     "google-genai==1.73.1",  # For Google Gemini models
@@ -82,7 +85,7 @@ agentcore = [
 
 # Voice/BidiAgent dependencies (Nova Sonic speech-to-speech)
 bidi = [
-    "strands-agents[bidi]==1.57.2",
+    "strands-agents[bidi]==1.63.0",
 ]
 
 # Document ingestion pipeline dependencies (for Lambda deployment)
@@ -102,7 +105,7 @@ dev = [
     "pytest-xdist==3.6.1",
     "hypothesis==6.152.3",
     "moto[dynamodb,cognitoidp]==5.1.22",
-    "black==26.3.1",
+    "black==26.10.1",
     "ruff==0.15.12",
     "mypy==1.20.2",
     "types-aiofiles==25.1.0.20260409",
@@ -114,6 +117,12 @@ dev = [
     # and it is the only line compatible with the numpy pin above — pandas 3.x
     # requires numpy>=2.3.3 on py3.14+.
     "pandas==2.3.3",
+    # LLM judges for the eval harness (scripts/eval_harness.py judge;
+    # apis/shared/evals/judges.py imports it lazily, so no service needs it).
+    # 1.7.0 is the version the adapter was written against. It requires
+    # rich>=15, which moves rich for every extra since the lock is shared;
+    # strands-agents-tools allows rich>=14,<16.
+    "strands-agents-evals==1.7.0",
 ]
 
 # All dependencies (convenience)
@@ -122,33 +131,49 @@ all = [
 ]
 
 [tool.uv]
-# Guard rail on a TRANSITIVE dependency — this is not a loosened pin.
+# Exact pins on TRANSITIVE dependencies — the MCP SDK line is chosen here.
 #
 # `mcp` arrives only via `strands-agents`; we do not depend on it directly and
-# deliberately do not promote it to a direct dependency. `strands-agents==1.57.2`
-# — the version pinned above, today — declares `mcp>=1.23.0,<2.2`, so the
-# resolver is free to cross into `mcp` 2.x whenever it gets the chance.
+# deliberately do not promote it to a direct dependency. `strands-agents==1.63.0`
+# declares `mcp>=1.23.0,<2.4`, so without this constraint the resolver would
+# move the SDK whenever it got the chance. 2.3.0 is the newest release inside
+# that range: it negotiates MCP 2026-07-28 (`server/discover`, per-request
+# `_meta` capabilities, multi-round-trip input requests), and Strands'
+# `strands/tools/mcp/_compat.py` adapts to it (`MCP_V2`).
 #
-# Without this constraint the only thing holding us on 1.x is incidental: `mcp` 2.x
-# pulls `httpx2>=2.5.0`, which needs `idna>=3.18`, and we pin `idna==3.15` for
-# an unrelated Dependabot alert. A routine security bump of `idna` would quietly
-# unblock the major crossing — nobody would be choosing it, and nothing in the
-# diff would say "MCP".
+# Our own seams on the SDK are in `src/agents/main_agent/integrations/`:
+# `mcp_apps.py` substitutes `strands.tools.mcp.mcp_client.ClientSession` with
+# `_UIExtensionClientSession` to advertise the MCP Apps UI extension (SEP-1865),
+# and `mcp_transport.py` builds the streamable-HTTP transport over `httpx2`.
+# Both fail silently on an SDK line they were not written for (no App frames,
+# no auth-status signal), so move this pin deliberately, with a test pass over
+# them. See docs/kaizen/scoping/2026-10-17-mcp-sdk-v2-upgrade.md.
 #
-# That crossing lands under `src/agents/main_agent/integrations/mcp_apps.py`,
-# which substitutes `strands.tools.mcp.mcp_client.ClientSession` with
-# `_UIExtensionClientSession` to advertise the MCP Apps UI extension (SEP-1865)
-# on `initialize`. That seam reaches through a Strands internal into an MCP SDK
-# class and has never been exercised against 2.x — where the transport
-# dependency itself changed (httpx -> httpx2) and the types moved to a separate
-# `mcp-types` distribution. The failure mode is silent: MCP App frame headers
-# degrade to a generic glyph rather than raising an ImportError.
+# `httpx2` / `httpcore2` / `truststore` are the 2.x transport's own
+# dependencies (`mcp` asks only for `httpx2>=2.5.0`), pinned so the lock never
+# drifts onto a release younger than two weeks.
 #
-# A constraint, not a dependency: it bounds the version IF `mcp` is in the
-# resolution graph, without adding it to our own dependency metadata. Lift it
-# deliberately, together with a test pass over that `ClientSession` patch.
+# A constraint, not a dependency: it bounds the version IF the package is in
+# the resolution graph, without adding it to our own dependency metadata.
 # Asserted by backend/tests/supply_chain/test_strands_agentcore_pairing.py.
-constraint-dependencies = ["mcp<2"]
+constraint-dependencies = [
+    "mcp==2.3.0",
+    "httpx2==2.13.1",
+    "httpcore2==2.13.1",
+    "truststore==0.10.4",
+]
+
+# Override, not a constraint: this REPLACES strands-agents-tools' own pillow
+# requirement. Every strands-agents-tools release through 0.8.10 declares
+# `pillow>=12.1.1,<13.0.0`, which would hold us on 12.3.0 and its ~30 open
+# advisories (4 critical, fixed only in 13.0.0). Upstream has the fix open but
+# unmerged (strands-agents/tools#625, #626).
+#
+# Safe because the only module we import from that package is
+# `strands_tools.calculator` (sympy + rich, no PIL). The PIL users,
+# image_reader and use_computer, are never loaded. Remove this once a
+# strands-agents-tools release allows pillow 13, and bump it with that release.
+override-dependencies = ["pillow==13.0.0"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -167,7 +192,7 @@ line-length = 150
 target-version = "py310"
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false

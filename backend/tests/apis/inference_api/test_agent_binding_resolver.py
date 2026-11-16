@@ -75,7 +75,7 @@ def _patch_skill_access(monkeypatch, allowed, *, enabled=True) -> AsyncMock:
     """
     monkeypatch.setattr(f"{MODULE}.skills_enabled", lambda: enabled)
     predicate = AsyncMock(
-        side_effect=lambda invoker, refs, owner_id: (
+        side_effect=lambda invoker, refs, owner_id, adders=None: (
             set(refs) if allowed is True else {r for r in refs if r in allowed}
         )
     )
@@ -201,6 +201,19 @@ class TestModelResolution:
         assert "us.anthropic.opus" in ei.value.message
         # Checked against the INVOKING user, not the author.
         assert svc.can_access_model.await_args.args[0].user_id == "u-bob"
+
+    @pytest.mark.asyncio
+    async def test_model_missing_from_the_catalog_blocks_as_not_offered(self, monkeypatch):
+        """An Agent bound to an id whose row was deleted would run unpriced: refused."""
+        svc = _patch_access(monkeypatch, False)
+        _patch_retirement(monkeypatch, [_catalog_row("us.anthropic.haiku")])
+        cfg = AgentModelConfig(model_id="global.anthropic.haiku")
+        with pytest.raises(AgentBindingBlockedError) as ei:
+            await resolve_agent_invocation(_assistant(model_settings=cfg), _user())
+        assert "isn't offered on this platform" in ei.value.message
+        assert "agent's owner" in ei.value.message
+        kwargs = svc.can_access_model.await_args.kwargs
+        assert kwargs["record"] is None and kwargs["catalog_read"] is True
 
     @pytest.mark.asyncio
     async def test_legacy_assistant_never_blocks(self, monkeypatch):
@@ -485,3 +498,34 @@ class TestRetiredMemoryBinding:
         # unbound Agent.
         assert plan.skills.skill_ids == []
         assert plan.tools.tool_ids == [] and plan.tools.owns_toolset is False
+
+
+class TestProjectSkillAdders:
+    """A project harness hands each skill binding's recorded adder to the predicate
+    (shared-projects §9.6, clause 4); every other Agent hands none, so the adder
+    clause can only ever widen a project's skills."""
+
+    @pytest.mark.asyncio
+    async def test_a_project_harness_passes_its_adders(self, monkeypatch):
+        predicate = _patch_skill_access(monkeypatch, True)
+        harness = _assistant(bindings=[
+            AgentBinding(kind="skill", ref="erins_rubric", config={"version": 1, "addedBy": "u-erin"}),
+            AgentBinding(kind="skill", ref="old_skill", config={"version": 2}),
+        ])
+        harness.kind = "project"
+
+        await resolve_agent_invocation(harness, _user(), degrade=True)
+
+        predicate.assert_awaited_once()
+        assert predicate.await_args.kwargs == {"adders": {"erins_rubric": "u-erin"}}
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_agent_passes_no_adders(self, monkeypatch):
+        predicate = _patch_skill_access(monkeypatch, True)
+        agent = _assistant(bindings=[
+            AgentBinding(kind="skill", ref="erins_rubric", config={"addedBy": "u-erin"}),
+        ])
+
+        await resolve_agent_invocation(agent, _user())
+
+        assert predicate.await_args.kwargs == {"adders": {}}

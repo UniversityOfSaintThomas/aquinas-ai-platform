@@ -1,0 +1,477 @@
+# Field set authoring
+
+**Status:** PRs 1–3 implemented (§8): `serialize_field_set` and the unconditional
+check on every skill-file write (PR 1); the app-api routes, the parser's
+`FieldSetLayout` and the `FIELD_SET_AUTHORING_ENABLED` flag (PR 2); the SPA editor
+(PR 3). On in dev since 2026-11-13 (the `development` GitHub variable and
+`environment.development.ts`); off by default and in prod.
+**Closes:** `docs/specs/structured-extraction.md` §4, "what is given up" #1.
+**Depends on:** structured extraction (`DOCUMENT_EXTRACT_ENABLED`), in development.
+
+---
+
+## 1. The gap, stated exactly
+
+Structured extraction shipped to `develop` on 2026-10-20 and runs on dev. A named,
+typed **field set** is resolved from a skill's reference bundle, run over N documents on
+its own constrained model call, and every value comes back with a provenance state.
+
+A field set is one file: `references/field-set.<name>.md`.
+
+**There is no way to write that file without an API client.** Today it takes a
+`POST /skills/mine` and a `POST /skills/mine/{id}/resources` with a multipart body whose
+contents the author had to format by hand. The structured-extraction spec recorded this
+as a deliberate sequencing choice — "prove the extraction is trustworthy before handing
+out the schema editor" — and the extraction is now demonstrably trustworthy, so the
+choice has expired rather than been proven wrong.
+
+### 1.1 What is *not* missing — verified on dev, 2026-10-20
+
+An earlier framing of this gap said the feature was API-only end to end. It is not. On
+dev, signed in as an ordinary user, through the SPA and nothing else:
+
+| Step | Result |
+|---|---|
+| Composer → **Add files or photos** → a document | Chip renders, bytes reach the turn |
+| Composer → **Skills** → *NSF Solicitation Review (test)* | Inserts `/nsf-solicitation-review-test`, sends `enabled_skills` |
+| Ask for the field set over the attached document | `document_extract` ran in 6.6s, `schemaEnforced: true` |
+
+The run's seven rows against the fixture's captured ground truth: **7/7 values correct**,
+all four provenance states present (`supported` ×3, `quote_unsupported` ×1,
+`unassessed` ×2, `unverified` ×1), one artifact and one workbook written, an `EXTR#` row
+persisted and replayed on `GET /messages` as `extractions`.
+
+The skill carrying the set is a **user-owned** skill — it lists under `/skills/mine`
+with `field-set.nsf-solicitation.md` in its manifest. So the entire user tier already
+works: resolution, access, the mount gate, the constrained call, provenance, persistence.
+
+**The gap is one file the user cannot write.** Everything downstream of it is built.
+
+### 1.2 Two things the same run surfaced, neither in this scope
+
+* **The rows are not rendered.** *(Since fixed: structured extraction's PR-3 renders
+  them under the answer.)* The thread shows the model's prose summary and nothing
+  else; the typed table reaches the SPA on the `document_extraction` event and in the
+  `extractions` sidecar, and nothing reads either. The model, having no way to know,
+  told the user the table "is already displayed in your chat files". Structured
+  extraction's PR-3 owns this and places it outside slice one. It is the larger of the
+  two remaining gaps by user-visible effect, and it should be sequenced next.
+* **The first `document_extract` call failed in 71 ms** because the model guessed an
+  upload id; it recovered by calling `document_read` and retrying. A wasted round trip
+  on the happy path, not a correctness problem.
+
+---
+
+## 2. Scope
+
+**In:** creating, reading, editing, renaming and deleting a field set on a skill the
+signed-in user owns, through the Customize surface, with the same parser that the
+extraction tool uses as the only authority on whether the file is valid.
+
+**Out**, each for its own reason:
+
+| Not doing | Why |
+|---|---|
+| Editing or validating `## Rules` | G9 owns that section and nothing reads it yet. The editor **preserves it verbatim** and shows it read-only; it must never be the thing that silently deletes an author's rules |
+| Sharing one field set across skills | A set has no identity outside its skill. That is D2 of structured extraction, and it is what buys the access model for free |
+| Versioning beyond the frontmatter `version` | No history, no diff, no restore. The skill's own bundle versioning is the backstop |
+| Anything the optimizer owns | No `find`-phrase suggestions, no accuracy-per-field, no "try this set on a document" from inside the editor |
+| Rendering extraction results | §1.2. Separate work, separate PR |
+| A field-set picker in the composer | The tool resolves sets from the turn's active skills. A picker would be a second answer to a question already answered |
+| Admin authoring (`/admin/skills/...`) | The admin resource surface exists and works. This is about the user tier, which has none |
+
+---
+
+## 3. Where it lives
+
+**Decision (D1): a dedicated route under the skill that owns the set.** Not a top-level
+Customize tab, not a modal, not a section crammed into the skill form.
+
+```
+/customize/skills/:skillId/field-sets/new
+/customize/skills/:skillId/field-sets/:name
+```
+
+Reached from a **Field sets** section on the skill edit form, above the existing
+Supporting files fieldset, listing each set with its title, field count and version.
+
+Three reasons, in order of weight:
+
+1. **A top-level tab would imply an entity that does not exist.** Structured extraction's
+   D2 is that a field set is reference material inside a skill — that is what makes its
+   visibility, RBAC grant, Agent binding and project-harness binding already correct,
+   four access questions nobody has to re-answer. A `/customize/field-sets` page listing
+   sets across skills would be a list of things with no owner on screen, and the first
+   feature request against it would be "let me share one", which D2 exists to refuse.
+2. **A skill can have several sets, and a set needs room.** Seven field cards with a
+   multi-line `find` on each is a page, not a fieldset. The skill form is already long.
+3. **It keeps the bundle view honest.** The Supporting files list still shows
+   `field-set.nsf-solicitation.md` as the file it is, with View and Delete; a field-set
+   file additionally gets **Edit** , which routes here. Two views of one file, with the
+   file never hidden.
+
+---
+
+## 4. The format is owned by the backend, on both sides
+
+**Decision (D2): the SPA never parses and never serializes the field-set format.**
+
+The wire is structured JSON. `apis.shared.extraction.field_sets` owns bytes in both
+directions: it already owns `parse_field_set`, and this adds `serialize_field_set`
+beside it, in the same pure, stdlib-only module, under the same unit tests.
+
+This is the same argument as `grants_model_access` — a format with two implementations
+has two answers, and they diverge. A TypeScript parser would have to re-implement
+`_COLUMN_ALIASES`, the delimiter-row test, the enum comma-or-pipe split, the
+`MAX_FIELDS = 14` ceiling and six distinct authoring errors, and the day they drift is
+the day the editor accepts a file the tool refuses — at which point the author sees a
+green Save and a broken extraction, which is the worst available failure.
+
+It also means **the API path gets validation for free**: a `curl` that uploads a
+malformed field set is refused with the same message the editor would have shown.
+
+### 4.1 Routes
+
+All in `backend/src/apis/app_api/skills/routes.py`, all
+`Depends(get_current_user_from_session)`, all scoped to a skill the caller owns through
+the existing `UserSkillService`. No new table, no new GSI, no new RBAC noun.
+
+| Route | Does |
+|---|---|
+| `GET /skills/mine/{skill_id}/field-sets` | Lists the sets on this skill. Derived from the resource **manifest** — filenames only, no S3 GET |
+| `GET /skills/mine/{skill_id}/field-sets/{name}` | One set, parsed: `{name, title, version, fields[], rules, markdown, unmanagedColumns[]}`. Carries the raw `markdown` too, so the escape hatch needs no second call |
+| `PUT /skills/mine/{skill_id}/field-sets/{name}` | Writes one set. Body is **either** `{title, version, fields[], rules}` (structured) **or** `{markdown}` (raw). `?validate=true` parses and returns the same body shape without writing |
+| `DELETE` | Already exists: `DELETE /skills/mine/{id}/resources/{filename}`. Not duplicated |
+
+A `GET` of a set whose stored file does not parse returns **400 with the parser's
+message and the raw markdown**, never a 500 and never a silent empty form. A file that
+is already broken is exactly the file someone needs to open.
+
+**As built (PR 2)**, in `apis/app_api/skills/routes.py` with the wire models and
+conversions in `apis/app_api/skills/field_sets.py`:
+
+* **The routes 404 while the flag is off, after authentication**: each handler declares `get_current_user_from_session` and calls `_require_field_set_authoring()` first.
+  The §4.2 check on upload does not depend on the flag.
+* **`GET …/field-sets`** returns `{skillId, fieldSets: [{name, filename, size, contentHash}], maxFields}`,
+  read from the manifest. It counts only `reference` files, the only kind the resolver reads.
+  It carries no title, field count or version, because those need the file. §3's list
+  section therefore either opens each set or shows names only; PR 3 decides which.
+* **`GET …/field-sets/{name}`** returns the set's fields, `title`, `version`, `rules`,
+  `markdown` and `maxFields` (the parser's 14, so the editor's "7 of 14" can't disagree
+  with Save). It also returns what the form can't show: `preamble`, `postscript`,
+  `frontmatter`, `unmanagedColumns`, and `unmanagedValues` on each field. A broken
+  stored file answers `400 {detail, markdown}`; a non-UTF-8 one answers `400 {detail, markdown: null}`.
+* **`PUT …/field-sets/{name}`** takes the structured set or `{markdown}`. Sending both, or
+  neither, is a 422.
+  * Structured: every string is trimmed at its ends and nothing else. An empty title or
+    version gets the default the parser would read, and the file is written by
+    `serialize_field_set(set, layout=…)`.
+  * Markdown: the bytes are stored as sent once they parse.
+  * `?validate=true` returns the response, `markdown` included, and writes nothing.
+  * A file byte-identical to the stored one is not written, so a no-op save leaves
+    the skill row, its version history and the grammar alone (§6).
+  * An existing `asset` or `script` of that filename is a 409 rather than replaced.
+  * A set name the resolver would skip is a 400 with the naming rule.
+  * The write is the ordinary `UserSkillService.add_resource`, so the §4.2 check runs on it too.
+
+### 4.2 Validation on write, unconditionally
+
+**Decision (D6): `SkillBundleFiles.add_resource` parses any file whose name is a field
+set, and refuses it on `FieldSetError`.** Not only on the new routes — on the existing
+resource upload too, and whether or not any feature flag is on.
+
+The alternative is to validate only behind `FIELD_SET_AUTHORING_ENABLED`, which would
+mean a deployment that later flips the flag discovers files that were invalid all along.
+A stored-invalid field set fails at *extraction* time, mid-turn, in front of a user who
+did not author it.
+
+**This is a behaviour change for deployments that are not using this feature**: a
+`POST .../resources` of a file named `field-set.*.md` that does not parse now returns
+400 where it returned 200. It is a correct 400 — the file could never have worked — but
+it is a change, and it gets a CHANGELOG line of its own. *(Open question 1, decided
+unconditional on 2026-11-13.)*
+
+**As built (PR 1)**, in `validate_field_set_upload`
+(`apis.shared.extraction.field_sets`), called from `SkillBundleFiles.add_resource`:
+
+* **Three entry points, one check.** The user upload, the admin upload and the agent's
+  `my_skill_write_file` all go through `add_resource`, so all three refuse. The routes
+  answer 400 with the parser's message; the agent tool returns it as an error result the
+  model can correct, which makes the authoring tools a first, feedback-bearing way to
+  write a set before the editor exists.
+* **`reference` kind only.** `turn_has_field_set` reads field sets from `references/`
+  alone, so a same-named `asset` or `script` is not a field set and is stored as before.
+* **A name the resolver would skip is refused too.** `field-set.NSF_Review.md` is not a
+  field set to `field_set_name_for`, so it used to store fine and then silently never
+  appear. It now answers with the naming rule.
+* **Nothing already stored is touched.** No migration: a broken file written before this
+  stays, and still fails at extraction as it did.
+
+---
+
+## 5. The editor
+
+**Decision (D3): a vertical list of field cards, not a grid.** An office authors seven
+rows of prose-ish search phrases, not a spreadsheet.
+
+Each card:
+
+| Input | Control | Notes |
+|---|---|---|
+| **Title** | text | What the column is called. First field, because it is what the author is thinking in |
+| **Name** | text, auto-derived | `snake_case`, derived from Title on first type and editable after. A rename is a new field, not a relabel — the card says so when an existing name changes |
+| **Type** | select | `string · number · currency · date · boolean · enum · list` |
+| **Find** | **textarea, 3 rows** | The visual centre of the card, with the widest control on the page |
+| **Allowed values** | chips | Only when Type is `enum`. Hidden otherwise, because the parser *refuses* values on any other type |
+| **Optional** | checkbox | "The document may legitimately not state this" |
+
+### 5.1 `find` is the field, and the UI has to say so
+
+The parser's own docstring: a field named `cost_share` tells a model almost nothing;
+*"whether the funder requires institutional cost sharing, and at what percentage of
+total project cost"* tells it what to look for. It is the only required column with no
+default, it is what gets tuned when a field under-performs, and it is the one an
+outsider leaves blank.
+
+So it is not a narrow cell in a row. It is a labelled multi-line input with a helper
+line — *"Say what to look for, the way you would tell a new colleague"* — and an example
+drawn from the card's own Title. A card with an empty `find` cannot be saved, and the
+message is the parser's, which already explains itself: *"'find' is required — it is the
+phrase that locates the value, and a field without one is a column header with no
+question behind it."*
+
+**Measured, and worth telling the author:** field description length is free. Fourteen
+fields with one-sentence descriptions compile a Bedrock grammar as fast as with
+three-word ones. There is no cost argument for a terse `find`, and the editor should not
+imply one by giving it a small box.
+
+### 5.2 Order is declared
+
+**Decision (D4): explicit Move up / Move down buttons on every card. Never sorted, never
+drag-only.**
+
+Authored row order *is* the order: it becomes the generated schema's property order, and
+the editor must never reorder on read, on save, or as a side effect of anything. Drag
+handles may be added later as an *additional* affordance; they are never the only one,
+because reordering by keyboard is the case that gets dropped and this is a field an
+office will reorder.
+
+### 5.3 The ceiling is 14, and the editor says why
+
+`MAX_FIELDS = 14` is measured, not chosen — Bedrock refuses to compile a wider
+constrained schema in our shape, with four separate undocumented limits behind it. The
+editor shows **"7 of 14 fields"** from the first card, disables Add at 14, and when
+refusing says what the parser says: split the set in two and run them separately. A
+cap that appears only on save, as a server error, after someone has written the
+fifteenth `find` phrase, is a cap that wasted their afternoon.
+
+### 5.4 The markdown escape hatch
+
+**Decision (D7): an "Edit as markdown" mode beside the form, over the same file.**
+
+The form cannot express everything the format allows, and three of those things are
+real:
+
+* `## Rules` — carried verbatim by the parser, read by nobody yet, and **lost forever**
+  if a structured editor round-trips without it.
+* **Unknown columns.** The parser ignores them deliberately, "so a set can carry a note
+  column for its own authors". A form that writes back only the six columns it knows
+  silently deletes that column.
+* Prose before and after the table, which a field set is allowed to have because it is
+  "a document an office reads, not only a payload".
+
+Rather than invent a form field for each, the editor **preserves all three through the
+structured path** (they ride on the `PUT` body as opaque strings) and offers raw
+markdown for anything else. On opening a set whose table has an unmanaged column, the
+form shows a banner naming the column and pointing at markdown mode — it does not
+silently drop it and it does not refuse to open.
+
+---
+
+## 6. What stability actually requires — a correction
+
+The brief for this work said an editor that changes "key order, spacing or separators"
+produces a different schema and costs minutes of grammar compilation. **That is not what
+the code does, and the difference changes the test.**
+
+`model_for_field_set` keys on `(name, version, field_set_fingerprint(field_set))`, and
+`field_set_fingerprint` hashes exactly `name · title · type · find · enum · optional`
+per field, in order. `build_model` reads the parsed `FieldSet`. **Neither ever sees the
+file's bytes.** So:
+
+* Reformatting the markdown — different cell padding, `|:---|` instead of `|---|`,
+  the `field` alias instead of `name`, reordered *header columns* — produces a
+  byte-identical schema and reuses the compiled grammar. It costs nothing.
+* Changing a `find` phrase changes the fingerprint and so misses our in-process model
+  cache. It does **not** necessarily cost a grammar compile: AWS documents that changing
+  only a name or description does not invalidate a cached grammar, and `find` reaches
+  the schema only as part of a field's `description`.
+* Reordering *fields*, renaming one, retyping one, or changing the enum values is what
+  genuinely produces a new schema.
+
+**Decision (D5): pin two different properties, for two different reasons.**
+
+1. **Semantic round-trip, because it protects the author's cost.**
+   `parse(serialize(parse(bytes))) == parse(bytes)` — field-for-field, in order,
+   including `rules`. This is the property that guarantees opening a set and saving it
+   unchanged changes nothing the schema can see. It must hold for hand-authored files
+   with foreign formatting, which is the case a byte test cannot cover.
+2. **Exact serializer bytes, because it protects the diff.**
+   A pinned fixture of `serialize_field_set` output, asserted byte-for-byte, so the
+   editor's own output format cannot drift between PRs and turn every saved file into a
+   whole-file diff. This is a review-hygiene property, not a cost one, and the spec
+   should not claim otherwise.
+
+Two further rules follow and are enforced, not merely stated:
+
+* **A no-op save does not bump `version`.** `version` is part of the cache key; bumping
+  it on every save is a forced grammar recompile per keystroke-session. The editor
+  bumps it only when the author does, and offers to when the field list changed shape.
+* **The editor never reorders, retitles or normalizes whitespace inside `find`.** Trim
+  the ends, touch nothing else.
+
+---
+
+## 7. Flag
+
+**Decision (D8): its own switch, `FIELD_SET_AUTHORING_ENABLED` /
+`CDK_FIELD_SET_AUTHORING_ENABLED`, SPA `features.fieldSetAuthoring`. app-api and the SPA
+only — the Runtime has none, because resolution does not change.** In development, so
+`"true"` and only `"true"` enables, and it is off in all three environment files.
+
+Why not ride `DOCUMENT_EXTRACT_ENABLED`: "may this deployment run extractions" and "may
+users write their own extraction schemas" are different decisions, and structured
+extraction's §4 drew that line itself. A deployment can reasonably want
+admin-authored sets with no user editor — which is exactly dev's state today.
+
+It is a **feature switch**, not a rollout switch: it does not retire. Turning it off
+takes an editor away from people, which is a product choice, not a kill switch for a
+change meant to be invisible.
+
+**Ceilings:** app-api gains one environment variable and no AWS resources, so the
+expected all-on delta is **zero**. `infrastructure/test/platform-ceilings.test.ts` fails
+by name until `fieldSetAuthoring` is added to `allFlagsOn()`; that failure is the guard
+working, and the PR records the measured before/after counts rather than asserting zero.
+
+**No new RBAC noun (D9).** A field set is a resource on a skill the user already owns
+and can already upload arbitrary files to. Adding a catalog tool id or a role grant
+would be inventing a permission for a capability the user demonstrably has.
+
+---
+
+## 8. Build order
+
+| PR | Contents |
+|---|---|
+| **1** ✅ | `serialize_field_set` in `apis.shared.extraction.field_sets`, both pinned tests (§6), validate-on-write in `SkillBundleFiles` (§4.2) |
+| **2** ✅ | The app-api routes (§4.1), the flag, CDK config + ceilings entry, docs-site row. Also the parser reporting what it ignores (`FieldSetLayout`, below), so the structured `PUT` can carry it |
+| **3** ✅ | The SPA: route, list section on the skill form, the card editor, markdown mode (§8.1) |
+
+PR 1 is useful on its own: it stops a malformed field set being storable at all, through
+any path, whether or not the editor is ever turned on.
+
+**What the serializer carries.** `serialize_field_set(set, layout=…)` writes the
+frontmatter, the table in authored order with the canonical column names, and
+`## Rules` verbatim. It parses its own output before returning and refuses, by name,
+any value the format can't carry: a `|` or a line break in a cell, a comma inside one
+enum value, or a title the frontmatter would strip. So it never saves a set that reads
+back as a different one.
+
+Since PR 2 it also carries the `FieldSetLayout` that `read_field_set_file` reports: the
+parts of the file the set ignores.
+
+* **Prose before the table.**
+* **Prose after it.** Prose written between table rows is written back after the table:
+  its words survive, but not its position.
+* **Frontmatter lines** other than `title` and `version`.
+* **Columns the parser does not read**, written after the six canonical ones. That
+  includes an earlier alias that a later one overrides, e.g. `field` before `name`.
+
+The serializer checks the layout's round trip as strictly as the set's. It refuses an
+extra column headed with an alias, which would read as a real column, and a `|` in the
+text after the table, which would read as a row. The layout is a separate object from
+`FieldSet`, so extraction, its schema and its grammar-cache key are unchanged.
+
+### 8.1 As built (PR 3)
+
+All under `frontend/ai.client/src/app/customize/skills/`, behind `features.fieldSetAuthoring`:
+
+* **Routes.** `customize/skills/:skillId/field-sets/new` and `…/:name`, both `canMatch` on
+  the flag, declared above `customize/skills/:skillId`. They render `FieldSetEditorPage`.
+* **The Field sets section** (`FieldSetsSectionComponent`) sits on the skill's **edit**
+  form, above Supporting files. It lists each set with its title, field count and
+  version (§3), by opening each one, because the list route carries names only (§4.1).
+  A skill holds a handful of sets at most, and the reads run in parallel. A set whose
+  file no longer parses still lists, marked "Can't be opened as a form".
+* **Supporting files keeps the file.** A `reference` named `field-set.<name>.md` gains an
+  Edit link beside View and Delete. It is never hidden.
+* **Cards** follow §5:
+  * Title first, and Name derived from it until the author types in the name box. An
+    existing field's rename is called out as a new column.
+  * The seven types by label.
+  * **What to look for** as a three-row textarea, with its helper line and a placeholder
+    drawn from the card's title.
+  * Allowed values as chips, shown only for `enum`, and sent only for `enum`.
+  * Optional.
+  * Move up / Move down keep keyboard focus on the moved card (D4).
+  * "N of 14" comes from the backend's `maxFields`. Add field disables at the ceiling and
+    says why.
+* **What the form doesn't show** rides along unchanged: `## Rules` (shown read-only),
+  prose, extra frontmatter lines and note columns. A banner names any note column and
+  points at markdown mode. A new card gets empty cells for those columns, so the
+  structured `PUT` lines up.
+* **Version.** A save sends exactly the version in the box. When the field list changes
+  shape (a name, type, allowed values, optional, or the order) and the version has not
+  moved, a link offers the next number. A changed `find` or title does not count as a
+  new shape.
+* **Markdown mode (D7).** Form → markdown is `PUT …?validate=true` with the structured
+  body, so the backend writes the file. Markdown → form is `PUT …?validate=true` with
+  `{markdown}`, so the backend reads it. A body the backend refuses keeps you where you
+  are, with its message. Save in markdown mode stores the text as typed. A stored file
+  that no longer parses opens here with the parser's message.
+* **Create, rename and delete.**
+  * A new set takes its name from the title when none is typed.
+  * Create or rename first checks the list and refuses a name already in use, because
+    a `PUT` replaces.
+  * A rename writes the new name, then deletes the old file, then replaces the URL.
+  * Delete confirms in a destructive `alertdialog` and uses the existing resource
+    `DELETE`.
+
+Checked in the in-app browser against a local app-api from this branch, with the flag
+on, on 2026-11-13. A structured save of a hand-written set:
+* kept its `note` column and that column's cells;
+* kept the prose on both sides of the table, an extra frontmatter line and `## Rules`;
+* left `version` at 2, while the edited phrase changed.
+
+Also checked in the same session:
+* reorder plus markdown mode carried the note cell with its row;
+* broken markdown stayed in markdown mode with the parser's message;
+* a new set was created and then deleted through the dialog;
+* at 375 px in dark mode, nothing scrolled sideways.
+
+**Checked on dev, 2026-11-13**, after #2055 and #2057 deployed. The dev app-api task
+definition (992) carries `FIELD_SET_AUTHORING_ENABLED=true`, and the dev bundle has
+`fieldSetAuthoring` on. Everything below used a throwaway skill, deleted afterwards:
+* A broken `field-set.*.md` upload answered **400** with the parser's message (PR 1).
+* The list route returned the set (PR 2).
+* The section showed "Grant Intake · grant-intake · 2 fields · version 2".
+* A structured save from the editor kept the `note` column and its cell, both prose
+  blocks, the `owner:` line and `## Rules`, with `version` still 2.
+* An unchanged second save left the skill's `updatedAt` and the file's hash as they
+  were.
+* Markdown mode carried the note column.
+* Delete through the dialog left "No field sets yet".
+
+---
+
+## 9. Open questions for review
+
+1. ~~**Unconditional validation (§4.2).**~~ **Decided 2026-11-13: unconditional.** A
+   flag-gated check would let invalid files collect quietly until a deployment turned
+   extraction on, then fail in front of users who did not write them.
+2. ~~**Does the escape hatch earn its place in slice one (§5.4)?**~~ **Shipped in PR 3.**
+   It is the only way to edit `## Rules`, a note column or the prose, and the only way
+   to fix a stored file that no longer parses. Both switches go through the backend,
+   so it adds no second parser.
+3. ~~**Sequencing against the render gap (§1.2).**~~ **Settled:** the render shipped
+   first, in structured extraction's PR-3 (#1940).

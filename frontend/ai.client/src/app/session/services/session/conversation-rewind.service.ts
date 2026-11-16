@@ -1,0 +1,129 @@
+import { HttpErrorResponse } from '@angular/common/http';
+import { Injectable, Injector, inject, signal } from '@angular/core';
+import { FEATURES } from '../../../services/features';
+import { ToastService } from '../../../services/toast/toast.service';
+import { ChatStateService } from '../chat/chat-state.service';
+import { Message } from '../models/message.model';
+import { ComposerDraftService } from './composer-draft.service';
+import { parseMessageRef } from './message-feedback.service';
+import { MessageMapService } from './message-map.service';
+import { SessionService } from './session.service';
+
+/**
+ * "Rewind to here" on a user message (docs/specs/conversation-rewind-and-fork.md §4).
+ *
+ * The server hides the message and everything after it, nothing is deleted,
+ * and this puts the message's text back in the composer to edit and resend.
+ * The thread keeps its id, URL, title and place in the sidebar. The next turn
+ * resends the same history the earlier turns sent, so the agent reads it from
+ * the prompt cache instead of paying to write it again.
+ *
+ * A root service the bubble calls directly, like `FailedSendService`, because
+ * the action needs the message map, the composer and the session API, none of
+ * which a leaf component should reach. Those are resolved when a rewind runs,
+ * not when the service is built: every user bubble injects this, and a bubble
+ * should not drag the HTTP stack into existence just to decide whether to
+ * draw a button.
+ */
+@Injectable({ providedIn: 'root' })
+export class ConversationRewindService {
+  private readonly features = inject(FEATURES);
+  private readonly chatState = inject(ChatStateService);
+  private readonly injector = inject(Injector);
+
+  /** The message a rewind is in flight for, so its button can show it and not double-fire. */
+  readonly pendingMessageId = signal<string | null>(null);
+
+  /**
+   * Per conversation, the highest message index the server has refused
+   * because the compaction summary covers it. The SPA is not told the
+   * checkpoint (`GET /messages` carries only `totalSummarizedTurns`), so it
+   * learns it from the first refusal. That is enough to stop offering the
+   * dead buttons: the checkpoint only moves forward, and a rewind or fork
+   * before it is refused (rewind_service `_compaction_after_cut`), so every
+   * message at or before a refused one is covered too. Fork and rewind share
+   * the rule, so a refusal from either hides both.
+   */
+  private readonly summarizedThrough = signal<ReadonlyMap<string, number>>(new Map());
+
+  /** Whether the feature is on at all; the bubble renders nothing without it. */
+  get enabled(): boolean {
+    return this.features.sessionRewind;
+  }
+
+  /**
+   * Whether `message` can be rewound to right now. Never while its
+   * conversation streams (the server's single-flight lease would refuse it),
+   * and never for a message the server has not numbered (a send that failed).
+   */
+  canRewind(message: Message): boolean {
+    if (!this.enabled || message.role !== 'user' || message.steering || message.sendFailure) return false;
+    const ref = parseMessageRef(message.id);
+    if (!ref || this.isSummarized(message)) return false;
+    return !this.chatState.isSessionLoading(ref.sessionId) && this.pendingMessageId() === null;
+  }
+
+  /** Whether the server has said the summary covers `message`; neither rewind nor fork is offered there. */
+  isSummarized(message: Message): boolean {
+    const ref = parseMessageRef(message.id);
+    if (!ref) return false;
+    const through = this.summarizedThrough().get(ref.sessionId);
+    return through !== undefined && ref.index <= through;
+  }
+
+  /** Remember a summary refusal for `message`, from a rewind or a fork. Other refusals are ignored. */
+  noteRefusal(message: Message, error: unknown): void {
+    if (!isSummaryRefusal(error)) return;
+    const ref = parseMessageRef(message.id);
+    if (!ref) return;
+    this.summarizedThrough.update((current) => {
+      if ((current.get(ref.sessionId) ?? -1) >= ref.index) return current;
+      return new Map(current).set(ref.sessionId, ref.index);
+    });
+  }
+
+  async rewind(message: Message): Promise<boolean> {
+    if (!this.canRewind(message)) return false;
+    const ref = parseMessageRef(message.id)!;
+    this.pendingMessageId.set(message.id);
+    try {
+      const result = await this.injector.get(SessionService).rewindSession(ref.sessionId, message.id);
+      this.injector.get(MessageMapService).rewindToMessage(ref.sessionId, message.id, result.nextMessageIndex);
+      // The hidden turn took its affordances with it: the server cleared the
+      // markers, and a "Continue" or "interrupted" chip here would point at a
+      // reply that is no longer on screen.
+      this.chatState.setLastTurnContinuable(ref.sessionId, false);
+      this.chatState.setLastTurnInterrupted(ref.sessionId, false);
+      this.chatState.setLastTurnProviderOutage(ref.sessionId, null);
+      this.injector.get(ComposerDraftService).request(ref.sessionId, result.prefillText);
+      return true;
+    } catch (error) {
+      this.noteRefusal(message, error);
+      this.injector.get(ToastService).error("Couldn't rewind", rewindErrorMessage(error));
+      return false;
+    } finally {
+      this.pendingMessageId.set(null);
+    }
+  }
+}
+
+/** The server's own explanation for a refusal, which is written for the user. */
+export function rewindErrorMessage(error: unknown): string {
+  if (error instanceof HttpErrorResponse) {
+    const detail = (error.error as { detail?: unknown } | null)?.detail;
+    if (typeof detail === 'string' && detail && error.status !== 500) return detail;
+  }
+  return 'Something went wrong. Try again in a moment.';
+}
+
+/**
+ * The refusal for a message the compaction summary covers: a 409 whose detail
+ * names the summary. Matched on the wording because the route answers every
+ * refusal as `{detail}` with no code, and the other 409s (a turn streaming,
+ * a message already rewound, a race) are all worth trying again.
+ */
+export function isSummaryRefusal(error: unknown): boolean {
+  if (!(error instanceof HttpErrorResponse) || error.status !== 409) return false;
+  const detail = (error.error as { detail?: unknown } | null)?.detail;
+  return typeof detail === 'string' && /\bsummary\b/i.test(detail);
+}

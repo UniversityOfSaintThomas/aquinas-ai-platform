@@ -4,6 +4,460 @@ All notable changes to this project are documented in this file. Format follows 
 
 For narrative release notes written for operators and product owners, see [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
+## [Unreleased]
+
+## [1.36.1] - 2026-11-13
+
+A patch that gets the 1.36.0 release published and turns attachment cards on in our prod. The 1.36.0 Release workflow stopped on a formatting check in a terminal-client test, so v1.36.0 has no tag or GitHub release; 1.36.1 is the first tagged release carrying 1.36.0's changes. No backend changes, no new flags, no manual steps, no GSI changes.
+
+### 🔧 CI/CD
+
+- `tui/tests/test_catalog.py` formatted with `black`, which the Release workflow's `scripts/tui/build.sh --check` failed on after the 1.36.0 merge; no PR workflow checks `tui/`, which is why it reached `main`
+
+### ✨ Improved
+
+- Attachment cards (`features.attachmentCards`, UI only) are on in our prod build (`environment.production.ts`); still off by default
+
+## [1.36.0] - 2026-11-13
+
+Attachments are planned in tokens, per model: one pure planner (`attachment_plan.py`) decides every attachment, its `token` profile (`ATTACHMENT_PLAN_ENABLED`, a rollout switch, default off) budgets documents at half the model's compaction ceiling, sends anything over it on demand or to search, admits 20 files, 20 images and 1,000-page PDFs, and stores documents and images in Memory as handles; this release turns it on in our prod. Voice mode runs the conversation's Agent. The MCP SDK moves to 2.3.0 (protocol 2026-07-28), with form elicitation built dark. Handoffs gain deliveries and files by reference (dev only). Sonnet 5.5 and GPT-6.1 Sol are curated, model ids with no catalog row are refused, and Gateway tools honour "Needs approval". Release eval results are published as a public benchmark and an admin Evaluations page. New flags: `ATTACHMENT_PLAN_ENABLED`, `MCP_ELICITATION_ENABLED`, `FIELD_SET_AUTHORING_ENABLED` (each in development, default off), `ANALYZE_SANDBOX_REUSE_ENABLED` (rollout, default on) and SPA `features.attachmentCards`; none retired; `CDK_FRONTEND_CORS_ORIGINS` removed. Our prod also turns on structured extraction, field-set authoring and source provenance, each still off by default. Manual steps: `backfill_voice_tool_flags.py` per environment, catalog rows for Sonnet 5.5 and GPT-6.1 Sol in prod, and four `production` GitHub variables. No GSI changes.
+
+### 🚀 Added
+
+- **Field-set editor, behind `features.fieldSetAuthoring` (on in dev only).** A skill's edit form gains a **Field sets** section listing each set's title, field count and version, and a field-set file in Supporting files gains an Edit link. The editor at `/customize/skills/{id}/field-sets/new` and `/{name}` shows one card per field in authored order:
+  - title, a name derived from it, the type, a three-row "What to look for" box, allowed values (for "One of a list" only) and Optional;
+  - Move up / Move down to reorder, with "N of 14 fields" shown and Add field disabled at the ceiling.
+
+  Saving keeps what the form doesn't show (`## Rules`, note columns, prose and extra frontmatter), never changes the version on its own, and offers the next version when the fields change shape. **Edit as markdown** switches over the same file through the backend's validate route, so the SPA never parses the format; it is also where a stored file that no longer parses opens to be fixed. Create and rename refuse a name already in use; delete confirms first. Needs `FIELD_SET_AUTHORING_ENABLED` on app-api (`docs/specs/field-set-authoring.md` PR 3). (#2057)
+
+- **Field-set authoring routes (`FIELD_SET_AUTHORING_ENABLED`, app-api only, on in dev only).** `GET /skills/mine/{skill_id}/field-sets` lists the field sets on a skill the caller owns, from its manifest, without reading any file. `GET …/field-sets/{name}` returns one as structured fields plus its stored markdown. A stored file that no longer parses answers 400 with the parser's message and the markdown, so it can still be opened and fixed. `PUT …/field-sets/{name}` saves either the structured set or raw markdown, and `?validate=true` returns what would be saved without saving it. The parser now reports what it ignores (`read_field_set_file` → `FieldSetLayout`): columns it does not read, prose before and after the table, and frontmatter lines other than `title` and `version`. The writer puts them back, so a save from a form never deletes an author's note column. A save whose file is unchanged writes nothing, and `version` is only ever what the caller sent. Deleting stays the existing resource `DELETE`. No new table, index, RBAC scope or AWS resource; the Runtime is unchanged and extraction's schema and grammar cache are untouched (`docs/specs/field-set-authoring.md` PR 2). The SPA flag `features.fieldSetAuthoring` is added, off, for the editor that follows. (#2055)
+
+- **An artifact share link can follow the latest version.** The share dialog has an "Always show the latest version" checkbox, off by default. A link made with it ticked opens the newest version each time it's opened, including versions written later; an existing pinned link can be switched with **Follow latest** in the dialog's list, keeping its URL. The recipient page says "always the latest version", and the owner's list and the recipient's library say "Latest version". Links shared with Project members always pin one version. The backend stores `follows_latest` on the share rows and resolves the owner's HEAD after the access check on the metadata, render-token and content routes (`_resolve_share_target`); pinned shares are unchanged and cost no extra read. `followsLatest` is optional on `POST /artifacts/{id}/shares` and `PATCH /artifacts/shares/{id}` and appears on share responses. No infra, flag or Lambda change (`docs/specs/artifact-sharing.md` §9). (#2034)
+
+- **Over-budget documents are indexed and searched (`ATTACHMENT_PLAN_ENABLED`, on in dev only; unified-attachment-delivery phase 5).** Under the attachment planner's `token` profile with the attachments KB on, a document the planner would send on demand is also ingested into the `attachments` knowledge base when its facts are written, not only a reference-class one (`attachment_plan.indexes_for_search`). Once indexed it is planned `search`, and a conversation whose on-demand set reaches `SEARCH_STEER_MIN_DOCUMENTS` documents gets one line in the turn's user message telling the model to call `document_read` with `query` first. The overflow readout (`docs/testing/attachment-overflow-search-2026-11.md`) set that threshold to 9, above every set it measured: at 2–8 documents steering to search answered the same and cost more input tokens on Haiku 5.5 and, below 8, on Sonnet 4.6. An over-budget file's guidance keeps `pattern` first. No tool spec or system prompt changes. The conversation's file rows are read in a worker thread that overlaps the agent build. `attachmentPlan` on `C#` rows gains a `conversation` entry, and the prepare Lambda gets `ATTACHMENT_PLAN_ENABLED` while the flag is on. The `attachment_delivery` eval family gains the `search` arm, files attached on later turns, and the `overflow_*` cells. (#2002, #2003)
+
+- **Attachment cards draw images and Drive folders too (`features.attachmentCards`, on in dev only).** A sent message's documents, images and folders now share one layout: one card, a pair, a mosaic for 3 to 5, and a "+N more" tile past five. An image card shows the image full-bleed and opens the message's images in the existing lightbox. A folder card shows its first files with type icons and `Folder · N files · source`. Its **Files** button opens the whole list, and its menu offers Refresh and Save as project. The composer's folder card is drawn the same way and keeps its progress, Connect, Retry and Remove. The folder actions moved into `FolderAttachmentActionsService`, which the old chip now uses too. (#1974)
+
+- **Attachment cards show the real contents of Word, spreadsheet, CSV and deck files.** The prepare Lambda writes `_derived/preview.json`, at most 4 KB, when a file is uploaded (`apis/shared/files/attachment_preview.py`, standard library only, so the Lambda image gains no dependency):
+  - a Word file's opening paragraphs;
+  - a workbook's sheet names and first rows, or a CSV's first rows;
+  - a deck's slide count and the first slide's title and bullets.
+
+  Word files get it from their facts or preparation pass. Spreadsheets, CSVs and decks never reach those passes, so app-api queues `{"action": "preview"}` for them on the same queue. `GET /files/previews?ids=` returns up to 20 at once, owner-scoped: an id that isn't the caller's reads `null`, the same as one with no preview. The SPA batches cards that ask together into one call, and a fresh composer upload asks again after 3 and 6 seconds. Files uploaded before this keep the type skeleton. A rendered slide image is left out: it needs LibreOffice. Display only: nothing reaches a model call or the stored message. (#1977)
+
+- **Attachment cards, behind `features.attachmentCards` (UI only; on in `environment.development.ts`, off locally and in prod).** Attached files are drawn with the browser card's shape: a tray holding the file's preview, then its name and `TYPE · size · status`. The preview shows a PDF's first page, the opening lines of text and Markdown, a CSV's first rows, or a skeleton shaped like a page, sheet or slide. In the composer, a local file previews from its own bytes before the upload finishes. Up to five files sit on one line; past five the line folds into a summary that keeps failed and in-flight files in view. A sent message shows one card, a pair, a two-column mosaic for 3 to 5, and for 6 or more the first three with a "+N more files" tile that expands in place. The shared shell (`app-content-card`) now draws the browser card too, with no visual change. Every route it reads already exists; nothing reaches a model call or the prompt. Images keep their mosaic and Drive folders their own card for now. (#1964)
+
+- **Attachment planner `token` profile** (`ATTACHMENT_PLAN_ENABLED` / `CDK_ATTACHMENT_PLAN_ENABLED`, SPA `features.attachmentPlan`; in development, a rollout switch, default off; on in our prod from this release): attachments are decided in each model's own tokens against `document_budget = 0.5 × chat_ceiling` (`tokens.text × tokenizer_factor`, 1,565 a page for a native PDF), and a document over the budget goes on demand from the row the resolver already read, so nothing is read before the first token; written to the Runtime only while on (#1987, #1988, #2004)
+- **More and larger attachments under the token profile:** 20 files, 20 images and 1,000-page PDFs (a PDF over 1,000 pages is refused at `/complete`); images are downscaled at upload into a high and a compact (≤340 KB) copy, with a 20 MB image limit, and fall back to the compact copy when the byte budget runs out (#1992, #1994)
+- **Memory stores attachments as handles, not bytes** (token profile): a document's `CreateEvent` payload drops from 4.5 MB to 518 B on the measured case, and documents and images restore byte-identically from S3; a cold restore with images in history adds about 104 ms for 10 compact images (about 350 ms for 10 high ones), accepted 2026-11-11 (#1993, #1996)
+- **`GET /files/limits`** reports the active attachment limits; upload admission, the SPA (`AttachmentLimitsService`) and the terminal client all read it, so the TUI now checks size and count before uploading (#1967)
+- **Every document gets `facts` on its file row at upload** (token counts, pages; rides the default-on large-document pipeline: one more SQS message per small-document upload to the existing prepare queue; EMF `FileFactsComputed` / `FileFactsMs`) (#1966)
+- **Handoffs: deliveries** (`HANDOFFS_ENABLED` / `features.handoffs`, dev only): Bring back result and Send to *{title}* create `DELIVERY#` rows, shown as cards above the composer and sent with a message (up to three, each attached by one conditional write beside the agent build, about 4.5 ms measured on dev and accepted); `POST /sessions/{targetId}/handoffs/send-back`, `…/handoffs/{id}/deliver`, `/sessions/{id}/deliveries/{id}/dismiss` (#2018, #2023)
+- **Handoffs: files by reference** (dev only): handed-off and delivered files become read-only reference rows in the receiving conversation (`linked_files.py`), never counted against quota, never inlined, named to the model by one `<file …/>` line each; review-sheet checkboxes, file chips and "From *{title}*" in the Files panel (#2026, #2028)
+- **Voice mode runs the conversation's Agent** (#625): an Agent's "Available in voice mode" (off by default) and "Use only this agent's instructions" (on by default) settings, its knowledge sent whole up to `VOICE_KB_MAX_TOKENS` (optional env, default 800,000), and only catalog tools marked `voiceAvailable` (off by default; voice fails closed when the catalog can't be read); a clear message when Bedrock refuses a session at capacity. Needs `backfill_voice_tool_flags.py` (#2056)
+- **Voice applies role-based and personal instructions** like a text chat; byte-identical prompt for a user with neither (#2052)
+- **MCP form elicitation, backend** (`MCP_ELICITATION_ENABLED` / `CDK_MCP_ELICITATION_ENABLED`, SPA `features.mcpElicitation`; in development, off everywhere): a server whose catalog row sets `elicitationEnabled` can pause a tool call on a form (`mcp_elicitation_required`), and the call is replayed on resume; written to the Runtime only while on (#1953)
+- **Structured extraction results render as a table** under the answer (`DocumentExtractionComponent`, `features.documentExtract`, now on in the dev build only) (#1940)
+- **Users can pin private Agents**; the pin routes are gated on `AGENTS_API_ENABLED` rather than the marketplace (#1990)
+- **Sonnet 5.5 curated** (`us.` $2.20 / $11.00 input/output, $2.75 cache write, $0.11 read; thinking bound like the other 5.5 models); Sonnet 5 demoted (#2045)
+- **GPT-6.1 Sol curated** ($2.20 / $11.00, cache read 0.05×, no `none` effort); GPT-6 Sol demoted (#1800)
+- **Public benchmark:** `eval_harness.py publish` writes `docs-site/src/data/benchmarks.json` and the README table from a release run; docs-site Benchmarks, Methodology and Reproduce pages; `rescore` and `expect.forbidden_in_code` (#2029)
+- **Evaluations page** at `/admin/evaluations` and `GET /admin/costs/ledger/evals` (behind `RELEASE_LEDGER_ENABLED` / `features.releaseLedger`, scope `admin.costs`); `LEDGER#EVAL` rows gain per-case outcomes and `track` (`--track nightly|release|manual`) (#1944, #1928)
+- **Eval efficiency table** (tokens, tool calls, duration, first token; advisory, recorded in `LEDGER#EVAL`), a `usage_patterns` family (10 cases), and Sonnet 4.6, Sonnet 5, Sonnet 5.5 and Opus 5.5 baselines (#2025, #2027, #2042, #2054, #1995)
+- **Cost diagnostics on `C#` rows:** `toolCalls[].errorKinds` and `outputChars` (rides `COST_DIAGNOSTICS_ENABLED`), and `pastedChars` from an optional `pasted_chars` request field an older Runtime ignores (#2024, #2040)
+- **Terminal client: encrypted credential file** for hosts with no keyring (`credential_store` / `AGENTCORE_CREDENTIAL_STORE`) (#2009)
+
+### ✨ Improved
+
+- Thinking folds into the tool rail (#1982); the Word preview shows comments and change authors (#2011); inline code takes a neutral colour (#2017)
+- A long quiet turn shows a muted hint at 30 s and at 3 min; amber is kept for a retry or unexplained silence (#2048)
+- `analyze_spreadsheet` rejections name what was blocked and what to write instead, and `import time` is allowed; `memory_save` rebases an index save that conflicts only with the conversation's own lines. One `toolConfig` rewrite at deploy: `analyze_spreadsheet` 1,013 → 1,164 tokens, project-harness `memory_save` 790 → 817 (#2038, #2051)
+
+### ⚠️ Changed
+
+- **A model provider outage says whose fault it is and offers a one-click resend.** When Bedrock (or OpenAI or Gemini) fails a model call on its side and the automatic retries run out, the reply now names the model and the service that runs it, says the fault is the provider's and not this app's or the user's message, and leaves out the raw provider error, whose "reached max retries: 1" read as if nothing had been retried (it stays in the logs and the event's `detail`). The `stream_error` event carries the new code `provider_unavailable` with `metadata.error_kind`, `model_id`, `model_name` and `provider`; the stream coordinator fills in the model, reading the catalog only on this failure path, never before the first token. The SPA shows an "AWS service issue" label under that reply with a **Try again** button that resends the last message; it is live-only, and a reload shows the reply's text. The terminal client reads `code` as an opaque string, so it is unaffected. Prompted by 2026-11-13, when one model returned `ServiceUnavailableException` on every call for about eight hours. (#2058)
+
+- **A skill's field-set file is checked when it is saved, on every deployment.** A reference file named `field-set.<name>.md` is now parsed by the same parser `document_extract` uses before it is stored. If it does not parse, it is refused with the parser's message: the user and admin upload routes answer **400** where they answered 200, and the agent's `my_skill_write_file` returns the message as an error the model can fix. A file named `field-set.<Name>.md` whose name breaks the naming rule (lowercase words joined by hyphens) is refused too, because extraction would otherwise skip it silently. This applies whether or not `DOCUMENT_EXTRACT_ENABLED` is on, because such a file could never have run, and stored it would fail later in someone else's turn. Other files, other kinds (`asset`, `script`), and files already stored are unchanged; nothing is migrated. Also adds `serialize_field_set`, the writer the field-set editor will use, which refuses any value a field-set file cannot carry rather than saving a different set (`docs/specs/field-set-authoring.md` PR 1). (#2053)
+
+- **Model ids with no catalog row are refused**, wildcard holders included, because they priced to $0 and counted against no quota; a catalog that can't be read still fails open to role grants. A deployment running a hand-entered id, an Agent bound to a deleted row or an API-key caller naming an arbitrary id must add a priced catalog row (#2016)
+- **Gateway OAuth accepts only `client_credentials`**: create or update with `authorization_code` / `token_exchange` answers 400; older rows still load (#2015)
+- **One attachment planner** (`apis/shared/files/attachment_plan.py`) replaces four selectors in the chat route; its `legacy` profile reproduces the previous rules, and `C#` rows and `GET /admin/costs/sessions/{id}/calls` gain `attachmentPlan` (#1962, #1998)
+- **Non-Bedrock providers receive non-PDF documents as text**; `.sql` uploads reach the model; the spreadsheet upload limit rises from 4 MB to 25 MB (`FILE_UPLOAD_MAX_SIZE_BYTES_SPREADSHEET`); too-large errors give the real size and limit (#1960)
+- **Structured extraction, field-set authoring and source provenance are on in our prod** (`environment.production.ts`; the backend halves are set on the `production` GitHub environment at deploy). All three stay off by default
+- **File responses no longer include `s3Uri`**, so the bucket and key never reach the browser (#2012)
+- **MCP App "Waiting for you" now needs protocol 2026-07-28:** the text-match fallback and `McpAppAwaitingSubmissionHook` are removed, so a self-hosted `github-mcp-server` older than 2026-07-28 shows a left-open form as "Failed" (#1951)
+
+### 🐛 Fixed
+
+- **Structured extraction can now run the 14-field sets it always promised.** Bedrock refuses a constrained schema with more than 16 nullable ("union") parameters. The extraction schema made both a field's value and its quote nullable, two unions per field, so a set was refused at its ninth non-enum field, while the parser, the field-set editor and the docs all allowed 14. The quote is now a plain string, empty when the document doesn't state the value, which verification already reads as "no quote". A field costs at most one union, and a "one of a list" field none. A test now counts unions on the schema actually sent. Each field set's first run after this deploy pays one grammar compilation (`docs/specs/structured-extraction.md` §16.9a). (#2063)
+
+- **The admin session cost view no longer fails for a conversation that ran structured extraction or voice.** `document_extract` writes its cost row under `extract:<toolUseId>` and voice under `voice:<n>`, and `GET /admin/costs/sessions/{id}/calls` put that id into an integer field, so one such row returned 500 for the whole session. Those rows now show no message id, and `callKind` names them (`document_extract`, `voice`) through the same rule the release ledger uses. Found while verifying source provenance and structured extraction on dev; results are recorded in both specs (§12.1, §14.1). (#2050)
+
+- **app-api no longer runs PDFium to draw a PDF's attachment thumbnail.** PDFium has crashed app-api tasks in production. The prepare Lambda already opens every PDF at upload, so it now renders page 1 to `_derived/thumb.png` (`apis/shared/files/pdf_thumbnail.py`, PNG encoded with `zlib`, no new dependency) on both its paths: the facts pass for a small PDF and the full preparation for a large one. `GET /files/{id}/thumbnail` keeps its URL and presigns that file. It falls back to the `_thumb.png` app-api rendered for older uploads. When neither exists, it queues `{"action": "thumbnail"}` and answers **202**, and the card asks again after 2, 4 and 8 seconds. A deployment without the prepare queue (large-document attachments off) still renders in-process, as before. No IAM, CDK or flag change: the Lambda already writes `_derived/`, and deleting a PDF now also clears its `_derived/` prefix. (#1972)
+
+- **`toolConfigHash`, the Responses `prompt_cache_key` and the context breakdown now count only what a model is sent.** Since mcp 2.3.0, Strands copies an MCP tool's `outputSchema` onto its registered spec: +77 KB across GitHub's 43 tools, which no formatter sends. Hashing that made `toolConfigHash` rotate with no cache miss behind it, which is a false lead for the cost runbook and for `TOOLCONFIG_MUTATED`. It also moved the Responses cache key on any GitHub schema edit, and overstated GitHub's share of the tool tokens about 2.6×. All three now go through `model_facing_tool_specs` (`apis/shared/models/tool_specs.py`), which a test pins against the Bedrock, OpenAI chat and Responses formatters. Expect one rotation of `toolConfigHash` at deploy for sessions whose tools carry `outputSchema` or `annotations`, and one cache write per live GPT conversation on the Responses transport. Bedrock's `toolConfig` itself is unchanged. (#1955)
+
+- Gateway tools honour their "Needs approval" setting (closes #454) (#2015)
+- A provider decline (`content_filtered`, `guardrail_intervened`) gives a fixed notice instead of a blank reply (`DeclinedAnswerHook`; about 30 tokens of history, once) (#2031)
+- Compaction and offload estimate documents from their row facts at the model's tokenizer factor instead of bytes/4 (dev repro error −65% → −0.4%), and price replayed reasoning as each model bills it (+22% → +0.4%); cut points can move, prefix bytes don't (#1976, #1991, #2001)
+- The `over_ceiling` offload uses the model's own ceiling before the first cut (Haiku 5.5: 50k, was 100k) (#1978); a document without facts yet is planned by the old rules (`facts_pending`) (#1989); the composer no longer warns that an image will be left out under the token profile (#1997)
+- `document_read` pattern search finds a PDF match wrapped across lines and searches HTML by rendered line (#1979, #1970); `project_files` / `knowledge_files` reads return the page rather than an offload preview (#1943)
+- A forked conversation restores and searches its parent's and root's documents (1–2 more Queries on a fork's cold restore) (#2000, #2006)
+- A `.pptx` attachment turns on `create_powerpoint_presentation` under the existing `ATTACHMENT_TOOL_AUTOENABLE_ENABLED` (+2,852 `toolConfig` tokens, only in sessions with a deck) (#1932); a shared handoff file's spreadsheet and deck tools arrive on turn 1, not turn 2, so the prefix is not rewritten (#2033)
+- Structured extraction resolves documents and field sets by name (`document_extract` spec 672 → 666 tokens, behind `DOCUMENT_EXTRACT_ENABLED`) (#1941)
+- Zoom's Connect prompt works again (#1950); the MCP SSE event cap rises to 16 MiB so GitHub's App forms load (#1956)
+- Five Office tools clean an output file name instead of refusing it (#2010)
+- Connector, file-source and export access honour one level of role inheritance, as tool grants do; status probes no longer toast (#2013)
+- 502s from idle connections: idle timeouts now order CloudFront 30 s < ALB 60 s < uvicorn 75 s, and the SPA retries a presign once on 502/503 (#1999)
+- A lone attachment card has room for its name (#1985); handoff relay toast, connector name and `waitingOn` fixes (#2014)
+- After the server refuses a fork or rewind because the message is in the compaction summary, Fork and Rewind are hidden on that message and every earlier one; an upload refused for good (a 400 from presign or `/complete`, such as a PDF over 1,000 pages, or the client's own size and type checks) no longer offers Retry (#2065)
+
+### 🔒 Security
+
+- **Outbound requests from the AgentCore Runtime no longer carry the conversation's `session.id`.**
+  - **What leaked:** every invocation arrives with W3C baggage `session.id=<runtime session id>`, a stable hash of user and session. ADOT's propagators (`baggage,xray,tracecontext`) injected it into every outbound carrier: the HTTP headers of every httpx/httpx2 request, to third-party MCP servers and every site `fetch_url_content` opens, and, since mcp 2.x, every MCP request's `params._meta`. It carried no content.
+  - **The fix:** `install_outbound_trace_policy` (`apis/shared/observability/trace_propagation.py`), called once at Runtime startup, wraps the configured propagator so it injects without baggage and extracts as before.
+  - **What stays:** `traceparent` and `X-Amzn-Trace-Id` still go out, so an MCP server can join its logs to the turn's trace. `session.id` stays on our own spans for the AgentCore Observability console. botocore was never affected, because it uses its own X-Ray propagator.
+  - **Cost:** nothing on the turn path or in the prompt. No feature flag.
+  - **Test:** `tests/security/test_outbound_trace_context.py` pins it on the real MCP wire, headers and `_meta` both. (#1957)
+- **The browser sign-in viewer has an origin of its own.** `live-view.html`, where a user types a password into the takeover browser, was served from the mcp-sandbox origin that also runs untrusted MCP App HTML, and the SPA framed it with no `sandbox` attribute, so an App frame on the same page shared its security principal. The viewer now has its own CloudFront distribution and bucket (`BrowserLiveViewConstruct`) on the distribution's default `*.cloudfront.net` domain: no certificate, no DNS record, no deploy variable. app-api returns the origin as `viewerOrigin` on `POST /sessions/{id}/browser/live-view` (new env `BROWSER_LIVE_VIEW_ORIGIN`, app-api only; the AgentCore Runtime's environment is unchanged), and the SPA frames and posts to that origin only, refusing one equal to the MCP App origin. The SPA's `frame-src` gains the new origin. The DCV SDK now lives at `infrastructure/assets/browser-live-view/dcvjs/`. +6 PlatformStack resources. No feature flag. (#1952)
+
+### ⚡ Performance
+
+- `analyze_spreadsheet` reuses one Code Interpreter sandbox per turn, skipping the S3 download, session start, upload, XLSX bootstrap and schema probe on later calls (`ANALYZE_SANDBOX_REUSE_ENABLED`, rollout switch, default on; `ANALYZE_SANDBOX_TIMEOUT_SECONDS`, default 900); its blocking S3 and Code Interpreter calls moved off the event loop, unflagged (#1894)
+- The chat route's file resolver reads attachments concurrently and off the event loop, on every deployment (#1994); non-Bedrock document renders moved off the event loop (#1962)
+
+### 🏗️ Infrastructure
+
+- `BrowserLiveViewConstruct`: its own CloudFront distribution and bucket for the sign-in viewer (+6 PlatformStack resources; new app-api env `BROWSER_LIVE_VIEW_ORIGIN`) (#1952)
+- Idle timeouts: ALB 60 s and uvicorn keep-alive 75 s (#1999); the prepare Lambda receives `ATTACHMENT_PLAN_ENABLED` while it is on, renders PDF thumbnails and file previews, and skips linked reference rows (#2002, #1972, #1977, #2026)
+- No new tables or GSIs; `gsi-inventory.json` is unchanged
+
+### 📦 Dependencies
+
+- **Backend:** `mcp` 1.30.0 → 2.3.0, new `mcp-types` 2.3.0, `httpx2` and `httpcore2` 2.13.1, `truststore` 0.10.4, `idna` 3.15 → 3.20; `pydantic-settings` and `httpx-sse` leave the lock; the scheduled-runs Lambda requirements carry the same pins (#1666)
+- **Terminal client:** `cryptography` 50.0.1, now a direct pin (#2009)
+- **Frontend / infrastructure (dev only):** `glob` 13.0.6 → 14.0.4 and `minimatch` 10.2.5 → 11.0.5 via `overrides` (#2005), pinned exactly (#2062)
+
+### 🔧 CI/CD
+
+- The nightly eval runs every model in `EVAL_MODEL_IDS` (Haiku 5.5 and Opus 5.5 by default, Sonnet 5.5 added) (#2043, #2054) and installs uv with the pinned `setup-uv` action (#1945)
+
+### 📚 Docs
+
+- `docs/specs/unified-attachment-delivery.md` with its removal plan, per-model budget and readouts; the Bedrock document-ceilings probe (`probe_bedrock_document_ceilings.py`) (#1954, #1959, #1961, #1971, #1980, #1984, #1986)
+- README and docs home lead with governance; new `configuration/governance` page (#2032)
+- Specs and readouts: handoffs §4.9 files by reference (#1942), quota-request open questions decided (#1949), idle-compaction cost replay (#1882), idle-return context sizing (#2039), model fallback profiles (#2059), admin model assignments (#2060)
+
+### 🧪 Tests
+
+- Eval harness EH-4 to EH-8: attachment, project-agent, project-memory, skill-outcome and terminal-client families, a second eval user, and the `attachment_delivery` family with its arms and cells (#1931, #1933, #1934, #1936, #1938, #1963, #1968, #1975)
+
+### 🗑️ Removed
+
+- **`CDK_FRONTEND_CORS_ORIGINS` (`frontend.additionalCorsOrigins`).** The SPA distribution built an origin list from it and then wrote nothing, so the setting has had no effect. The SPA is served, not a cross-origin caller, and app-api is same-origin behind `/api`. A deployment that sets the variable or the context key can drop it; synth ignores it. `CORS_ORIGINS` and the other `CDK_*_CORS_ORIGINS` extras are unchanged. (#2037)
+
+## [1.35.0] - 2026-11-08
+
+Contract redlining in the Word tools is finished: `redline_word_document` inserts and deletes whole tracked paragraphs and can leave changes it cannot place as ACTION NEEDED comments, and a new `compare_word_documents` turns a counterparty's clean revised copy into a redline of the original. All four ship under the existing `WORD_TRACKED_CHANGES_ENABLED` switch with no flag of their own, and grow the Word family's tool spec by about 1,000 tokens (`redline_word_document` 568 → 1,152, `compare_word_documents` 419), one cached `toolConfig` rewrite at deploy for users with the Word tools. The release ledger is complete: read-only admin routes under `/admin/costs/ledger/*`, eval and smoke results published into the ledger, a Releases tab on `/admin/costs`, and a terminal readout script plus `/release-readout` skill. Flags: one new SPA field, `features.releaseLedger` (in development, default off, the SPA half of the existing `RELEASE_LEDGER_ENABLED`); no default changes, none retired. Manual steps: none required; this is the first release prod can turn the ledger on from (runbook in `docs/specs/release-ledger.md` §7.2). No GSI changes; no dependency changes.
+
+### 🚀 Added
+
+- **Release ledger admin API** (behind `RELEASE_LEDGER_ENABLED`, `admin.costs`): `GET /admin/costs/ledger/versions`, `series`, `tools`, `agents`, `projects`, `quality`, `readout` and `export` (NDJSON) over the `LEDGER#` rows; known partitions only, never a scan; TTFT percentiles read from CloudWatch at read time; auth answered before the flag's 404; `/admin/feedback/fleet` gains a `version` arm (#1906)
+- **Eval and smoke results in the ledger.** `eval_harness.py score --publish` writes a `LEDGER#EVAL` row and `smoke_turns.py --publish --prefix <p>` a `LEDGER#SMOKE` row, keyed by the Runtime build that served the turns, idempotent and content-guarded; `smoke_turns.py --auth eval-user` signs in as the seeded eval user (#1908)
+- **Releases tab on `/admin/costs`** (in development, default off: SPA `features.releaseLedger`, the SPA half of `RELEASE_LEDGER_ENABLED`). Version strip, candidate-against-baseline compare header with caveats first, KPI cards, a trend chart with version bands, tools, agents and projects tables, a quality panel with no composite score, and JSON / NDJSON exports (#1921)
+- **`backend/scripts/release_readout.py` and the `/release-readout` skill.** A caveats-first `readout.md` + `readout.json` from the readout route's own handler (or a deployed route, a saved response, or an export), and a skill that turns it into a ship / watch / investigate verdict; the release skill now asks for the outgoing release's readout in each release PR (#1923, #1930)
+- **`redline_word_document` inserts whole paragraphs** (on wherever `WORD_TRACKED_CHANGES_ENABLED` builds the tool; no new flag). A change can give `insert` ("after" / "before") and `paragraphs` instead of `replace`; each new paragraph is a tracked insertion, paragraph mark included, copying the style, numbering and run formatting of the paragraph its `like` names, so a new numbered section or list item takes the next number and Reject All leaves no empty paragraph. Every call now also checks that its edited paragraphs read as before once its own revisions are rejected. The tool spec grows by 285 tokens (568 → 853, Bedrock CountTokens), so the first turn after the deploy rewrites the cached `toolConfig` once for users with the Word tools. Verified in Word for Mac and LibreOffice (#1922)
+- **`redline_word_document` can leave changes it cannot place as comments** (wherever `WORD_TRACKED_CHANGES_ENABLED` builds the tool; no new flag). A new optional `if_unplaced` argument: `"fail"` (the default) keeps the all-or-nothing call, and `"comment"` turns each change the document defeats (wording not found or ambiguous, a hyperlink or field in the way, an overlap) into an "ACTION NEEDED —" comment on the paragraph it most likely meant and saves the rest, listing applied and commented changes apart. Placed changes are written exactly as in `"fail"` mode. The tool spec grows by 151 tokens (853 → 1004, Bedrock CountTokens), so the first turn after the deploy rewrites the cached `toolConfig` once for users with the Word tools (#1924)
+- **`redline_word_document` deletes whole paragraphs** (on wherever `WORD_TRACKED_CHANGES_ENABLED` builds the tool; no new flag). A change can give `delete: "paragraph"`, optionally with `through` (wording of a later paragraph in the same container), instead of `replace`: every run moves into `w:del` and each paragraph mark is a tracked deletion too, so Accept All removes the paragraphs and the list items or sections after them renumber, rather than leaving an empty paragraph that keeps its number. Where no paragraph follows (end of a cell or of the document, before a table) the deletion takes the previous paragraph's mark when the two are formatted alike, and refuses otherwise. The redline self-check (every call) now compares paragraph marks and properties as well as wording. Checked in Word for Mac and LibreOffice. Works with `if_unplaced: "comment"`: a deletion the document defeats becomes its ACTION NEEDED comment, and no comment ever sits in a paragraph whose mark the call deletes. The spec grows 1004 → 1152 tokens (CountTokens), one `toolConfig` rewrite at deploy for users with the Word tools (#1927)
+- **`compare_word_documents` turns a clean revised copy into a redline** (a new Word tool beside `redline_word_document`, under `WORD_TRACKED_CHANGES_ENABLED`; no new flag). Given an original and a revised `.docx` with no tracked changes, it writes the revised wording into a copy of the original as tracked changes by `Counterparty` (or a name the user gives) and returns the list of changes: reworded paragraphs marked word by word in the original's formatting, removed and added paragraphs as whole tracked paragraphs (the same deletions and insertions `redline_word_document` writes), tables with an unchanged grid compared cell by cell, and a comment for what cannot be marked (a changed table grid, a change inside a hyperlink or field). Documents that already have tracked changes are refused. Every call checks that Accept All reads as the revised copy and Reject All as the original. The new spec adds 419 tokens (Bedrock CountTokens; the Word family 2,928 → 3,347) to `toolConfig`, one rewrite of the cached prefix at deploy for users with the Word tools. Verified in Word for Mac and LibreOffice (#1929)
+
+### 🐛 Fixed
+
+- The release-ledger backfill could count a live-ledgered turn twice, because a cost row's timestamp precedes `firstLiveAt`; live writes now mark the `C#` row `ledgered: true` in the same `put_item`, and the backfill never adds a marked row (#1904)
+
+### 🏗️ Infrastructure
+
+- `ReleaseLedgerMetricsRead` (`cloudwatch:GetMetricData`) on the existing app-api managed policy, only while `CDK_RELEASE_LEDGER_ENABLED` is on; `backend/evals/tool_spec_tokens.json` copied into the app-api image (#1906)
+
+### 🔧 CI/CD
+
+- The nightly dev eval job also runs the turn smoke matrix as the eval user, and both publish into dev's ledger where `CDK_RELEASE_LEDGER_ENABLED` is on; the summary gains a "Turn Smoke (dev)" row (#1908)
+
+### 📚 Docs
+
+- `docs/specs/word-tracked-changes.md` §3a–§3d and §4a–§4d (insertions, unplaced comments, deletions, compare); `docs/specs/eval-harness.md` §15 (phase 2 coverage across surfaces) and §16 (phase 3 Evaluations page) (#1926); `docs/specs/release-ledger.md` §5.4, §6.5, §7.1–§7.2; CLAUDE.md says when a change does not need its own feature flag (#1925)
+
+## [1.34.0] - 2026-11-07
+
+Long document work on Claude Opus 5.5 stops failing: reasoning streams as a summary instead of a silent gap that hit the 120 s read timeout, the read timeout itself is 600 s, Continue sends a user turn on models that refuse an assistant prefill, a conversation stays within Bedrock's five non-PDF documents, duplicate attachment names are avoided across turns, a tool round's page reads fit one Memory event, a young conversation compacts at the hard ceiling, and the Opus 5.5 output default is 64K. Agents gain a response-strictness setting, a `knowledge_files` tool and a Designer mode line; the Word tools can run a bound skill's script; the composer shows the attachment budget before send; knowledge-base uploads accept 50 MB; admins search users by fragment; API-key callers get prompt caching; and a release ledger stamps every image and cost row. Flags: four in development, default off (`AGENT_KNOWLEDGE_FILES_ENABLED`, `WORD_SKILL_SCRIPTS_ENABLED`, `CONVERSE_DOCUMENTS_AS_TEXT_ENABLED`, `RELEASE_LEDGER_ENABLED`, plus SPA `features.knowledgeBaseMode`) and three default-on rollout switches (`CONVERSE_DOCUMENT_CAP_ENABLED`, `INLINE_BUDGET_BY_REFERENCE_ENABLED`, `AGENTCORE_MEMORY_COMPACTION_TAIL_TOKEN_BOUND_ENABLED`). Manual step: run `backfill_model_output_caps.py` on every environment that already has Claude Opus 5.5 in its catalog. No GSI changes; no dependency changes.
+
+### 🚀 Added
+
+- **Response strictness on Agents** (issue #112). `responseStrictness` (`strict` / `balanced` / `flexible`) appends a grounding rule to the Agent's instructions; balanced leaves the prompt byte-identical; part of version snapshots and the marketplace review diff (#1891)
+- **`knowledge_files` for Agents** (in development, default off: `AGENT_KNOWLEDGE_FILES_ENABLED` / `CDK_AGENT_KNOWLEDGE_FILES_ENABLED`, Runtime only; on in our production). A non-project Agent lists its Knowledge and reads one document by name when the knowledge base is too large to send whole (#1915)
+- **Knowledge-base mode line** (in development: SPA `features.knowledgeBaseMode`). `GET /assistants/{id}/knowledge-base/mode` tells an author whether the knowledge base is sent whole or searched, and why, including which single document is over the budget (#1915, #1917)
+- **Word tools run a bound skill's script** (in development, default off: `WORD_SKILL_SCRIPTS_ENABLED` / `CDK_WORD_SKILL_SCRIPTS_ENABLED`, Runtime only). `create_word_document` and `modify_word_document` accept `skill_name`, `path` and `params` and run the skill's `scripts/*.py` inside Code Interpreter instead of the model retyping it (#1914)
+- **Documents as text on Converse** (in development, default off: `CONVERSE_DOCUMENTS_AS_TEXT_ENABLED` / `CDK_CONVERSE_DOCUMENTS_AS_TEXT_ENABLED`, Runtime only; on in our `development` and `production` environments). docx, txt, md, csv and html attachments reach a Converse model as rendered text; PDFs stay native; stored messages unchanged (#1907)
+- **Release ledger** (in development, default off: `RELEASE_LEDGER_ENABLED` / `CDK_RELEASE_LEDGER_ENABLED`). `APP_VERSION` / `APP_BUILD` baked into every image and stamped on cost rows, EMF records, `/health`, `/ping` and eval runs; a `LEDGER#DEPLOY` marker per build; `turnOutcome` and `emptyAnswer` on `C#` rows; tool census payload sizes; `LEDGER#VERSION` and monthly `LEDGER#MODEL` / `TOOL` / `AGENT` / `PROJECT` rollups while on (#1888, #1898, #1899)
+- **Composer shows the combined attachment budget before send.** Files that will not fit a message's 7 MB inline budget are named before the send, and an over-budget document is read by reference instead of dropped (rollout switch `INLINE_BUDGET_BY_REFERENCE_ENABLED`, default on) (#1912)
+- **Prompt caching on `/chat/api-converse`.** A `cachePoint` after the system prompt and after the last message, so API-key callers pay cache-read rates for a repeated prompt and a client-held conversation (#1889)
+- **Admin user search by fragment.** `GET /admin/users/search` and `GET /admin/users/domains/list` rank exact, prefix, contains, all-words and typo matches from a per-task in-memory index bounded by `ADMIN_USER_INDEX_MAX_ROWS` (issue #1874) (#1885)
+- **Knowledge-base uploads up to 50 MB** on managed knowledge bases. One server-side limit, `KB_UPLOAD_MAX_FILE_BYTES` from `CDK_KB_UPLOAD_MAX_FILE_BYTES` (default 52,428,800, the Bedrock per-file limit); the SPA reads it as `kbUsage.maxFileBytes`; classic knowledge bases keep their 20 MB processing limit (#1916)
+- `.sql` files accepted as chat attachments and knowledge-base files (issue #1883) (#1887)
+- Pin and Unpin in the conversation title menu (#1884)
+- Two CloudWatch alarms: `model-read-timeouts` and `chat-stream-upstream-drops` (#1895)
+
+### ✨ Improved
+
+- **Claude Opus 5.5 writes up to 64,000 output tokens per call by default** (was 32,000; the card allows 128,000). Applies to newly added catalog rows; an existing row changes with `backfill_model_output_caps.py` or an admin edit under Admin → Models. Haiku 5.5 stays at 32,000 because of its 100K input price step (#1911)
+- A response cut at the output limit says so, in the chat and in the `max_tokens` `stream_error`: "Cut off at the model's output limit. Continue picks up where it stopped." (#1911)
+- **Opus 5.5 and Haiku 5.5 stream summarized reasoning** with the `drop_block` binding, so a long think no longer sits silent; measured as no prompt-cache re-write (#1890)
+- Reasoning block redrawn as a tool-rail sibling with a shared shimmer that honours reduced motion; the loading label reads "Reasoning" (#1890)
+- Chat markdown typography tightened; code-block colours follow light and dark themes (#1879)
+- A spreadsheet or deck no longer disqualifies a knowledge base from full-context mode; the budget is settable from CDK as `CDK_ASSISTANT_KB_FULL_CONTEXT_MAX_TOKENS` (#1915)
+- A tool round's `document_read` page reads share `DOCUMENT_READ_MAX_BATCH_BYTES` (7 MB) so one Memory event never exceeds its 10 MB quota; `next_start` continues the range (#1900)
+- Compaction's protected tail is bounded by tokens and a young conversation cuts at the hard ceiling (rollout switch `AGENTCORE_MEMORY_COMPACTION_TAIL_TOKEN_BOUND_ENABLED`, default on) (#1910)
+
+### 🐛 Fixed
+
+- "Agent force-stopped: … Read timed out" on long Opus 5.5 turns: `RETRY_READ_TIMEOUT` 120 → 600 s, app-api proxy read 660 s, read timeouts no longer retried, and the error names the phase it failed in (#1895)
+- A follow-up queued during a turn that then failed was sent on its own; it now returns to the composer with a "Follow-up not sent" toast, and the empty assistant bubble a failed call left behind is dropped (#1913)
+- Continue failed on Claude 4.6 and later ("does not support assistant message prefill") and restarted the answer on GPT Responses models; both now send a fixed user turn (#1903, #1909)
+- After Continue, the continued answer no longer splits around a user bubble the user never typed, and message ids stay aligned with the server; `GET /sessions/{id}/messages` marks the continue prompt `continuation: true` (#1911)
+- Two same-named attachments across turns force-stopped every later turn on a warm agent; names are now unique across the live conversation (#1902)
+- "You can't include more than 5 documents in a request" on a warm conversation: a per-call projection keeps the first five non-PDF documents native and sends the rest as text or a stub (rollout switch `CONVERSE_DOCUMENT_CAP_ENABLED`, default on) (#1905)
+- Admin User Lookup matched only a whole email address (#1885)
+- 403 toasts on the tools pages for tools the user cannot reach, and request URLs in toast details (issue #1873) (#1884)
+- A `.sql` upload got a 403 from S3; the PUT now uses the presigned Content-Type (#1887)
+- A knowledge-base object refused for size after passing presign stayed in S3 until its agent was deleted; the ingestion consumer now deletes it (#1918)
+- The Designer mode line mislabelled a single oversized document as having no text (#1917)
+- Test flakes: the device-grant authorize test's moto transaction race and an unbounded MCP session-heal turn (#1896, #1901)
+
+### ⚠️ Changed
+
+- `RETRY_READ_TIMEOUT` defaults to 600 s (was 120); the app-api proxy read timeout is 660 s (was 300); a read timeout is no longer retried. A deployment that pinned `RETRY_READ_TIMEOUT` keeps its value (#1895)
+- Opus 5.5 and Haiku 5.5 requests always carry a `thinking` dict (`summarized`, `drop_block`) unless the caller set one (#1890)
+- A Converse request is projected per call for the document cap, so the wire request can differ from the stored message (#1905)
+- The knowledge-base per-file limit is 50 MiB by default (was 10 MB in the SPA); `CDK_KB_UPLOAD_MAX_FILE_BYTES=10485760` restores the old limit (#1916)
+
+### 🔒 Security
+
+- Error toast details no longer expose request URLs; admin user search returns generic error detail (#1884, #1885)
+
+### 🏗️ Infrastructure
+
+- Two new CloudWatch alarms in `AiPathAlarmsConstruct`, threshold `CDK_OBSERVABILITY_CHAT_STREAM_DROP_THRESHOLD` (default 5/h) for the drop alarm (#1895)
+- The kb-migration ingestion consumer gains `s3:DeleteObject*` on `assistants/*/documents/*`, the only IAM change (#1918)
+- New CDK config: `agentKnowledgeFiles`, `wordSkillScripts`, `converseDocumentsAsText`, `releaseLedger`, `assistantKbFullContext.maxTokens`, `managedKb.uploadMaxFileBytes` (1..50 MiB, synth fails otherwise). New Runtime variables are written only while on, so the default spends none of the Runtime's 2,560-byte environment budget (#1907, #1914, #1915, #1916, #1899)
+- Every container image rebuilds on this release: `VERSION` joins each image's hash manifest and `APP_VERSION` / `APP_BUILD` are build args (#1888)
+
+### 🔧 CI/CD
+
+- `build-one.sh` passes `APP_VERSION` and `APP_BUILD` build args; `build-and-push-if-changed.sh` substitutes the content hash; `load-env.sh` and `platform.yml` forward `CDK_ASSISTANT_KB_FULL_CONTEXT_MAX_TOKENS`, `CDK_AGENT_KNOWLEDGE_FILES_ENABLED`, `CDK_RELEASE_LEDGER_ENABLED`, `CDK_WORD_SKILL_SCRIPTS_ENABLED`, `CDK_CONVERSE_DOCUMENTS_AS_TEXT_ENABLED`, `CDK_KB_UPLOAD_MAX_FILE_BYTES`, `CDK_OBSERVABILITY_CHAT_STREAM_DROP_THRESHOLD` (#1888, #1895, #1907, #1914, #1915, #1916, #1899)
+
+### 📚 Docs
+
+- New spec `docs/specs/release-ledger.md`; compaction thresholds §3.2; document-context-offload, skill-creator and turn-path-ttft updates; a force-stop row in `docs/testing/smoke-regression.md`; docs-site pages for models, users, feature flags, agents, API keys and knowledge bases; kaizen research 2026-11-06 (#1886, #1888, #1899, #1910, #1913, #1914, #1915, #1916)
+
+## [1.33.0] - 2026-11-04
+
+Ask for more quota, hand work off with a model-written brief, see the account's AWS limits, and turn meetings into GitHub Project items. Every new feature is behind an in-development flag, off by default. Roles gain system instructions, Haiku 5.5 is curated, and app-api's DynamoDB grants are prefix-scoped. No GSI changes; no backfills.
+
+### 🚀 Added
+
+- **Quota requests, extensions and chargeback** (in development: `QUOTA_REQUESTS_ENABLED` / `CDK_QUOTA_REQUESTS_ENABLED`, `features.quotaRequests`). Users request more quota from the composer, the blocked state or Settings → Usage; admins grant additive extensions that stack on the resolved tier, and a chargeback report closes its ledger lazily. app-api only (#1813, #1815, #1821, #1829, #1831)
+- **Handoffs, SPA and brief** (in development: `HANDOFFS_ENABLED`, `features.handoffs`; `HANDOFF_BRIEF_ENABLED` / `CDK_HANDOFF_BRIEF_ENABLED`, `features.handoffBrief`). Review sheet, background send and handoff row; a brief the source's own model writes from its prompt cache; relayed prompts; inbox entries and browser notifications (#1748, #1849, #1854, #1859, #1863)
+- **AWS Limits admin page** (in development: `AWS_LIMITS_ENABLED` / `CDK_AWS_LIMITS_ENABLED`, `features.awsLimits`). Service Quotas with usage, 7-day peaks, Bedrock model usage and increase requests; Service Quotas IAM exists only while on (#1842, #1866, #1875)
+- **Meeting transcripts to GitHub issues** (in development: `MEETING_TASKS_ENABLED` / `CDK_MEETING_TASKS_ENABLED`, Runtime only). Tool families `google_calendar_meetings`, `zoom_meeting_transcripts`, `github_issues_local`, seeded off and not public (#1822, #1836, #1840)
+- **Project file readiness** (in development: `PROJECT_FILE_READINESS_ENABLED` / `CDK_PROJECT_FILE_READINESS_ENABLED`, `features.projectFileReadiness`). A strip above a project composer and a per-turn note naming files the model cannot see yet (#1838, #1839)
+- **AgentCore Web Search as a Gateway connector**, and a default of 5 results behind `WEB_SEARCH_DEFAULT_MAX_RESULTS_ENABLED` / `CDK_WEB_SEARCH_DEFAULT_MAX_RESULTS_ENABLED` (in development, Runtime only) (#1819, #1817)
+- **Role system instructions.** `AppRole.system_instruction` (8,000 chars) composed into plain chats between the base prompt and the active mode; admin role editor field (#1864)
+- **Claude Haiku 5.5 curated**, with the preserved-thinking `drop_block` binding (#1853)
+- Connector picker offers all 24 AgentCore OAuth vendors; Entra tenant ID on Microsoft connectors; the OAuth connector picker on built-in tools (#1867, #1830)
+- Delegated admins: a models admin can add a curated model; a read-only role list feeds role pickers (#1857, #1858)
+- Eval harness: large-document cases, judge model controls, orphan sweep, nightly track against dev, Haiku 5.5 baseline (#1810, #1812, #1820, #1865)
+
+### ✨ Improved
+
+- Handoff brief input is billed at the prompt-cache read rate (#1849)
+- AWS Limits starts on Adjustable only with a Hide unused toggle (#1875)
+- `resolve_turn_agent` and the prompt-composition phases extracted from the inference route (#1847)
+
+### 🐛 Fixed
+
+- A new Agent's or Project's files no longer wait up to 15 minutes at "Setting up"; the first upload invokes the migration worker directly (#1837)
+- Reading a project file that is not ready returns a result instead of failing the call; the readiness strip counts failures, keeps polling and passes AA contrast in dark mode (#1839, #1841)
+- A quota decision shows at once; a revoked extension on an approved request is labelled (#1816)
+- A cancelled handoff brief is metered as an estimate (#1856); the notification bell no longer under-counts (#1862)
+- Admins are told why AgentCore rejected a connector config; the connector list is no longer stale across tasks (#1871, #1872)
+- Sidebar session lists get their own drop-list ids, so dragging works with pinned Agents (#1823)
+- Nightly teardown retries a failed stack delete; `destroy.sh` empties buckets itself; `log_success` defined in `managed-kb.sh` (#1844, #1808)
+
+### ⚠️ Changed
+
+- A client-supplied `system_prompt` on `/chat/stream` is ignored outside `preview-` sessions (#1864)
+- The local GitHub tool family id is `github_issues_local` (#1836)
+
+### 🔒 Security
+
+- Dependabot alerts patched (`pyasn1`, `@hono/node-server`); unused `authlib` removed (#1848)
+
+### 🏗️ Infrastructure
+
+- app-api's DynamoDB grants are scoped by table-name prefix and the Runtime's are compacted; expect ~30–40 s of `AccessDenied` on the role while the policy propagates (#1806)
+- Four SSM parameters nothing read are dropped
+
+### 📦 Dependencies
+
+- `strands-agents` 1.61.1 → 1.63.0 (#1850); `aws-opentelemetry-distro` 0.19.0 → 0.22.0; `pyasn1` 0.6.4 → 0.6.5
+
+### 📚 Docs
+
+- Docs-site and README rewritten for a public-sector audience; new specs for quota requests, the handoff brief, meeting tasks, spoken audio, and rewind's long-term-memory residue (#1855, #1860, #1861)
+
+## [1.32.0] - 2026-10-30
+
+The terminal client becomes a first-class way in: `aps-tui` signs in with the same session as the browser (device authorization), holds a real conversation with the agent, reaches projects, Agents, skills and saved conversations, and can run tools on the user's own machine with their approval. Conversations can be rewound to an earlier message or forked from one (in development, default off; on in our dev and prod environments). Every skill bound on a Shared Project now runs for every member, and the agent can list and read a project's Files by name. Agents can be duplicated and pinned to the sidebar. Two production app-api task deaths are fixed at the root (a PDFium crash and a 3.5-minute event-loop block), with a faster health check and a new event-loop lag alarm around them. An evaluation harness drives a golden set through dev and scores it against a committed baseline. **Three things need attention:** the load balancer now accepts traffic only from CloudFront (`CDK_ALB_RESTRICT_TO_CLOUDFRONT`, default on), one backfill (`backfill_project_skill_adders.py`) must be run on each environment with projects, and the bootstrap seed should be re-run so the `web_research` skill picks up its new description. New flags: `SESSION_REWIND_ENABLED` and `SESSION_FORK_ENABLED` (default off; set on in `development` and `production`). No GSI changes.
+
+### 🚀 Added
+
+- **Terminal client (`aps-tui`), session-native.** The `tui/` package (renamed from `agentcore-tui`) now talks to the same App API as the web app with a real platform session: streaming turns, the server's model and tool catalogue, saved conversations, Shared Projects (`/project`), Agents (`/agent`), skills (`/skills`, `/<skill>`), conversation modes, effort, attachments and artifacts, all through slash commands (`/help`). Interrupts (tool approval, `ask_user_question`, OAuth consent) are answered in the terminal. A wheel and `SHA256SUMS` are attached to every GitHub Release and installed with `uv tool install`; first launch asks for the deployment's address and signs in through the browser (#1788, #1792)
+- **Client-executed tools.** The terminal declares five tools (`workspace_info`, `run_command`, `read_file`, `list_directory`, `write_file`) that run on the user's machine; the model sees them as `local_*`. Each call is shown before it runs (`y` / `n` / `a` for the session). Off with `/tools local off`. Backend: `client_tools` and `client_surface` on the invocation request, a new `client_tool_call` SSE event, and a `client_tool` interrupt kind. The web app's prompt, `toolConfig` and agent cache key are byte-identical to before (#1770, #1775)
+- **CLI device authorization** (RFC 8628): `POST /auth/cli/authorize`, `GET /auth/cli/verify`, `POST /auth/cli/token` on app-api, with the browser finishing on the normal Cognito Hosted UI login. The CLI then presents `Authorization: BFF <sealed>`; header sessions never set cookies and are CSRF-exempt. Rows live in the existing BFF sessions table; no new table, index or flag. Optional overrides: `DEVICE_GRANTS_TABLE_NAME`, `BFF_CLI_VERIFICATION_URL` (#1770)
+- **Conversation rewind** (in development, default off: `SESSION_REWIND_ENABLED` / `CDK_SESSION_REWIND_ENABLED`, `features.sessionRewind`). "Rewind to here" on a user message hides it and everything after it and puts its text back in the composer. `POST /sessions/{id}/rewind`; a `rewind` span on the session row; nothing in AgentCore Memory is deleted. A warm agent's history is cut in place so the retained prefix reads from the prompt cache (#1768, #1789)
+- **Conversation fork** (in development, default off: `SESSION_FORK_ENABLED` / `CDK_SESSION_FORK_ENABLED`, `features.sessionFork`). "Fork from here" starts a new conversation holding everything before that message. `POST /sessions/{id}/fork`; the fork runs in the parent's Runtime microVM and its first turn is seeded from the parent's live history. `SessionMetadataResponse` gains `rootSessionId` and `forkedFrom` (#1768, #1789)
+- **Copy and sent time on user messages.** A hover action row under each user bubble with the sent time and a Copy button. Not flag-gated (#1768)
+- **Every skill bound on a Shared Project runs, and shows, for every member.** `PUT /projects/{id}/skills` stamps the saver on each newly bound skill (`addedBy`), and a skill runs for a member when its author is the person who added it. New `GET /agents/{id}/skills` returns the bound skills resolved for the viewer, and the composer's `/` menu reads it. Bindings made before this release need the backfill (#1780, #1781)
+- **`project_files` tool.** On every project conversation the agent can list a project's Files and read one by name (paged at 48 KB). Built without a flag or grant; adds about 273 tokens to a project harness's `toolConfig` once (#1774)
+- **Duplicate an Agent.** `POST /agents/{id}/duplicate` makes a private "Copy of …" owned by the caller from the editable draft; the knowledge base, shares, listing, pins and versions are not copied. A Duplicate button on My Agents and an "Existing agent" option in the start-from-template dialog (#703)
+- **Pinned Agents in the sidebar**, above pinned conversations. Click starts a chat; unpin from the menu or by dragging out. Reuses the existing `/agents/pins` routes (#712)
+- **Evaluation harness.** `backend/scripts/eval_harness.py` drives a 57-case golden set (`backend/evals/cases/`) through a deployment as a dedicated eval user, scores it with pure functions against a committed per-model baseline, and exits non-zero when a gating family regresses. LLM judges (`strands-agents-evals` 1.7.0, dev extra) are advisory. `scripts/seed_eval_user.py` creates the `eval_harness` role, the `eval-harness` Cognito user and an SSM SecureString, and is opt-in. The nightly pipeline runs it non-blocking (#1782, #1794, #1796)
+- **Event-loop lag watchdog** on app-api: `EventLoopLagMs` EMF metric and a `{prefix}-app-api-event-loop-lag` alarm (over 2 s, 2 of 3 minutes) (#1795)
+- Smoke matrix row `empty_final_call` (#1790)
+
+### ✨ Improved
+
+- **A dead app-api task is replaced in about 20 s, not 90.** ALB and container health checks every 10 s with an unhealthy threshold of 2; the SPA retries a GET once on a gateway 502/503/504, never a POST or an SSE stream (#1795)
+- **Project conversations point at the project's tools and skills.** The composer's Tools and Skills menus link to `/projects/:id/tools` and `/skills` instead of Customize, say where a project's skills are chosen, and a project with no instructions now gets the project guidance (#1766, #1779)
+- A skill created under Customize → Skills appears in a project's Skills page and the Agent form without a reload (#1779)
+- `verify_sources` no longer needs an `upload_id` the model can't see: a missing id resolves to a unique filename match or the session's only document (#1784)
+- The seeded `web_research` skill's description says when to load it; on dev, Sonnet 4.6 went from loading it in 3 of 9 research requests to 9 of 9. Reaches a deployment on the next bootstrap seed (#1783)
+- ALB 5xx and connection-error alarm descriptions point at the stopped task's exit code first (#1793)
+- Both backend images set `PYTHONFAULTHANDLER=1`, so a native crash leaves a Python traceback (#1795)
+
+### ⚠️ Changed
+
+- **Breaking: the load balancer accepts traffic only from CloudFront.** `CDK_ALB_RESTRICT_TO_CLOUDFRONT` (default `true`) limits the ALB security group to the `com.amazonaws.global.cloudfront.origin-facing` managed prefix list on 443 (80 without a certificate). Requests sent straight to the ALB hostname time out; every client must use `https://{CDK_DOMAIN_NAME}/api/…`. Set it to `false` to keep the old `0.0.0.0/0` rules (#1746)
+- **Breaking for pre-release TUI installs:** the package, module, command and config paths are `aps-tui` / `aps_tui`; reinstall from the release wheel (#1788)
+- A GitHub Release now requires the TUI build and tests to pass (`build-tui` job) (#1788)
+- Project members now run and see skills that editors authored and added (#1780)
+- The base prompt no longer names a "knowledge base search" tool; it says the knowledge base is searched automatically. One-time prompt-cache re-write (#1777)
+
+### 🐛 Fixed
+
+- **app-api tasks died with exit 139.** PDFium is not thread-safe, and two PDFs parsed for their digests at the same time crashed the process. Every pypdfium2 call now runs behind one process-wide lock (#1793)
+- **app-api stopped answering `/health` for 3.5 minutes while an Agent with 41 documents was deleted.** Synchronous S3 Vectors calls, including a full-index scan, ran on the event loop; they now run off it, and a managed-KB document skips the scan it never needed (#1793)
+- **An empty model call stole the previous call's cost row.** Bedrock streams no `messageStart` for an empty response, so its usage overwrote the earlier call's slot. Each call now gets its own `C#` row (#1785)
+- A conversation deleted while its turn streamed came back to the sidebar; deleted rows now refuse writes and a repeat delete strips leftover index keys (#1765)
+- A dismissed connector sign-in prompt returned on the next conversation and every reload; dismissals are kept per user in localStorage until consent succeeds (#1760)
+- Strands rejected every client-tool call ("Field required: arguments") before the interrupt could fire (#1775)
+
+### 🔒 Security
+
+- ALB ingress restricted to CloudFront (see Changed) (#1746)
+- 11 of 12 open Dependabot alerts resolved: `brotli` 1.2.0 → 1.2.1 (critical, tests/load), `undici` → 8.12.3 (docs-site), `fast-uri` 3.1.8 → 3.1.9 and `body-parser` 2.3.0 → 2.4.0 (frontend), `brace-expansion` 5.0.9 → 5.0.12 via `aws-cdk-lib`. `opentelemetry-api` stays pinned by `aws-opentelemetry-distro` (#1761)
+
+### 📦 Dependencies
+
+- Infrastructure: `aws-cdk` 2.1128.0 → 2.1146.1 (reads cloud-assembly schema 55; a global `cdk` older than this fails to deploy), `aws-cdk-lib` 2.265.0 → 2.274.0 (#1771, #1761)
+- Backend: `strands-agents-evals` 1.7.0 added to the `dev` extra; `rich` 14.3.3 → 15.0.0 (#1796)
+- TUI: `textual` 8.2.8, `httpx-sse`, `keyring`, `platformdirs` (#1788)
+
+### 🏗️ Infrastructure
+
+- ALB security group rules come from an `AwsCustomResource` that resolves the CloudFront origin-facing prefix list at deploy time (about 55 of the 60-rule quota) (#1746)
+- New alarm `{prefix}-app-api-event-loop-lag`; ALB target group and container health-check intervals 30 s → 10 s, unhealthy threshold 3 → 2 (#1795)
+- Shipped defaults synthesize 441/500 resources (was 436); every opt-in flag on, 454/500 (was 449)
+- `platform.yml` forwards `CDK_SESSION_REWIND_ENABLED`, `CDK_SESSION_FORK_ENABLED` and `CDK_ALB_RESTRICT_TO_CLOUDFRONT`. The Runtime copies of the two session flags are written only while on
+
+### 🔧 CI/CD
+
+- **New release gate: every new feature flag must be named in the release notes, and every SPA flag on in prod but off by default must be accounted for in the newest entry.** `scripts/release/check-new-feature-flags.mjs` and `.github/workflows/new-feature-flags.yml` diff `feature_flags.py` and `feature-flags.ts` against `main` and compare `environment.production.ts` with `environment.ts` on every PR into `main`, like the backfill gate. The release skill gains a Feature flags table, a Still opt-in line and a Manual steps section; #1798 tracks each opt-in flag's promotion condition
+- `release.yml`: `build-tui` job attaches the `aps_tui` wheel and `SHA256SUMS` to the release and appends an install section (#1788)
+- Nightly pipeline seeds the eval user on the ephemeral stack and runs five families at k=1, non-blocking (#1794)
+- Concurrent device-grant approval test made deterministic (#1778)
+
+### 📚 Docs
+
+- New specs: evaluation harness, conversation rewind and fork, CLI device authorization, TUI/web parity. Docs-site: Terminal Client page, "Load balancer ingress" on the platform page, exit-code guidance in troubleshooting. Kaizen research 2026-10-23 (#1782, #1768, #1770, #1792, #1746, #1795, #1757)
+
+## [1.31.0] - 2026-10-24
+
+Users can pin conversations, choose how long-term memory treats them (on, read only or off), and start incognito chats that use memory without adding to it. The sidebar marks conversations that are waiting on the user, and a paused turn that can no longer resume now answers in the conversation instead of failing with a 424. Stopped turns are now metered for what they actually used. Grouping the DynamoDB and Lambda alarms frees 45 resources under CloudFormation's 500-per-stack limit. Source provenance, structured extraction and the first half of agent handoffs land behind in-development flags (default off). Dependency updates resolve 201 of 202 open Dependabot alerts. One GSI (`PinnedSessionIndex`) is added to sessions-metadata. **The backend now needs Python 3.11 or later.**
+
+### 🚀 Added
+
+- **Pin conversations.** A Pin / Unpin item in the conversation menu, and dragging a row onto or off **Pinned**, moves conversations into a Pinned group at the top of the sidebar. Pins load on the first page of `GET /sessions` as `pinned` from a new sparse `PinnedSessionIndex`; `PUT` / `DELETE /sessions/{id}/pin`. Project conversations can't be pinned (409) (#1711, #1734)
+- **Long-term memory mode: On, Read only or Off** on the `/memory` dashboard (`memoryMode` on `/users/me/settings`, missing = `on`). Read only keeps retrieval and writes every event with `extractionMode=SKIP`. Applies on every path that builds a session manager, including resume, MCP App dispatch and voice. The mode is part of the agent cache key. Agent and preview chats stay off (#1745, #1747, #1754)
+- **Incognito chats.** A toggle beside the model picker on a new plain chat (shown only in memory mode On) starts a conversation that reads memory but saves nothing to it. The flag is stored when the session row is created and locked after that. The sidebar shows an incognito icon on these chats (#1756)
+- **The sidebar marks conversations paused on the user** (OAuth consent, tool approval, `ask_user_question`, browser sign-in) with an amber dot, from a derived `awaitingInput` field on the session responses. It needs no new reads or writes (#1732)
+- **Replace a knowledge-base file** in an Agent's knowledge base or a project's files. The new version uploads and processes while the old one keeps serving, and the old one is deleted once the new one is ready
+- **Source provenance verification** (in development, default off: `SOURCE_PROVENANCE_ENABLED` / `CDK_SOURCE_PROVENANCE_ENABLED`, `features.sourceProvenance`). A `verify_sources` tool checks that a cited passage is in the document and that the asserted value appears in that passage. The result is shown under the answer as one of four states, and a plain page reference appears only when both checks pass. New `source_provenance` SSE event; verdicts are stored as `SRCV#` rows and replayed on `GET /messages` (#1682, #1690, #1696, #1699, #1700)
+- **Structured extraction** (in development, default off: `DOCUMENT_EXTRACT_ENABLED` / `CDK_DOCUMENT_EXTRACT_ENABLED`, `features.documentExtract`). A `document_extract` tool runs a skill's field set over one or more documents as typed rows, and each value carries a provenance verdict. The typed schema goes on a side-channel `strict_tools` call and never into the turn's `toolConfig`. Needs `CDK_DOCUMENT_EXTRACT_MODEL_ID` set to a model with a catalog row; `CDK_DOCUMENT_EXTRACT_CONCURRENCY` is optional (#1691, #1692, #1693)
+- **Agent handoffs, Phase 0 backend** (in development, default off: `HANDOFFS_ENABLED` / `CDK_HANDOFFS_ENABLED`). `HANDOFF#` rows, `POST /sessions/{id}/handoffs` and its get/dismiss routes, and `handoff_context` on the invocation path, which is accepted exactly once and keeps the source conversation's status current. No SPA yet (#1742, #1744)
+
+### ✨ Improved
+
+- **A paused turn that can't resume answers in the conversation.** A missing or expired snapshot or an unknown interrupt id used to return a 400, which the Runtime rewrote to a bare 424 ("Chat Request Failed"). It now streams a conversational `stream_error` (`error_kind: "resume_unavailable"`) and retires the dead prompt. Paused scheduled runs (`headless-` sessions) stay resumable for 7 days instead of 1 hour (#1731)
+- **One MCP client per server, not per catalog entry.** Catalog rows that open the same connection (same URL, custom headers and auth mode) collapse to one, and their tool filters are merged, so two roles granting one server no longer fail the agent with a duplicate tool name. A disabled row never wins the dedupe (#1681, #1686)
+- **An MCP App's action cards no longer multiply on reload.** One card per distinct call (session, frame, tool, arguments). Re-runs update it in place, and older rows are collapsed when read (#1664)
+- The shared-conversation page sits on the app shell's background, like the conversation page (#1709)
+
+### ⚠️ Changed
+
+- **Backend `requires-python` is now `>=3.11`** (Pillow 13 dropped 3.10). Every runtime image is already on 3.12 or 3.13 (#1750)
+- **Resume refusals return 200 with a streamed reply instead of HTTP 400.** API clients that resumed paused turns and matched on the 400 should read `stream_error.metadata.error_kind` instead (#1731)
+- **DynamoDB throttle and Lambda error/throttle alarms are grouped.** 29 per-table and 25 per-function alarms (54 resources) become 9 metric-math alarms under new names. A notification names the group, and while one member keeps a group in ALARM, a second member failing sends no new notification. Anything subscribed to the old alarm names must be updated (#1708)
+
+### 🐛 Fixed
+
+- **A stopped turn is charged for what it consumed.** The cut call's row used to record zero output and no cache buckets. Usage is now estimated from the request it actually sent, using each model's own minimum cacheable prefix (4,096 tokens on Haiku 4.5). The partial reply also joins the live conversation, so the follow-up turn sees it (#1701, #1739, #1740, #1741)
+- **Share editors can open and save the Agents shared with them.** Editors of PUBLIC and PRIVATE agents were shown a read-only form or refused, and a save that sent back owner-bound capabilities the editor lacks failed with 403 (#1679)
+- **A knowledge-base upload whose browser `PUT` never landed fails cleanly** with "Please upload the file again." and releases its byte reservation, instead of dead-lettering the ingestion event. The nightly document reconciler applies the same check (#1676, #1677)
+- **A saved default model applies to the next new chat** without a reload (#1585)
+- **A deleted memory disappears from the `/memory` dashboard at once** instead of coming back from the reload's semantic retrieval
+- **Quota admin cards render on load.** The quota writers emitted `+00:00Z` timestamps that made Angular's DatePipe throw; the writers are fixed and the SPA normalizes rows already stored (#1728)
+- A DynamoDB table that throttled only reads, or only writes, could never raise its throttle alarm (`FILL(…, 0)` in the grouped alarm) (#1708)
+
+### 🔒 Security
+
+- **MCP App tool calls can no longer run on another user's MCP client.** `UIToolCatalog` was keyed by tool name alone, so in a shared process one user's App click could run with another user's credential. Entries are now keyed by `(owner, tool)` (#1455)
+- **201 of 202 open Dependabot alerts resolved**, including all 22 critical. The one left is `opentelemetry-api` in `backend/uv.lock`, which stays pinned at 1.44.0 by `aws-opentelemetry-distro` (#1750, #1736, #1737, #1735)
+
+### 📦 Dependencies
+
+- Backend: `strands-agents` 1.57.2 → 1.61.1, `bedrock-agentcore` 1.24.0 → 1.24.2 (two local workarounds retired, and the local OpenAI cache-write recovery removed) (#1694, #1683); `pillow` 12.3.0 → 13.0.0 (uv override past `strands-agents-tools`' `<13` cap), `aiohttp` 3.14.3 → 3.14.4, `yarl` 1.23.0 → 1.25.1, `certifi` → 2026.10.19, `black` 26.3.1 → 26.10.1 (#1750, #1736)
+- Frontend: `katex` 0.16.45 → 0.18.2, `vite` override → 8.1.6, `dompurify` override → 3.4.17, `vitest` / `@vitest/coverage-v8` 4.1.11 → 4.1.12 (#1737, #1750)
+- Infrastructure: `js-yaml` 4.3.2 override for `@istanbuljs/load-nyc-config`, which drops `sprintf-js` from the dev tree (#1735)
+- Other: scheduled-runs Lambda `opentelemetry-api/sdk` 1.44.0 → 1.45.1; docs-site `astro` 7.3.3 / `vite` 8.1.6; `certifi` and `black` in tui and scripts (#1750)
+
+### 🏗️ Infrastructure
+
+- `PinnedSessionIndex` (GSI6, sparse) on the sessions-metadata table. It is the only GSI change in this release (#1711)
+- 54 per-resource DynamoDB and Lambda alarms become 9 grouped alarms. All flags on now synthesizes 449/500 resources (was 494) (#1708)
+- `platform-ceilings.test.ts`: one synth-time guard for the 500-resource stack limit and IAM's 6,144-character managed-policy limit, checked against the all-flags-on synth and calibrated to dev's live stack (#1680, #1685, #1688)
+- `platform.yml` forwards `CDK_HANDOFFS_ENABLED`, `CDK_SOURCE_PROVENANCE_ENABLED`, `CDK_DOCUMENT_EXTRACT_ENABLED`, `CDK_DOCUMENT_EXTRACT_MODEL_ID` and `CDK_DOCUMENT_EXTRACT_CONCURRENCY`. Each Runtime variable is written only while on (or set), so the defaults use none of the V2 environment budget
+
+### 🔧 CI/CD
+
+- Fixed date- and race-dependent backend tests that failed every PR (`test_attachment_index` eviction, `test_kb_dual_read`), a fake catalog that broke on develop after #1455, and Windows-only test failures (#1704, #1695, #1707)
+- Smoke harness: a `source_provenance` row, with the event allowed in the frame contract's tail (#1690)
+
+### 📚 Docs
+
+- New specs: structured extraction, field-set authoring and source provenance. Also a one-pager on the research-admin content gap, prod's V1 Runtime GB-hours baseline and its first V2 days, an account MCP server scoping doc, and kaizen queue cleanup (#1687, #1689, #1697, #1702, #1703, #1705, #1706, #1684, #1454, #1448, #1678, #1698, #1730)
+
 ## [1.30.0] - 2026-10-18
 
 Fixes to how an Agent (assistant) chat builds its context, raised by an instructor whose course assistants answered worse than the legacy system did. An assistant chat no longer reads or writes the user's long-term memory. Retrieved excerpts reach the model whole, and the model is told they are partial. An Agent that binds no tools or skills now runs with none instead of the viewer's own. The Runtime can now read assistant knowledge-base uploads, so spreadsheet analysis works in cloud. Eight finished features now default on, and full-context mode for small knowledge bases is added (in development, default off). **Deploy `backend.yml` before `platform.yml`** (see the release notes).

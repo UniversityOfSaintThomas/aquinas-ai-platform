@@ -74,19 +74,40 @@ class TestMCPGatewayConfigSerialization:
             oauth_scopes=["repo", "read:user"],
             custom_parameters={"audience": "https://api.github.com"},
         )
-        # 3LO (authorization_code) is the default grant.
-        assert config.grant_type == GatewayOAuthGrantType.AUTHORIZATION_CODE
+        # Client credentials is the default (and only saveable) grant (#454).
+        assert config.grant_type == GatewayOAuthGrantType.CLIENT_CREDENTIALS
 
         data = config.to_dict()
-        assert data["grantType"] == "authorization_code"
+        assert data["grantType"] == "client_credentials"
         assert data["customParameters"] == {"audience": "https://api.github.com"}
 
         restored = MCPGatewayConfig.from_dict(data)
         assert restored.credential_type == GatewayCredentialType.OAUTH
         assert restored.oauth_scopes == ["repo", "read:user"]
         assert restored.credential_provider_arn == config.credential_provider_arn
-        assert restored.grant_type == GatewayOAuthGrantType.AUTHORIZATION_CODE
+        assert restored.grant_type == GatewayOAuthGrantType.CLIENT_CREDENTIALS
         assert restored.custom_parameters == {"audience": "https://api.github.com"}
+
+    @pytest.mark.parametrize("legacy", ["authorization_code", "token_exchange"])
+    def test_pre_454_grant_rows_still_load(self, legacy):
+        # Rows saved before #454 keep their grant on read; only a save rejects it.
+        restored = MCPGatewayConfig.from_dict(
+            {
+                "targetName": "old-target",
+                "endpointUrl": "https://old/mcp",
+                "credentialType": "oauth",
+                "credentialProviderArn": "arn:...:oauth2credentialprovider/old",
+                "grantType": legacy,
+            }
+        )
+        assert restored.grant_type == legacy
+
+    def test_row_without_grant_type_reads_as_authorization_code(self):
+        # Such a row was registered when 3LO was the default.
+        restored = MCPGatewayConfig.from_dict(
+            {"targetName": "t", "endpointUrl": "https://e/mcp"}
+        )
+        assert restored.grant_type == GatewayOAuthGrantType.AUTHORIZATION_CODE
 
     def test_client_credentials_grant_round_trip(self):
         config = MCPGatewayConfig(
@@ -205,6 +226,47 @@ class TestRequestResponseWiring:
         resp = MCPGatewayConfigResponse.from_model(model)
         assert resp.grant_type == "client_credentials"
         assert resp.custom_parameters == {"audience": "https://api.github.com"}
+
+    @pytest.mark.parametrize("grant", ["authorization_code", "token_exchange"])
+    def test_request_rejects_removed_oauth_grants(self, grant):
+        # #454: 3LO had no consent handling for Gateway tools, and token
+        # exchange needs a JWT-inbound Gateway. ValueError → 400 in the routes.
+        req = MCPGatewayConfigRequest(
+            **{
+                "targetName": "gh",
+                "endpointUrl": "https://gh/mcp",
+                "credentialType": "oauth",
+                "credentialProviderArn": "arn:...:oauth2credentialprovider/gh",
+                "grantType": grant,
+            }
+        )
+        with pytest.raises(ValueError, match="client_credentials"):
+            req.to_model()
+
+    def test_request_defaults_to_client_credentials(self):
+        req = MCPGatewayConfigRequest(
+            **{
+                "targetName": "gh",
+                "endpointUrl": "https://gh/mcp",
+                "credentialType": "oauth",
+                "credentialProviderArn": "arn:...:oauth2credentialprovider/gh",
+            }
+        )
+        assert req.to_model().grant_type == GatewayOAuthGrantType.CLIENT_CREDENTIALS
+
+    def test_non_oauth_request_ignores_a_stale_grant(self):
+        # The grant only matters for OAuth; an IAM target edited from an old row
+        # that stored authorization_code must still save.
+        req = MCPGatewayConfigRequest(
+            **{
+                "targetName": "policy-search",
+                "endpointUrl": "https://x.lambda-url.us-west-2.on.aws/mcp",
+                "credentialType": "gateway_iam_role",
+                "awsService": "lambda",
+                "grantType": "authorization_code",
+            }
+        )
+        assert req.to_model().credential_type == GatewayCredentialType.GATEWAY_IAM_ROLE
 
     def test_response_from_model_exposes_identifiers(self):
         config = MCPGatewayConfig(
@@ -328,3 +390,97 @@ class TestCoGatingValidator:
         )
         with pytest.raises(ValidationError):
             req.to_model()
+
+
+# ------------------------------------------------------- built-in connectors
+
+
+class TestConnectorConfig:
+    """`connector_id` registers an AgentCore connector (Web Search) instead of
+    an external server; the validator fills in everything the connector fixes."""
+
+    def test_connector_defaults(self):
+        config = MCPGatewayConfig(target_name="web-search", connector_id="web-search")
+
+        assert config.is_connector
+        assert config.endpoint_url == ""
+        assert config.credential_type == "gateway_iam_role"
+        assert config.listing_mode == "default"
+        assert config.connector_version == "1.3.0"
+        # The tool list is what expands the bare catalog id into
+        # gateway_web-search___WebSearch, so it must never be empty.
+        assert [e.name for e in config.tools] == ["WebSearch"]
+
+    def test_per_tool_flags_survive_normalization(self):
+        config = MCPGatewayConfig(
+            target_name="web-search",
+            connector_id="web-search",
+            tools=[MCPToolEntry(name="WebSearch", always_on=True)],
+        )
+        assert config.tools[0].always_on is True
+
+    def test_round_trip_keeps_pinned_version_and_filters(self):
+        config = MCPGatewayConfig(
+            target_name="web-search",
+            connector_id="web-search",
+            connector_version="1.2.0",
+            domain_include=["BoiseState.edu", "boisestate.edu", " nih.gov. "],
+            domain_exclude=["pinterest.com"],
+        )
+        item = config.to_dict()
+
+        assert item["connectorVersion"] == "1.2.0"
+        assert item["domainInclude"] == ["boisestate.edu", "nih.gov"]
+        assert MCPGatewayConfig.from_dict(item) == config
+
+    def test_external_server_rows_gain_no_connector_keys(self):
+        config = MCPGatewayConfig(
+            target_name="weather-target", endpoint_url="https://example.com/mcp"
+        )
+        assert not config.is_connector
+        assert "connectorId" not in config.to_dict()
+
+    @pytest.mark.parametrize(
+        "overrides, message",
+        [
+            ({"connector_id": "not-a-connector"}, "Unsupported Gateway connector"),
+            ({"endpoint_url": "https://example.com/mcp"}, "takes no endpoint_url"),
+            ({"aws_service": "lambda"}, "gateway execution role"),
+            ({"credential_provider_arn": "arn:aws:x"}, "gateway execution role"),
+            ({"tools": [MCPToolEntry(name="Other")]}, "exposes only 'WebSearch'"),
+            ({"domain_include": ["https://example.com/docs"]}, "not a bare domain"),
+            ({"domain_exclude": ["example.com:443"]}, "not a bare domain"),
+            ({"domain_exclude": [f"d{i}.com" for i in range(101)]}, "at most 100"),
+        ],
+    )
+    def test_rejects_what_a_connector_cannot_honor(self, overrides, message):
+        with pytest.raises(ValidationError, match=message):
+            MCPGatewayConfig(
+                **{"target_name": "web-search", "connector_id": "web-search", **overrides}
+            )
+
+    def test_external_server_still_requires_endpoint_and_no_domain_filter(self):
+        with pytest.raises(ValidationError, match="endpoint_url is required"):
+            MCPGatewayConfig(target_name="weather-target")
+        with pytest.raises(ValidationError, match="only to a connector target"):
+            MCPGatewayConfig(
+                target_name="weather-target",
+                endpoint_url="https://example.com/mcp",
+                domain_exclude=["pinterest.com"],
+            )
+
+    def test_request_and_response_carry_connector_fields(self):
+        request = MCPGatewayConfigRequest.model_validate(
+            {
+                "targetName": "web-search",
+                "connectorId": "web-search",
+                "domainExclude": ["pinterest.com"],
+            }
+        )
+        model = request.to_model()
+        response = MCPGatewayConfigResponse.from_model(model).model_dump(by_alias=True)
+
+        assert response["connectorId"] == "web-search"
+        assert response["connectorVersion"] == "1.3.0"
+        assert response["domainExclude"] == ["pinterest.com"]
+        assert response["endpointUrl"] == ""

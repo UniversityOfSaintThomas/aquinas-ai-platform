@@ -32,7 +32,13 @@ from apis.shared.errors import (
     ErrorCode,
     StreamErrorEvent,
     build_conversational_error_event,
+    model_read_timeout_phase,
+    provider_unavailable_message,
 )
+from apis.shared.observability.emf import emit_model_read_timeout
+from apis.shared.sessions.ledger_rollups import TURN_OUTCOMES
+from agents.main_agent.session.hooks.declined_answer import DECLINED_NOTICE
+from agents.main_agent.session.hooks.declined_answer import needs_notice as needs_declined_notice
 
 from .history_count import HistoryCount, count_created_before
 from .stream_processor import process_agent_stream
@@ -45,6 +51,15 @@ from .stream_processor import process_agent_stream
 _FIRST_MODEL_OUTPUT_TYPES = frozenset(
     {"content_block_start", "content_block_delta", "reasoning", "tool_use"}
 )
+
+#: How a turn ended, recorded as ``outcome`` on each of its ``C#`` cost rows
+#: (release-ledger spec §5.1). ``completed``: the success path; ``paused``:
+#: the success path, stopped on an interrupt waiting for the user; ``error``:
+#: a failure arm (an agent error, a coordinator exception, a max_tokens
+#: truncation); ``stopped``: the cooperative Stop arm; ``interrupted``: torn
+#: down by the connection closing. ``TURN_OUTCOMES`` is declared in
+#: ``apis.shared.sessions.ledger_rollups``, beside the ledger writer that counts
+#: them, because app-api runs that writer too and may not import ``agents``.
 
 
 def _turn_clock_call(turn_clock: Any, method: str, *args: Any) -> None:
@@ -97,15 +112,110 @@ class _CooperativeStopSignal(Exception):
     """
 
 
-def _long_term_memory_of(main_agent_wrapper: Any) -> bool:
-    """Whether the turn's own session manager feeds long-term memory.
+def _memory_extraction_of(main_agent_wrapper: Any) -> bool:
+    """Whether the turn's own session manager extracts long-term memory.
 
     A synthetic write (an error reply, an interrupted partial) goes through a
-    fresh manager, which must inherit the turn's setting: an Agent
-    conversation's partial answer is knowledge-base material like the rest.
+    fresh manager, which must inherit the turn's extraction setting:
+    an Agent conversation's partial answer is knowledge-base material like the
+    rest, and a read-only turn learns nothing.
     """
     manager = getattr(main_agent_wrapper, "session_manager", None)
-    return getattr(manager, "long_term_memory", True) is not False
+    return getattr(manager, "memory_extraction", True) is not False
+
+
+def _model_provider_value(model_config: Any) -> Optional[str]:
+    """The ``ModelProvider`` value the turn's model runs on, or ``None`` if unknown.
+
+    ``get_provider`` is the detection ``AgentFactory`` builds the model from,
+    so a continuation is judged by the transport it is actually sent over.
+    """
+    get_provider = getattr(model_config, "get_provider", None)
+    if not callable(get_provider):
+        return None
+    try:
+        provider = get_provider()
+    except Exception:  # noqa: BLE001 — an unreadable config keeps the model-id rule alone
+        logger.debug("Could not resolve the model provider for a continuation", exc_info=True)
+        return None
+    return getattr(provider, "value", provider) or None
+
+
+# How long a failed turn may wait for the model's display name. The catalog
+# read is usually a cache hit; this only stops a slow one from holding the
+# error reply back. Never on the success path.
+_OUTAGE_MODEL_NAME_TIMEOUT_SECONDS = 2.0
+
+
+async def _outage_model_name(model_id: Optional[str]) -> Optional[str]:
+    """The catalog's display name for a model, or ``None`` if it can't be read in time."""
+    if not model_id:
+        return None
+    try:
+        from apis.shared.costs.pricing_config import get_model_by_model_id
+
+        record = await asyncio.wait_for(
+            get_model_by_model_id(model_id), timeout=_OUTAGE_MODEL_NAME_TIMEOUT_SECONDS
+        )
+    except Exception:  # noqa: BLE001 — the reply still goes out, unnamed
+        logger.debug("Could not read the display name for %s", model_id, exc_info=True)
+        return None
+    name = getattr(record, "model_name", None)
+    return name if isinstance(name, str) and name.strip() else None
+
+
+async def _describe_provider_outage(
+    event: ConversationalErrorEvent, main_agent_wrapper: Any
+) -> ConversationalErrorEvent:
+    """Name the turn's model and provider in a provider-outage reply.
+
+    The classifiers that recognize the outage (the force-stop formatter, and
+    ``build_conversational_error_event`` for a raised error) know only the
+    error text. The coordinator knows the model, so it rebuilds the copy here
+    and puts the model on ``metadata``, where the SPA reads it for the
+    outage label and "Try again". Ids and display names only.
+    """
+    model_config = getattr(main_agent_wrapper, "model_config", None)
+    model_id = getattr(model_config, "model_id", None)
+    provider = _model_provider_value(model_config)
+    model_name = await _outage_model_name(model_id)
+
+    metadata: Dict[str, Any] = dict(event.metadata or {})
+    metadata["error_kind"] = "provider_unavailable"
+    if model_id:
+        metadata["model_id"] = model_id
+    if model_name:
+        metadata["model_name"] = model_name
+    if provider:
+        metadata["provider"] = provider
+    return event.model_copy(
+        update={
+            "message": provider_unavailable_message(model_name, provider),
+            "metadata": metadata,
+        }
+    )
+
+
+def _record_model_read_timeout(
+    error_text: str, main_agent_wrapper: Any, session_id: Optional[str]
+) -> None:
+    """Count a turn a model read timeout ended (``ModelReadTimeout``, alarmed).
+
+    Called from the in-loop ``error`` arm, where both a force-stop and an
+    exception raised inside the agent stream arrive. Nothing else records it:
+    the turn reports no usage, so it writes no ``C#`` row.
+    """
+    phase = model_read_timeout_phase(error_text.lower())
+    if phase is None:
+        return
+    model_config = getattr(main_agent_wrapper, "model_config", None)
+    retry_config = getattr(model_config, "retry_config", None)
+    emit_model_read_timeout(
+        model_id=getattr(model_config, "model_id", None),
+        phase=phase,
+        read_timeout_seconds=getattr(retry_config, "read_timeout", None),
+        session_id=session_id,
+    )
 
 
 def reset_cancellation_state(agent: Any, session_manager: Any) -> None:
@@ -291,6 +401,8 @@ class StreamCoordinator:
         original_message: Optional[str] = None,
         turn_agent_id: Optional[str] = None,
         turn_project_id: Optional[str] = None,
+        turn_attachment_plan: Optional[Dict[str, Any]] = None,
+        turn_pasted_chars: Optional[int] = None,
         turn_lease: Any = None,
         turn_started_at: Optional[float] = None,
         poll_side_frame: Optional[Callable[[], Optional[str]]] = None,
@@ -320,6 +432,13 @@ class StreamCoordinator:
             turn_project_id: The Shared Project whose harness ran this turn (None for any
                 other turn). Recorded on each cost row as ``projectId``; the metadata writer
                 also adds the call to the project's monthly ``COST#`` rollup.
+            turn_attachment_plan: The turn's ``AttachmentPlan.to_row()`` (per file: mode,
+                class, tokens, reason, upload id; ``docs/specs/unified-attachment-delivery.md``
+                §8.2), or None for a turn with no attachments. Written as ``attachmentPlan``
+                on the turn's last cost row, after the stream. Per turn, like turn_agent_id.
+            turn_pasted_chars: Characters of the user's message the composer counted as
+                pasted, or None. Written as ``pastedChars`` on the turn's last cost row,
+                beside ``attachmentPlan``; never reaches the prompt.
             turn_lease: This turn's single-flight ``SessionLease``, which doubles as the
                 mid-turn steering inbox. Stamped onto the session manager for the life of
                 the turn so ``SteeringHook`` can read it at each tool boundary — and
@@ -370,6 +489,17 @@ class StreamCoordinator:
         if session_manager is not None:
             session_manager.turn_lease = turn_lease
 
+        # Rewind (rewind spec §4.3): a rewind app-api recorded since the last
+        # turn cuts the live list in place, before anything else reads it, so
+        # the retained prefix stays byte-identical and is read from the prompt
+        # cache. Its row read is reused by the compaction re-read just below.
+        # Best-effort: never blocks the turn.
+        if session_manager is not None and hasattr(session_manager, "apply_rewind"):
+            try:
+                session_manager.apply_rewind(agent)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"apply_rewind failed, continuing: {e}")
+
         # Paid-when-free compaction (spec §3.5): if a cut is parked, apply it
         # to the live list now — before the first model call — only when the
         # prefix re-write is free (cache expired, model/agent switched) or
@@ -393,7 +523,11 @@ class StreamCoordinator:
         # named stays pinned. Best-effort: never blocks the turn.
         if session_manager is not None and hasattr(session_manager, "apply_document_offload"):
             try:
-                session_manager.apply_document_offload(agent, prompt=prompt)
+                session_manager.apply_document_offload(
+                    agent,
+                    prompt=prompt,
+                    model_id=getattr(getattr(main_agent_wrapper, "model_config", None), "model_id", None),
+                )
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"apply_document_offload failed, continuing: {e}")
 
@@ -402,6 +536,30 @@ class StreamCoordinator:
         # interrupt state makes Strands reject this turn's prompt outright.
         # See ``reset_stale_interrupt_state``.
         reset_stale_interrupt_state(agent, prompt)
+
+        # A "Continue" (empty-list prompt) on a model that does not continue
+        # from assistant prefill would end the request on the partial assistant
+        # message: Claude 4.6+ rejects it on every retry, and a Responses-API
+        # model (GPT) starts the answer over. Send a fixed user turn instead.
+        # Runs after everything above has settled the live list, and only reads
+        # it: the history before the partial is unchanged.
+        if isinstance(prompt, list) and not prompt:
+            from apis.shared.models.assistant_prefill import continuation_prompt
+
+            _continuation_config = getattr(main_agent_wrapper, "model_config", None)
+            _continuation_model = getattr(_continuation_config, "model_id", None)
+            _continuation_provider = _model_provider_value(_continuation_config)
+            _continued = continuation_prompt(
+                prompt, getattr(agent, "messages", None) or [], _continuation_model, _continuation_provider
+            )
+            if _continued is not prompt:
+                logger.info(
+                    "Continuation on %s (%s): history ends on assistant text and the model does not continue "
+                    "from prefill; sending a continue turn instead",
+                    _continuation_model,
+                    _continuation_provider or "bedrock",
+                )
+                prompt = _continued
         # Compaction state re-read (#751), document offload, the resets above.
         _turn_clock_call(turn_clock, "mark", "head_of_turn.compaction")
 
@@ -648,19 +806,7 @@ class StreamCoordinator:
                         # Record the start time for this specific assistant message
                         # This enables accurate per-message latency calculation
                         per_message_metadata.append(
-                            {
-                                "usage": {},
-                                "metrics": {},
-                                "start_time": time.time(),  # When this message started
-                                "first_token_time": None,  # When first token was received
-                                "end_time": None,  # When this message ended
-                                # The hooks that key per-call data by model
-                                # call (prefix fingerprints, tool census,
-                                # context ledger) count every BeforeModelCallEvent,
-                                # retried attempts included, so their index for
-                                # this call is its position plus the retries so far.
-                                "call_index": current_assistant_message_index + model_retries_seen,
-                            }
+                            self._new_call_slot(current_assistant_message_index + model_retries_seen)
                         )
                         logger.debug(f"📝 Assistant message {current_assistant_message_index} started at {per_message_metadata[-1]['start_time']}")
 
@@ -675,6 +821,8 @@ class StreamCoordinator:
                         # Capture the partial for interruption persistence.
                         assistant_text_acc.append(event_data["text"])
                         if current_assistant_message_index >= 0 and current_assistant_message_index < len(per_message_metadata):
+                            text_slot = per_message_metadata[current_assistant_message_index]
+                            text_slot["text_chars"] = text_slot.get("text_chars", 0) + len(event_data["text"])
                             if per_message_metadata[current_assistant_message_index]["first_token_time"] is None:
                                 per_message_metadata[current_assistant_message_index]["first_token_time"] = time.time()
                                 logger.info(
@@ -683,6 +831,13 @@ class StreamCoordinator:
                                 # Also update global first_token_time for the first message (backward compatibility)
                                 if current_assistant_message_index == 0 and first_token_time is None:
                                     first_token_time = per_message_metadata[0]["first_token_time"]
+
+                # What this call's output was made of, as lengths only
+                # (`outputChars` on the cost row): the reasoning the model
+                # streamed and the signature that tracks what it was billed.
+                elif event.get("type") == "reasoning":
+                    if 0 <= current_assistant_message_index < len(per_message_metadata):
+                        self._count_reasoning(per_message_metadata[current_assistant_message_index], event.get("data"))
 
                 # Note whether the agent invoked an artifact authoring
                 # tool this turn. Gates the post-turn artifacts query so
@@ -727,14 +882,63 @@ class StreamCoordinator:
                     # and the append_message hook persists it to AgentCore
                     # Memory. It is no longer "in flight", so an interruption
                     # from here on must not re-persist its text.
+                    # Whether this call said anything is kept on its slot first:
+                    # a turn whose final call streamed no text is an empty
+                    # answer (`emptyAnswer` on the cost row, release-ledger D6).
+                    call_streamed_text = any(t.strip() for t in assistant_text_acc)
                     assistant_text_acc.clear()
+                    # Bedrock opens an EMPTY response with no `messageStart`:
+                    # the call streams only `messageStop` + `metadata`. With no
+                    # slot of its own, its usage overwrote the previous call's
+                    # (which then went unbilled) and was keyed to that call's
+                    # message. A stop with no open slot is therefore a call
+                    # that never announced itself; give it one.
+                    if not per_message_metadata or per_message_metadata[-1].get("end_time") is not None:
+                        current_assistant_message_index += 1
+                        per_message_metadata.append(
+                            self._new_call_slot(current_assistant_message_index + model_retries_seen)
+                        )
+                        logger.info(
+                            "Model call %d in session %s stopped without a message_start; opened its own slot",
+                            current_assistant_message_index, session_id,
+                        )
                     if current_assistant_message_index >= 0 and current_assistant_message_index < len(per_message_metadata):
                         per_message_metadata[current_assistant_message_index]["end_time"] = time.time()
+                        per_message_metadata[current_assistant_message_index]["has_text"] = call_streamed_text
                         logger.debug(f"📝 Assistant message {current_assistant_message_index} ended")
+                    # The provider declined this call and it said nothing: show
+                    # the notice DeclinedAnswerHook also writes into the message,
+                    # before this message_stop goes out, so the bubble is never
+                    # blank (declined_answer.py).
+                    if needs_declined_notice(event.get("data", {}).get("stopReason"), call_streamed_text):
+                        if 0 <= current_assistant_message_index < len(per_message_metadata):
+                            per_message_metadata[current_assistant_message_index]["declined"] = True
+                        yield 'event: content_block_start\ndata: {"contentBlockIndex": 0, "type": "text"}\n\n'
+                        yield f"event: content_block_delta\ndata: {json.dumps({'contentBlockIndex': 0, 'type': 'text', 'text': DECLINED_NOTICE})}\n\n"
+                        yield 'event: content_block_stop\ndata: {"contentBlockIndex": 0}\n\n'
 
                 # Track individual metadata events (per assistant message)
                 if event.get("type") == "metadata":
                     event_data = event.get("data", {})
+                    # Usage arrives once per call, after its `messageStop`. Usage
+                    # for a slot that already holds a finished call's usage
+                    # belongs to a call that sent neither a start nor a stop;
+                    # open a closed slot for it rather than overwrite the last.
+                    if event_data.get("usage") and (
+                        not per_message_metadata
+                        or (
+                            per_message_metadata[-1].get("end_time") is not None
+                            and per_message_metadata[-1].get("usage")
+                        )
+                    ):
+                        current_assistant_message_index += 1
+                        orphan_slot = self._new_call_slot(current_assistant_message_index + model_retries_seen)
+                        orphan_slot["end_time"] = orphan_slot["start_time"]
+                        per_message_metadata.append(orphan_slot)
+                        logger.info(
+                            "Model call %d in session %s reported usage without a message boundary; opened its own slot",
+                            current_assistant_message_index, session_id,
+                        )
                     if current_assistant_message_index >= 0 and current_assistant_message_index < len(per_message_metadata):
                         msg_meta = per_message_metadata[current_assistant_message_index]
 
@@ -825,6 +1029,18 @@ class StreamCoordinator:
                         tool_summary_tasks, drain_all=True
                     ):
                         yield summary_sse
+                    # Last chance for a verdict queued by a tool call in the
+                    # final batch: the loop above drains between agent events,
+                    # and `done` may be the next one.
+                    for provenance_sse in await self._drain_source_provenance_events(
+                        session_id, user_id
+                    ):
+                        yield provenance_sse
+                    # Same last chance for an extraction run in the final batch.
+                    for extraction_sse in await self._drain_document_extractions(
+                        session_id, user_id
+                    ):
+                        yield extraction_sse
                     await self._persist_paused_turn_snapshot(
                         agent,
                         session_id=session_id,
@@ -850,6 +1066,18 @@ class StreamCoordinator:
                     ):
                         yield sse
                     for sse in await self._extract_browser_login_required_events(
+                        agent,
+                        session_id=session_id,
+                        user_id=user_id,
+                    ):
+                        yield sse
+                    for sse in await self._extract_mcp_elicitation_required_events(
+                        agent,
+                        session_id=session_id,
+                        user_id=user_id,
+                    ):
+                        yield sse
+                    for sse in await self._extract_client_tool_call_events(
                         agent,
                         session_id=session_id,
                         user_id=user_id,
@@ -1046,6 +1274,9 @@ class StreamCoordinator:
                                     current_messages=current_messages,
                                     context_window=turn_context_window,
                                     history_tokens=history_tokens,
+                                    model_id=getattr(
+                                        getattr(main_agent_wrapper, "model_config", None), "model_id", None
+                                    ),
                                 )
                                 # The cut (and its forced / floor_unreachable
                                 # flags) belongs on the call that triggered it,
@@ -1113,6 +1344,9 @@ class StreamCoordinator:
                     error_message = error_data.get("error", "An error occurred")
                     error_detail = error_data.get("detail", "")
                     error_code_str = error_data.get("code", "stream_error")
+                    _record_model_read_timeout(
+                        f"{error_message} {error_detail or ''}", main_agent_wrapper, session_id
+                    )
 
                     # Map string code to ErrorCode enum
                     try:
@@ -1133,7 +1367,7 @@ class StreamCoordinator:
                     # generic wrapper below.
                     recoverable = error_data.get("recoverable", False)
                     if (
-                        error_code == ErrorCode.AGENT_ERROR
+                        error_code in (ErrorCode.AGENT_ERROR, ErrorCode.PROVIDER_UNAVAILABLE)
                         and error_message
                         and error_message.lstrip().startswith("⚠️")
                     ):
@@ -1158,6 +1392,14 @@ class StreamCoordinator:
                             error=synthetic_error,
                             session_id=session_id,
                             recoverable=recoverable,
+                        )
+
+                    # Either classifier may have recognized a provider outage
+                    # (a raised error arrives here as STREAM_ERROR and is
+                    # reclassified by the builder), so check the built event.
+                    if conv_error_event.code == ErrorCode.PROVIDER_UNAVAILABLE:
+                        conv_error_event = await _describe_provider_outage(
+                            conv_error_event, main_agent_wrapper
                         )
 
                     if error_code == ErrorCode.MAX_TOKENS:
@@ -1265,7 +1507,7 @@ class StreamCoordinator:
                                 session_id=session_id,
                                 user_id=user_id,
                                 caching_enabled=False,
-                                long_term_memory=_long_term_memory_of(main_agent_wrapper),
+                                memory_extraction=_memory_extraction_of(main_agent_wrapper),
                             )
                             persist_synthetic_messages(
                                 persist_session_manager,
@@ -1295,6 +1537,8 @@ class StreamCoordinator:
                         citations=citations,
                         turn_agent_id=turn_agent_id,
                         turn_project_id=turn_project_id,
+                        turn_attachment_plan=turn_attachment_plan,
+                        turn_pasted_chars=turn_pasted_chars,
                     )
 
                     # Skip the original error event and exit the loop - we've handled the error
@@ -1340,6 +1584,28 @@ class StreamCoordinator:
                     tool_summary_tasks
                 ):
                     yield summary_sse
+
+                # Source provenance: `verify_sources` parked its verdicts on the
+                # broker because a tool result is the Converse payload and the
+                # quote, locator and method must not reach the cacheable prefix
+                # (docs/specs/source-provenance-verification.md §8). Drained on
+                # the same pass as the summaries, and persisted here, so a
+                # dropped connection still leaves the `SRCV#` row a reload reads.
+                for provenance_sse in await self._drain_source_provenance_events(
+                    session_id, user_id
+                ):
+                    yield provenance_sse
+
+                # Structured extraction: `document_extract` parked its rows on
+                # its own broker for the same reason — a tool result is the
+                # Converse payload, and the quotes, locators and the rendered
+                # table must not reach the cacheable prefix
+                # (docs/specs/structured-extraction.md §9). Drained on the same
+                # pass, so the table appears while the turn continues.
+                for extraction_sse in await self._drain_document_extractions(
+                    session_id, user_id
+                ):
+                    yield extraction_sse
 
                 # Format as SSE event and yield (including done event after metadata)
                 sse_event = self._format_sse_event(event)
@@ -1391,7 +1657,7 @@ class StreamCoordinator:
                         # rail with no flash; the full html-bearing resource
                         # follows below and mounts the iframe.
                         for sse in self._emit_ui_app_header_for_tool(
-                            tname, tuid, ui_header_emitted
+                            tname, tuid, ui_header_emitted, user_id=user_id
                         ):
                             yield sse
                         for sse in await self._emit_ui_resource_for_tool(
@@ -1490,19 +1756,33 @@ class StreamCoordinator:
             # the `except` arm below.
             turn_usage_recorded = True
 
-            # Always update session metadata (for last_model, message_count, etc.)
-            await self._update_session_metadata(
-                session_id=session_id,
-                user_id=user_id,
-                message_id=message_id,  # May be None if no assistant messages
-                agent=main_agent_wrapper,  # Use wrapper instead of internal agent
-            )
+            # The user can delete the conversation while it streams (#1764).
+            # Its delete cleanup has already run by then, so the session writes
+            # below would only leave records behind for a conversation that is
+            # gone. Cost rows are still written: the turn was billed either way.
+            from apis.shared.sessions.metadata import session_is_deleted
+
+            session_deleted = await session_is_deleted(session_id, user_id)
+            if session_deleted:
+                logger.warning(
+                    "Session %s was deleted during the turn; skipping post-turn session writes",
+                    session_id,
+                )
+            else:
+                # Update session metadata (for last_model, message_count, etc.)
+                await self._update_session_metadata(
+                    session_id=session_id,
+                    user_id=user_id,
+                    message_id=message_id,  # May be None if no assistant messages
+                    agent=main_agent_wrapper,  # Use wrapper instead of internal agent
+                )
 
             # Store message-level metadata for assistant messages created during this stream
             # Use individual per-message metadata if we tracked it, otherwise fallback to accumulated
             message_ids_to_store = assistant_message_ids if assistant_message_ids else ([message_id] if message_id is not None else [])
 
             if message_ids_to_store:
+                turn_outcome, empty_answer = self._completed_turn_outcome(agent, per_message_metadata)
                 await self._store_turn_call_metadata(
                     session_id=session_id,
                     user_id=user_id,
@@ -1517,6 +1797,10 @@ class StreamCoordinator:
                     citations=citations,
                     turn_agent_id=turn_agent_id,
                     turn_project_id=turn_project_id,
+                    turn_attachment_plan=turn_attachment_plan,
+                    turn_pasted_chars=turn_pasted_chars,
+                    outcome=turn_outcome,
+                    empty_answer=empty_answer,
                 )
 
             # displayText backstop. `DisplayTextHook` normally wrote this at
@@ -1525,7 +1809,7 @@ class StreamCoordinator:
             # didn't happen: a wrapper with no hook (voice, tests), or a
             # failed write. Skipped otherwise, so the normal path still makes
             # exactly one put.
-            if original_message and not self._display_text_written(main_agent_wrapper):
+            if original_message and not session_deleted and not self._display_text_written(main_agent_wrapper):
                 user_message_index = initial_message_count  # User message is first in this turn
                 try:
                     from apis.shared.sessions.metadata import store_user_display_text
@@ -1547,11 +1831,12 @@ class StreamCoordinator:
             # jumps to an `except` below, leaving the marker in place so the
             # next turn can re-send the attachments the model never saw. See
             # `set_pending_attachments` for the full lifecycle.
-            try:
-                from apis.shared.sessions.metadata import clear_pending_attachments
-                await clear_pending_attachments(session_id, user_id)
-            except Exception as e:
-                logger.error(f"Failed to clear pending attachments: {e}", exc_info=True)
+            if not session_deleted:
+                try:
+                    from apis.shared.sessions.metadata import clear_pending_attachments
+                    await clear_pending_attachments(session_id, user_id)
+                except Exception as e:
+                    logger.error(f"Failed to clear pending attachments: {e}", exc_info=True)
 
             # Same reasoning, applied to the interrupted-turn marker: a turn
             # that reached here produced a COMPLETE answer, so it was not
@@ -1581,11 +1866,12 @@ class StreamCoordinator:
             # happened. That is what this does. The real interruption arms
             # below re-set it after persisting their partial, so a genuine
             # interruption is unaffected.
-            try:
-                from apis.shared.sessions.metadata import clear_interrupted_turn
-                await clear_interrupted_turn(session_id, user_id)
-            except Exception as e:
-                logger.error(f"Failed to clear stale interrupted_turn: {e}", exc_info=True)
+            if not session_deleted:
+                try:
+                    from apis.shared.sessions.metadata import clear_interrupted_turn
+                    await clear_interrupted_turn(session_id, user_id)
+                except Exception as e:
+                    logger.error(f"Failed to clear stale interrupted_turn: {e}", exc_info=True)
 
             # Conversation search's archive (docs/specs/conversation-search.md
             # §4): one S3 object per turn, written in a background task. Last,
@@ -1597,22 +1883,25 @@ class StreamCoordinator:
             # message, and `message_id` then falls back to the session
             # manager's stale per-instance count (it once landed a resume on
             # the previous turn's key).
+            # Set even when the session was deleted, so the failure arms below
+            # don't archive the turn either.
             turn_archived = True
-            try:
-                from apis.shared.conversation_archive.live import schedule_turn_archive
-                archive_messages = getattr(agent, "messages", None) or []
-                schedule_turn_archive(
-                    messages=archive_messages,
-                    user_id=user_id,
-                    session_id=session_id,
-                    turn_first_index=initial_message_count,
-                    appended_count=appended_since(archive_messages, archive_anchor),
-                    original_message=original_message,
-                    project_id=turn_project_id,
-                    assistant_id=turn_agent_id,
-                )
-            except Exception as e:
-                logger.error(f"Failed to schedule conversation archive write: {e}", exc_info=True)
+            if not session_deleted:
+                try:
+                    from apis.shared.conversation_archive.live import schedule_turn_archive
+                    archive_messages = getattr(agent, "messages", None) or []
+                    schedule_turn_archive(
+                        messages=archive_messages,
+                        user_id=user_id,
+                        session_id=session_id,
+                        turn_first_index=initial_message_count,
+                        appended_count=appended_since(archive_messages, archive_anchor),
+                        original_message=original_message,
+                        project_id=turn_project_id,
+                        assistant_id=turn_agent_id,
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to schedule conversation archive write: {e}", exc_info=True)
 
         except _CooperativeStopSignal:
             # Deliberate user Stop observed mid-stream (see the in-loop check).
@@ -1648,6 +1937,8 @@ class StreamCoordinator:
                 citations=citations,
                 turn_agent_id=turn_agent_id,
                 turn_project_id=turn_project_id,
+                turn_attachment_plan=turn_attachment_plan,
+                turn_pasted_chars=turn_pasted_chars,
                 meter_usage=meter_usage,
                 model_retries=model_retries_seen,
             )
@@ -1699,6 +1990,8 @@ class StreamCoordinator:
                 citations=citations,
                 turn_agent_id=turn_agent_id,
                 turn_project_id=turn_project_id,
+                turn_attachment_plan=turn_attachment_plan,
+                turn_pasted_chars=turn_pasted_chars,
                 meter_usage=meter_usage,
                 model_retries=model_retries_seen,
             )
@@ -1748,7 +2041,7 @@ class StreamCoordinator:
                     session_id=session_id,
                     user_id=user_id,
                     caching_enabled=False,
-                    long_term_memory=_long_term_memory_of(main_agent_wrapper),
+                    memory_extraction=_memory_extraction_of(main_agent_wrapper),
                 )
                 persist_synthetic_messages(
                     persist_session_manager,
@@ -1776,6 +2069,8 @@ class StreamCoordinator:
                     citations=citations,
                     turn_agent_id=turn_agent_id,
                     turn_project_id=turn_project_id,
+                    turn_attachment_plan=turn_attachment_plan,
+                    turn_pasted_chars=turn_pasted_chars,
                 )
         finally:
             # The first model output was the stream's last event (or the turn
@@ -1800,6 +2095,108 @@ class StreamCoordinator:
                         "MCP Apps broker unsubscribe failed", exc_info=True
                     )
 
+            # Same contract for the provenance broker: anything still queued
+            # when the stream ends is already persisted as a `SRCV#` row, so
+            # dropping it here loses nothing and leaves no residue for the next
+            # turn on this conversation to emit out of order.
+            try:
+                from apis.shared.files.provenance_broker import discard_provenance
+
+                discard_provenance(user_id, session_id)
+            except Exception:  # noqa: BLE001
+                logger.debug("source provenance discard failed", exc_info=True)
+
+            # Stop the turn's analyze_spreadsheet sandbox (#259). The agent's
+            # AfterInvocationEvent normally does this; a dropped client can
+            # skip it, so release here too. Idempotent.
+            try:
+                sandbox_hook = getattr(main_agent_wrapper, "analyze_sandbox_hook", None)
+                if sandbox_hook is not None:
+                    await sandbox_hook.release()
+            except Exception:  # noqa: BLE001
+                logger.debug("analyze sandbox release failed", exc_info=True)
+
+    @staticmethod
+    def _completed_turn_outcome(
+        agent: Any, per_message_metadata: List[Dict[str, Any]]
+    ) -> Tuple[str, bool]:
+        """``(outcome, empty_answer)`` for a turn that reached the success path.
+
+        A turn that paused for the user (OAuth consent, an approval, a
+        question, a browser sign-in) is ``paused``, never an empty answer: its
+        last call ends on the tool use the user is now answering, which is the
+        normal shape of a pause. Any other turn is ``completed``, and an empty
+        answer when its final model call streamed no text — the failure the
+        eval harness found on dev 2026-10-30, a turn whose last visible words
+        were a tool preamble ("Now let me verify:") and whose final call said
+        nothing. Read off facts already in memory, after the stream.
+        """
+        interrupt_state = getattr(agent, "_interrupt_state", None)
+        if interrupt_state is not None and getattr(interrupt_state, "activated", False) is True:
+            return "paused", False
+        final_call = per_message_metadata[-1] if per_message_metadata else None
+        # A call the provider declined is not the empty-answer defect: the
+        # user saw the declined notice, and the model chose not to answer.
+        empty = final_call is not None and not final_call.get("has_text") and not final_call.get("declined")
+        return "completed", empty
+
+    @staticmethod
+    def _new_call_slot(call_index: int) -> Dict[str, Any]:
+        """A ``per_message_metadata`` entry for one model call.
+
+        ``call_index`` is the call's position plus the retries so far: the
+        hooks that key per-call data by model call (prefix fingerprints, tool
+        census, context ledger) count every BeforeModelCallEvent, retried
+        attempts included.
+        """
+        return {
+            "usage": {},
+            "metrics": {},
+            "start_time": time.time(),  # When this message started
+            "first_token_time": None,  # When first token was received
+            "end_time": None,  # When this message ended
+            "call_index": call_index,
+            # Lengths of what the call streamed, for `outputChars`.
+            "text_chars": 0,
+            "reasoning_chars": 0,
+            "reasoning_signature_chars": 0,
+        }
+
+    @staticmethod
+    def _count_reasoning(slot: Dict[str, Any], data: Any) -> None:
+        """Add one reasoning event's lengths to its call slot. Lengths only."""
+        if not isinstance(data, dict):
+            return
+        text = data.get("reasoningText")
+        if isinstance(text, str):
+            slot["reasoning_chars"] = slot.get("reasoning_chars", 0) + len(text)
+        signature = data.get("reasoning_signature")
+        if isinstance(signature, str):
+            slot["reasoning_signature_chars"] = slot.get("reasoning_signature_chars", 0) + len(signature)
+
+    @staticmethod
+    def _output_chars(slot: Any) -> Optional[Dict[str, int]]:
+        """``outputChars`` for a call's cost row, or ``None`` when it streamed
+        nothing measurable or the cost diagnostics are off.
+
+        ``text`` is the answer the call streamed and ``reasoning`` the thinking
+        it streamed. ``reasoningSignature`` is the length of the reasoning
+        block's signature: with summarized thinking the streamed text is a
+        short summary while the signature carries the full thinking, so its
+        length is what tracks the reasoning share of the billed output tokens
+        (see ``REASONING_SIGNATURE_CHARS_PER_TOKEN`` in the compaction policy).
+        What the model wrote to call tools is the census's ``inputChars``.
+        """
+        if not isinstance(slot, dict) or not cost_diagnostics_enabled():
+            return None
+        chars = {
+            "text": slot.get("text_chars", 0),
+            "reasoning": slot.get("reasoning_chars", 0),
+            "reasoningSignature": slot.get("reasoning_signature_chars", 0),
+        }
+        chars = {name: count for name, count in chars.items() if isinstance(count, int) and count > 0}
+        return chars or None
+
     @staticmethod
     def _last_persisted_role(agent: Any) -> Optional[str]:
         """Role of the message at the tail of ``agent.messages``, or ``None``.
@@ -1823,6 +2220,54 @@ class StreamCoordinator:
             logger.debug("Could not read agent.messages tail for alternation guard", exc_info=True)
         return None
 
+    @staticmethod
+    def _append_interrupted_reply(
+        agent: Any,
+        session_id: str,
+        message: str,
+        *,
+        tail: Optional[Dict[str, Any]],
+        history_len: int,
+    ) -> bool:
+        """Give the live conversation the synthetic reply Memory just got.
+
+        ``persist_synthetic_messages`` writes straight to Memory and nothing
+        appends it to ``agent.messages``. The next turn usually hits the agent
+        cache, where ``initialize()`` never re-runs, so without this the model
+        answers the follow-up from ``[question, follow-up]`` with no partial,
+        while a later restore from Memory produces a different history and
+        re-writes the cached prefix. Same class as #741 and #751.
+
+        Appends **in place**: the list is aliased across every agent serving
+        this ``(session, user)`` (``_adopt_session_conversation``), so one
+        append reaches all of them and nothing is held on this instance. The
+        message is the exact dict ``persist_synthetic_messages`` stores, so a
+        later restore serializes it byte for byte the same.
+
+        Skipped when the list moved since the alternation decision was made
+        (a new turn already appended its prompt): appending now would land the
+        reply after the wrong user turn. Returns whether it appended.
+        """
+        try:
+            messages = getattr(agent, "messages", None)
+            if not isinstance(messages, list):
+                return False
+            if len(messages) != history_len or (messages[-1] if messages else None) is not tail:
+                logger.warning(
+                    "Session %s: conversation moved before the interrupted reply "
+                    "could join it in process; Memory holds it, this process does not",
+                    session_id,
+                )
+                return False
+            messages.append({"role": "assistant", "content": [{"text": message}]})
+            return True
+        except Exception:  # noqa: BLE001 - best-effort, like the rest of the teardown
+            logger.error(
+                "Failed to append interrupted reply to the live conversation for session %s",
+                session_id, exc_info=True,
+            )
+            return False
+
     async def _persist_interruption(
         self,
         agent: Any,
@@ -1842,6 +2287,8 @@ class StreamCoordinator:
         citations: Optional[List] = None,
         turn_agent_id: Optional[str] = None,
         turn_project_id: Optional[str] = None,
+        turn_attachment_plan: Optional[Dict[str, Any]] = None,
+        turn_pasted_chars: Optional[int] = None,
         meter_usage: bool = True,
         model_retries: int = 0,
         original_message: Optional[str] = None,
@@ -1884,6 +2331,9 @@ class StreamCoordinator:
         Whenever nothing is persisted, only the marker is set. The write itself
         also passes ``last_persisted_role`` to ``persist_synthetic_messages`` so
         the centralized alternation guard is the single enforcement point.
+        Whatever Memory gets, the live conversation gets too
+        (``_append_interrupted_reply``), so the next turn's model sees the
+        partial and the in-process history matches what a restore would build.
 
         ``history_count``, when passed, supersedes ``initial_message_count``
         and is resolved inside the shielded task, so the teardown cannot
@@ -1910,10 +2360,17 @@ class StreamCoordinator:
                 base_index = await history_count.resolve()
             text = partial_text.strip()
             last_role = None
+            tail = None
+            history_len = 0
+            archive_messages: List[Dict[str, Any]] = []
             try:
                 messages = getattr(agent, "messages", None) or []
                 if messages:
-                    last_role = messages[-1].get("role")
+                    tail = messages[-1]
+                    last_role = tail.get("role")
+                history_len = len(messages)
+                if archive_appended_count is not None:
+                    archive_messages = list(messages)
             except Exception:  # noqa: BLE001 - diagnostic only
                 logger.debug("Could not read agent.messages tail", exc_info=True)
 
@@ -1935,7 +2392,7 @@ class StreamCoordinator:
                         session_id=session_id,
                         user_id=user_id,
                         caching_enabled=False,
-                        long_term_memory=_long_term_memory_of(main_agent_wrapper),
+                        memory_extraction=_memory_extraction_of(main_agent_wrapper),
                     )
                     partial_persisted = persist_synthetic_messages(
                         persist_session_manager,
@@ -1962,7 +2419,6 @@ class StreamCoordinator:
                 try:
                     from apis.shared.conversation_archive.live import schedule_turn_archive
 
-                    archive_messages = list(getattr(agent, "messages", None) or [])
                     appended = archive_appended_count
                     if partial_persisted and text:
                         archive_messages.append({"role": "assistant", "content": [{"text": text}]})
@@ -2014,10 +2470,11 @@ class StreamCoordinator:
             # tail is the turn's user or tool-result message, so a model call
             # was streaming or awaiting its first token). A cut generation
             # often never delivered the provider's terminal usage event, so
-            # its input side falls back to the context-attribution projection
-            # (output unknown, priced at zero). Never projected for a Stop
-            # during tool execution: the projection then describes the last
-            # completed call, which is already metered.
+            # its whole usage is estimated — prompt size, the tokens of the
+            # partial we streamed, and the cache bucket the prompt belongs in
+            # — and the row says so (`interrupted_usage`). Never estimated for
+            # a Stop during tool execution: the projection then describes the
+            # last completed call, which is already metered.
             if meter_usage and main_agent_wrapper is not None:
                 try:
                     await self._update_session_metadata(
@@ -2041,15 +2498,19 @@ class StreamCoordinator:
                             else current_assistant_message_index + 1
                         )
                         if in_flight_idx not in metered:
-                            projected = self._projected_input_usage(agent)
-                            if projected:
+                            estimated = await self._interrupted_call_usage(
+                                strands_agent=agent,
+                                wrapper=main_agent_wrapper,
+                                partial_text=text,
+                            )
+                            if estimated:
                                 while len(slots) <= in_flight_idx:
                                     # Its hooks' index counts this turn's
                                     # retried attempts, like any slot's.
                                     slots.append(
                                         {"usage": {}, "metrics": {}, "call_index": len(slots) + model_retries}
                                     )
-                                slots[in_flight_idx] = {**slots[in_flight_idx], "usage": projected}
+                                slots[in_flight_idx] = {**slots[in_flight_idx], **estimated}
                                 metered.append(in_flight_idx)
 
                     if metered:
@@ -2067,9 +2528,16 @@ class StreamCoordinator:
                             citations=citations,
                             turn_agent_id=turn_agent_id,
                             turn_project_id=turn_project_id,
+                            turn_attachment_plan=turn_attachment_plan,
+                            turn_pasted_chars=turn_pasted_chars,
                             # The breakdown describes the call in flight, so
                             # only a row for that call may carry it.
                             attach_context_breakdown=metered[-1] == in_flight_idx,
+                            # A Stop the coordinator saw is `stopped`; a turn
+                            # torn down by the connection closing is
+                            # `interrupted` (that includes a Stop whose signal
+                            # lost the race with the disconnect).
+                            outcome="stopped" if reason == "user_stopped" else "interrupted",
                         )
                     logger.info(
                         "📊 Metered interrupted turn for session %s: %d model call(s) (in flight: %s)",
@@ -2081,6 +2549,16 @@ class StreamCoordinator:
                         session_id, meta_error, exc_info=True,
                     )
 
+            # Last, after metering: the in-flight estimate describes the
+            # request the cut call sent, and its native count is keyed to that
+            # request's message count (``get_projected_input_tokens``). With
+            # the reply appended first the count no longer matched, a first
+            # turn had no fallback, and the stopped call went unmetered.
+            if partial_persisted:
+                self._append_interrupted_reply(
+                    agent, session_id, message, tail=tail, history_len=history_len
+                )
+
         try:
             await asyncio.shield(asyncio.ensure_future(_do()))
         except asyncio.CancelledError:
@@ -2089,30 +2567,42 @@ class StreamCoordinator:
             # shield). Swallow here and let the caller re-raise the original.
             logger.debug("interrupted-turn persistence shield cancelled; inner write continues")
 
-    def _projected_input_usage(self, agent: Any) -> Optional[Dict[str, Any]]:
-        """Best-effort input-token usage for an interrupted turn.
+    async def _interrupted_call_usage(
+        self,
+        *,
+        strands_agent: Any,
+        wrapper: Any,
+        partial_text: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Estimated usage for the model call this interruption cut off.
 
         A cut generation frequently never delivers Bedrock's terminal usage
-        event, so ``accumulated_metadata['usage']`` is empty and the turn
-        would persist with no token/cost/context data. The context-attribution
-        hook keeps the best input size it has for the call in flight — a
-        native count of the exact request when it measured one, else Strands'
-        usage-anchored projection (see ``get_projected_input_tokens``). Output
-        is unknown — the turn never finished — so it's reported as zero
-        (input-side cost only). Returns ``None`` if no projection is
-        available, leaving the caller to persist whatever it has.
+        event, so ``accumulated_metadata['usage']`` is empty and the call
+        would reach the cost row with nothing on it. Everything that can be
+        established about what it consumed — the projected prompt size, the
+        tokens of the answer we streamed, and which billing bucket the prompt
+        belongs in — is assembled in
+        :mod:`agents.main_agent.streaming.interrupted_usage`, which also
+        records the method behind each figure so the row never presents an
+        estimate as a measurement.
+
+        Returns the slot payload to merge (``usage`` + ``usageEstimate``), or
+        ``None`` when the input size cannot be established — there is no
+        honest row to write then. Runs inside the shielded teardown task,
+        after the stream is over; never on the path to a first token.
         """
         try:
-            from agents.main_agent.session.hooks.context_attribution import (
-                get_projected_input_tokens,
+            from agents.main_agent.streaming.interrupted_usage import (
+                build_interrupted_call_usage,
             )
 
-            total = get_projected_input_tokens(agent)
-            if not total or total <= 0:
-                return None
-            return {"inputTokens": int(total), "outputTokens": 0, "totalTokens": int(total)}
+            return await build_interrupted_call_usage(
+                strands_agent=strands_agent,
+                wrapper=wrapper,
+                partial_text=partial_text,
+            )
         except Exception:  # noqa: BLE001 - best-effort enrichment only
-            logger.debug("Could not project interrupted-turn input usage", exc_info=True)
+            logger.debug("Could not estimate interrupted-turn usage", exc_info=True)
             return None
 
     async def _persist_paused_turn_snapshot(
@@ -2131,16 +2621,16 @@ class StreamCoordinator:
         interrupt extractors so any flavor of pause (OAuth consent, tool
         approval, future variants) gets a snapshot. Multiple interrupts in
         the same turn share one snapshot; they were all built against the
-        same agent. TTL matches AgentCore Identity's consent window so stale
-        snapshots don't pin storage and a too-late resume returns a clean
-        400.
+        same agent. The resume window is ``paused_turn_ttl``: an hour for an
+        attended turn, a week for a headless run, whose owner was not watching
+        when it paused. A too-late resume streams a conversational refusal
+        (``ResumeUnavailable`` in the chat route), never an HTTP error.
 
         Persistence is best-effort: a DynamoDB write failure logs but does
         not break the live SSE flow.
         """
-        from datetime import timedelta
         from apis.shared.sessions.metadata import set_paused_turn
-        from apis.shared.sessions.models import PausedTurnSnapshot
+        from apis.shared.sessions.models import PausedTurnSnapshot, paused_turn_ttl
 
         interrupt_state = getattr(agent, "_interrupt_state", None)
         if not interrupt_state or not getattr(interrupt_state, "activated", False):
@@ -2167,16 +2657,19 @@ class StreamCoordinator:
                 caching_enabled=snapshot_source.get("caching_enabled"),
                 max_tokens=inference_params.get("max_tokens"),
                 agent_type=snapshot_source.get("agent_type"),
+                client_surface=snapshot_source.get("client_surface"),
+                client_tools=snapshot_source.get("client_tools"),
                 enabled_skills=snapshot_source.get("enabled_skills"),
                 inference_params=dict(inference_params) if inference_params else None,
                 mantle_api_mode=snapshot_source.get("mantle_api_mode"),
                 mantle_region=snapshot_source.get("mantle_region"),
                 assistant_id=snapshot_source.get("assistant_id"),
                 memory_binding=snapshot_source.get("memory_binding"),
+                memory_mode=snapshot_source.get("memory_mode"),
                 memory_context=snapshot_source.get("memory_context"),
                 text_only_model=snapshot_source.get("text_only_model"),
                 captured_at=now.isoformat(),
-                expires_at=(now + timedelta(hours=1)).isoformat(),
+                expires_at=(now + paused_turn_ttl(session_id)).isoformat(),
             )
             await set_paused_turn(session_id, user_id, snapshot)
         except Exception as e:
@@ -2478,6 +2971,139 @@ class StreamCoordinator:
             )
         return events
 
+    async def _extract_mcp_elicitation_required_events(
+        self,
+        agent: Any,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> List[str]:
+        """Yield one SSE-formatted ``mcp_elicitation_required`` event per form
+        an MCP server is waiting on, persisting each one so the form rehydrates
+        after a refresh (``docs/specs/mcp-elicitation.md`` §4).
+
+        Raised by ``elicitation_middleware`` through
+        ``ExecuteToolContext.interrupt``; Strands stops for it exactly as it
+        does for a hook or tool interrupt, so the ``PausedTurnSnapshot`` on
+        this same ``done`` event covers it. One difference from the other
+        extractors: a call that elicits twice pauses twice, and the first
+        round's interrupt is still in the state, answered. Only an unanswered
+        one is a form to show.
+
+        Persistence is best-effort, as for the other kinds.
+        """
+        from apis.shared.mcp_elicitation.forms import (
+            ELICITATION_EVENT_TYPE,
+            event_payload,
+            event_sse,
+        )
+        from apis.shared.sessions.metadata import add_pending_interrupt
+        from apis.shared.sessions.models import PendingInterrupt
+
+        interrupt_state = getattr(agent, "_interrupt_state", None)
+        if not interrupt_state or not getattr(interrupt_state, "activated", False):
+            return []
+
+        events: List[str] = []
+        for interrupt in interrupt_state.interrupts.values():
+            reason = interrupt.reason or {}
+            if not isinstance(reason, dict) or reason.get("type") != ELICITATION_EVENT_TYPE:
+                continue
+            if interrupt.response is not None:
+                continue
+            if not reason.get("fields"):
+                logger.warning("MCP elicitation interrupt has no fields: id=%s", interrupt.id)
+                continue
+
+            if session_id and user_id:
+                try:
+                    await add_pending_interrupt(
+                        session_id=session_id,
+                        user_id=user_id,
+                        interrupt=PendingInterrupt(
+                            interrupt_id=interrupt.id,
+                            kind="mcp_elicitation",
+                            tool_use_id=reason.get("toolUseId") or None,
+                            tool_name=reason.get("toolName") or None,
+                            elicitation=json.dumps(event_payload(interrupt.id, reason)),
+                            created_at=datetime.now(timezone.utc).isoformat(),
+                        ),
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to persist mcp_elicitation pending_interrupt %s: %s",
+                        interrupt.id, e, exc_info=True,
+                    )
+
+            events.append(event_sse(interrupt.id, reason))
+        return events
+
+    async def _extract_client_tool_call_events(
+        self,
+        agent: Any,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> List[str]:
+        """Yield one SSE-formatted `client_tool_call` event per pending
+        client-executed tool interrupt (``apis.shared.client_tools``).
+
+        Same shape as :meth:`_extract_user_question_required_events`: the tool
+        raised the interrupt itself through ``ToolContext``, and the client
+        answers by resuming with an ``interrupt_responses`` entry. Only a client
+        that declared ``client_tools`` on the request can receive one of these,
+        since only such a turn has the tools to call.
+        """
+        from apis.shared.client_tools import ClientToolCallEvent, INTERRUPT_TYPE
+        from apis.shared.sessions.metadata import add_pending_interrupt
+        from apis.shared.sessions.models import PendingInterrupt
+
+        interrupt_state = getattr(agent, "_interrupt_state", None)
+        if not interrupt_state or not getattr(interrupt_state, "activated", False):
+            return []
+
+        events: List[str] = []
+        for interrupt in interrupt_state.interrupts.values():
+            reason = interrupt.reason or {}
+            if not isinstance(reason, dict) or reason.get("type") != INTERRUPT_TYPE:
+                continue
+            tool_name = str(reason.get("toolName") or "")
+            if not tool_name:
+                logger.warning("client_tool_call interrupt has no toolName: id=%s", interrupt.id)
+                continue
+            tool_use_id = str(reason.get("toolUseId") or "")
+            arguments = reason.get("arguments")
+            if not isinstance(arguments, dict):
+                arguments = {}
+
+            if session_id and user_id:
+                try:
+                    await add_pending_interrupt(
+                        session_id=session_id,
+                        user_id=user_id,
+                        interrupt=PendingInterrupt(
+                            interrupt_id=interrupt.id,
+                            kind="client_tool",
+                            tool_use_id=tool_use_id,
+                            tool_name=tool_name,
+                            tool_input=json.dumps(arguments, default=str),
+                            created_at=datetime.now(timezone.utc).isoformat(),
+                        ),
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to persist client_tool pending_interrupt %s: %s",
+                        interrupt.id, e, exc_info=True,
+                    )
+
+            events.append(
+                ClientToolCallEvent(
+                    interrupt_id=interrupt.id,
+                    tool_use_id=tool_use_id,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                ).to_sse_format()
+            )
+        return events
+
     async def _extract_browser_login_required_events(
         self,
         agent: Any,
@@ -2586,12 +3212,12 @@ class StreamCoordinator:
                 deadline_at=ref.deadline_at,
                 target_url=ref.target_url,
                 reason=prompt_reason,
-                # Same origin MCP Apps are framed from, and for the same
-                # reasons: its CloudFront function locks `frame-ancestors` to
-                # the SPA and composes `connect-src` from `?csp=`, which is how
-                # the viewer is allowed to open DCV's WebSocket. Empty when the
-                # sandbox origin is not deployed — the SPA then shows the
-                # prompt without a viewer rather than framing nothing.
+                # Only "is a viewer deployed": the mcp-sandbox origin ships
+                # beside the viewer's own distribution, and is empty when it is
+                # not deployed, in which case the SPA shows the prompt without
+                # a viewer. The SPA never frames the viewer from this origin —
+                # MCP Apps run there — and takes the viewer's own origin from
+                # app-api's mint response, so the Runtime carries no new env.
                 sandbox_origin=os.environ.get(
                     "AGENTCORE_MCP_APPS_SANDBOX_ORIGIN", ""
                 ).strip(),
@@ -2688,6 +3314,7 @@ class StreamCoordinator:
         tool_name: Optional[str],
         tool_use_id: Optional[str],
         emitted: set,
+        user_id: Optional[str] = None,
     ) -> List[str]:
         """Emit a UI tool's instant header-only `ui_resource` shell (empty html).
 
@@ -2709,7 +3336,7 @@ class StreamCoordinator:
         if not tool_use_id or not tool_name or tool_use_id in emitted:
             return []
         try:
-            payload = build_ui_app_header(tool_name, tool_use_id)
+            payload = build_ui_app_header(tool_name, tool_use_id, user_id)
             if payload is None:
                 return []
             emitted.add(tool_use_id)
@@ -2765,7 +3392,7 @@ class StreamCoordinator:
 
         try:
             payload = await asyncio.to_thread(
-                fetch_ui_resource, tool_name, tool_use_id
+                fetch_ui_resource, tool_name, tool_use_id, user_id
             )
             if payload is None:
                 return []
@@ -3194,6 +3821,14 @@ class StreamCoordinator:
             batch_id = str(batch.get("batchId") or "")
             tool_use_ids = [str(t) for t in (batch.get("toolUseIds") or [])]
 
+            # Deleted mid-turn (#1764): the delete cleanup has run, so a row
+            # written now would outlive the conversation.
+            from apis.shared.sessions.metadata import session_is_deleted
+
+            if await session_is_deleted(session_id, user_id):
+                logger.info("Session %s was deleted; tool batch summary not stored", session_id)
+                return None
+
             # Persist before returning: the emit loop may never get to this
             # payload (cancelled turn, dropped connection), but the row is
             # what makes the summary survive a reload either way.
@@ -3217,6 +3852,75 @@ class StreamCoordinator:
         except Exception:  # noqa: BLE001 - a summary is never worth an error
             logger.debug("Tool batch summary task failed", exc_info=True)
             return None
+
+    @staticmethod
+    async def _drain_source_provenance_events(session_id: str, user_id: str) -> List[str]:
+        """Harvest `verify_sources` verdicts into `source_provenance` SSEs.
+
+        The verdicts are already persisted by the tool, so this is purely the
+        live view: nothing here is load-bearing for a reload, and a failure
+        costs the user the mid-turn update and nothing else.
+
+        Keyed on `(user_id, session_id)` because a session id alone does not
+        name a conversation (CLAUDE.md) — two users on one session id must
+        never drain each other's quoted document text.
+        """
+        from apis.shared.feature_flags import source_provenance_enabled
+
+        if not source_provenance_enabled():
+            return []
+        try:
+            from apis.shared.files.provenance_broker import take_provenance
+
+            payloads = take_provenance(user_id, session_id)
+        except Exception:  # noqa: BLE001 - never worth breaking the stream
+            logger.debug("source provenance drain failed", exc_info=True)
+            return []
+
+        events: List[str] = []
+        for payload in payloads:
+            event = {
+                "type": "source_provenance",
+                "sessionId": session_id,
+                "toolUseId": payload.get("toolUseId", ""),
+                "claims": payload.get("claims") or [],
+            }
+            events.append(
+                f"event: source_provenance\ndata: {json.dumps(event)}\n\n"
+            )
+        return events
+
+    @staticmethod
+    async def _drain_document_extractions(session_id: str, user_id: str) -> List[str]:
+        """Harvest `document_extract` runs into `document_extraction` SSEs.
+
+        The rows are already persisted by the tool, so this is purely the live
+        view: nothing here is load-bearing for a reload, and a failure costs
+        the user the mid-turn table and nothing else.
+
+        Keyed on `(user_id, session_id)` because a session id alone does not
+        name a conversation (CLAUDE.md) — two users on one session id must
+        never drain each other's extracted document values.
+        """
+        from apis.shared.feature_flags import document_extract_enabled
+
+        if not document_extract_enabled():
+            return []
+        try:
+            from apis.shared.extraction.extraction_broker import take_extractions
+
+            payloads = take_extractions(user_id, session_id)
+        except Exception:  # noqa: BLE001 - never worth breaking the stream
+            logger.debug("document extraction drain failed", exc_info=True)
+            return []
+
+        events: List[str] = []
+        for payload in payloads:
+            event = {"type": "document_extraction", "sessionId": session_id, **payload}
+            events.append(
+                f"event: document_extraction\ndata: {json.dumps(event)}\n\n"
+            )
+        return events
 
     @staticmethod
     async def _collect_tool_summary_events(
@@ -3574,7 +4278,11 @@ class StreamCoordinator:
         citations: Optional[List],
         turn_agent_id: Optional[str],
         turn_project_id: Optional[str],
+        turn_attachment_plan: Optional[Dict[str, Any]] = None,
+        turn_pasted_chars: Optional[int] = None,
         attach_context_breakdown: bool = True,
+        outcome: Optional[str] = None,
+        empty_answer: bool = False,
     ) -> None:
         """Write one cost row per model call of this turn, in call order.
 
@@ -3588,6 +4296,11 @@ class StreamCoordinator:
         ``attach_context_breakdown`` is off for a failed turn: the breakdown
         describes the turn's last *attempted* call, which on a failure may be
         the one that never answered rather than the last row written.
+
+        ``outcome`` is how the turn ended (:data:`TURN_OUTCOMES`) and goes on
+        every row of the turn, so a filter on any one call sees it;
+        ``empty_answer`` is a fact about the turn's final call and goes on the
+        last row only, which is the one row per turn a count reads.
         """
         # Content-free tool census, read (not drained) per call so each
         # cost row carries the tools that call requested. None when the
@@ -3674,6 +4387,12 @@ class StreamCoordinator:
                     include_context_breakdown=attach_context_breakdown and is_last,
                     turn_agent_id=turn_agent_id,  # Which Agent ran this turn (#756)
                     turn_project_id=turn_project_id,
+                    # The turn's attachment plan, on its last row only (a turn counts once there).
+                    turn_attachment_plan=turn_attachment_plan if is_last else None,
+                    # How much of the user's message was pasted, on the same row (a count only).
+                    turn_pasted_chars=turn_pasted_chars if is_last else None,
+                    turn_outcome=outcome,
+                    empty_answer=empty_answer and is_last,
                     tool_calls=(
                         tool_census_hook.tally_for_call(hook_index)
                         if tool_census_hook is not None else None
@@ -3715,6 +4434,8 @@ class StreamCoordinator:
         citations: Optional[List],
         turn_agent_id: Optional[str],
         turn_project_id: Optional[str],
+        turn_attachment_plan: Optional[Dict[str, Any]] = None,
+        turn_pasted_chars: Optional[int] = None,
     ) -> None:
         """Meter the model calls a failed turn made before it failed.
 
@@ -3778,7 +4499,10 @@ class StreamCoordinator:
                 citations=citations,
                 turn_agent_id=turn_agent_id,
                 turn_project_id=turn_project_id,
+                turn_attachment_plan=turn_attachment_plan,
+                turn_pasted_chars=turn_pasted_chars,
                 attach_context_breakdown=False,
+                outcome="error",
             )
             logger.info(
                 "📊 Metered failed turn for session %s: %d of %d model call(s) reported usage",
@@ -3842,7 +4566,7 @@ class StreamCoordinator:
         self,
         session_id: str,
         user_id: str,
-        message_id: int,
+        message_id: Optional[int],
         accumulated_metadata: Dict[str, Any],
         stream_start_time: float,
         stream_end_time: float,
@@ -3852,11 +4576,17 @@ class StreamCoordinator:
         call_index: Optional[int] = None,
         turn_agent_id: Optional[str] = None,
         turn_project_id: Optional[str] = None,
+        turn_attachment_plan: Optional[Dict[str, Any]] = None,
+        turn_pasted_chars: Optional[int] = None,
         tool_calls: Optional[Dict[str, Dict[str, int]]] = None,
         context_ledger: Optional[Dict[str, Any]] = None,
         turn_duration_ms: Optional[int] = None,
         include_context_breakdown: bool = False,
-    ) -> None:
+        call_kind: Optional[str] = None,
+        prefix_fingerprint: Optional[Dict[str, Any]] = None,
+        turn_outcome: Optional[str] = None,
+        empty_answer: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         """
         Store message-level metadata (token usage, latency, model info, citations)
 
@@ -3874,6 +4604,20 @@ class StreamCoordinator:
                 look up the matching prompt-cache prefix fingerprint stashed
                 by PrefixFingerprintHook. None → latest fingerprint (single-
                 call paths like interrupted-turn persistence).
+            call_kind: Set for a call that is not a turn (``"handoff_brief"``):
+                recorded as ``callKind``, and the row is written with no
+                ``messageId`` when ``message_id`` is None.
+            prefix_fingerprint: This call's fingerprint, for a caller that ran no
+                hooks (the brief computes it over the request it sent).
+            turn_outcome: How the turn this call belongs to ended, recorded as
+                ``outcome`` (one of :data:`TURN_OUTCOMES`); None for a call
+                that is not a turn's, which then carries no ``outcome``.
+            empty_answer: Recorded as ``emptyAnswer: true`` — the turn
+                completed and its final call streamed no text. Set by the
+                caller on the turn's last row only.
+
+        Returns the row's derived cache observability (``cacheStatus`` …), or None
+        when no row was written.
         """
         try:
             from apis.shared.sessions.models import Attribution, LatencyMetrics, MessageMetadata, ModelInfo, TokenUsage
@@ -4025,6 +4769,14 @@ class StreamCoordinator:
                 )
                 if context_window is not None:
                     metadata_kwargs["contextWindow"] = context_window
+                # This call's usage was estimated, not reported: a field ->
+                # method map naming what produced each figure. Present only on
+                # the interrupted call's row (see `interrupted_usage`); its
+                # presence is also what suppresses the cache classification
+                # and `wastedUsd`, which must never be derived from a guess.
+                usage_estimate = accumulated_metadata.get("usageEstimate")
+                if usage_estimate:
+                    metadata_kwargs["usageEstimated"] = usage_estimate
                 # PR-5 experiment arm marker (extra field via extra="allow"),
                 # so the cost anatomy can split 1h-static-prefix turns from
                 # the 5m baseline without guessing from the write:read shape.
@@ -4039,10 +4791,19 @@ class StreamCoordinator:
                 # (extra field via extra="allow"; persisted on the cost row
                 # so cache misses are diagnosable component-by-component).
                 strands_agent = getattr(agent, "agent", None) if agent is not None else None
-                if strands_agent is not None:
+                if prefix_fingerprint is None and strands_agent is not None:
                     prefix_fingerprint = get_prefix_fingerprint(strands_agent, call_index)
-                    if prefix_fingerprint:
-                        metadata_kwargs["prefixFingerprints"] = prefix_fingerprint
+                if prefix_fingerprint:
+                    metadata_kwargs["prefixFingerprints"] = prefix_fingerprint
+                if call_kind:
+                    metadata_kwargs["callKind"] = call_kind
+                # How the turn ended (release-ledger spec §5.1): a closed
+                # vocabulary, no content. `emptyAnswer` is written only when
+                # true, so its absence is the normal case and costs nothing.
+                if turn_outcome in TURN_OUTCOMES:
+                    metadata_kwargs["outcome"] = turn_outcome
+                if empty_answer:
+                    metadata_kwargs["emptyAnswer"] = True
 
                 # Which Agent ran this turn (#756), as another extra field. An
                 # `@`-mention swaps the Agent for one turn, which genuinely re-writes
@@ -4053,10 +4814,39 @@ class StreamCoordinator:
                 # else on the row distinguishes them.
                 if turn_agent_id:
                     metadata_kwargs["turnAgentId"] = turn_agent_id
+                # The rewind epoch this call ran at (rewind spec §6). The
+                # metadata writer compares it with the previous call's to stamp
+                # `rewound`, which explains the history re-write a rewind past
+                # the cache TTL causes, the way `agentSwitched` explains a mention.
+                turn_session_manager = getattr(agent, "session_manager", None)
+                rewind_epoch = getattr(turn_session_manager, "_rewind_epoch", 0)
+                if isinstance(rewind_epoch, int) and rewind_epoch > 0:
+                    metadata_kwargs["rewindEpoch"] = rewind_epoch
+                # A fork's first call says where it came from and whether its
+                # history was seeded from the parent's live list (a cache hit is
+                # possible) or restored from the stored copy (it is not), so the
+                # spec's warm/cold claim is a row query. Consumed once.
+                # A call that is not a turn leaves it for the fork's first real call.
+                fork_marker = None if call_kind else getattr(turn_session_manager, "_pending_fork_marker", None)
+                if isinstance(fork_marker, dict) and fork_marker:
+                    metadata_kwargs.update(fork_marker)
+                    turn_session_manager._pending_fork_marker = None
                 # Shared Projects: which project this call is billed to. The metadata
                 # writer reads it back to bump PROJECT#{id}/COST#{YYYY-MM}.
                 if turn_project_id:
                     metadata_kwargs["projectId"] = turn_project_id
+                # How each of the turn's attachments was delivered (the planner's
+                # decision: modes, classes, reason codes, token estimates and
+                # upload ids — never a filename). Turn-level, so only the last
+                # row carries it. Written here, after the stream, never before
+                # the first token.
+                if turn_attachment_plan:
+                    metadata_kwargs["attachmentPlan"] = turn_attachment_plan
+                # Characters of the user's message that were pasted, as the composer
+                # counted them (docs/one-pagers/idle-return-context.md). A number,
+                # never text; on the turn's last row, like the attachment plan.
+                if turn_pasted_chars:
+                    metadata_kwargs["pastedChars"] = int(turn_pasted_chars)
 
                 # Content-free tool census for this call (tool name → calls /
                 # errors), another extra field. Read by the admin session
@@ -4065,6 +4855,14 @@ class StreamCoordinator:
                 # no tools or COST_DIAGNOSTICS_ENABLED=false.
                 if tool_calls:
                     metadata_kwargs["toolCalls"] = tool_calls
+
+                # What the call's output was made of: characters of answer
+                # text, of streamed reasoning, and of the reasoning signature.
+                # Lengths counted as the stream passed, never the text. Absent
+                # when the call streamed neither or COST_DIAGNOSTICS_ENABLED=false.
+                output_chars = self._output_chars(accumulated_metadata)
+                if output_chars:
+                    metadata_kwargs["outputChars"] = output_chars
 
                 # Context ledger for this call: the conversation window's
                 # cumulative trim count (a rise between consecutive rows is a
@@ -4110,7 +4908,13 @@ class StreamCoordinator:
                     try:
                         from agents.main_agent.session.document_context import summarize_document_context
 
-                        footprint = summarize_document_context(getattr(strands_agent, "messages", None))
+                        index_of = getattr(turn_session_manager, "document_index", None)
+                        footprint = summarize_document_context(
+                            getattr(strands_agent, "messages", None),
+                            index_of(getattr(getattr(agent, "model_config", None), "model_id", None))
+                            if callable(index_of)
+                            else None,
+                        )
                         if footprint:
                             metadata_kwargs.update(footprint)
                     except Exception as doc_err:  # noqa: BLE001 - never block the cost row
@@ -4135,8 +4939,11 @@ class StreamCoordinator:
 
                 message_metadata = MessageMetadata(**metadata_kwargs)
 
-                # Store metadata
-                await store_message_metadata(session_id=session_id, user_id=user_id, message_id=message_id, message_metadata=message_metadata)
+                # Store metadata. The derived cache observability comes back for a
+                # caller that records it elsewhere too (a handoff brief's HANDOFF# row).
+                return await store_message_metadata(
+                    session_id=session_id, user_id=user_id, message_id=message_id, message_metadata=message_metadata
+                )
 
         except Exception as e:
             # Log but don't raise - metadata storage failures shouldn't break streaming

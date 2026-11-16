@@ -36,10 +36,12 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List, Tuple, TYPE_CHECKING
+from typing import Optional, Dict, Any, List, Set, Tuple, TYPE_CHECKING
 
 from agents.main_agent.config.constants import Defaults, EnvVars
 from apis.shared.observability.build_stages import mark_stage
+from apis.shared.sessions.fork import ForkOrigin, ancestor_session_ids
+from apis.shared.sessions.rewind import RewindState
 
 from bedrock_agentcore.memory.integrations.strands.session_manager import AgentCoreMemorySessionManager
 from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig
@@ -50,6 +52,8 @@ from .compaction_summary import bound_summary
 
 if TYPE_CHECKING:
     from concurrent.futures import ThreadPoolExecutor
+
+    from .document_estimate import DocumentIndex
 
     from strands.agent.agent import Agent
 
@@ -69,6 +73,29 @@ _MEMORY_RETRIEVAL_THROTTLE_CODES = ("ThrottlingException", "TooManyRequestsExcep
 # Serializes replacing the retrieval client: boto3 client creation on the
 # default session is not thread-safe, and the namespaces retrieve in parallel.
 _RETRIEVAL_CLIENT_LOCK = threading.Lock()
+
+
+class LiveConversation:
+    """State that belongs to a live message LIST, not to the manager holding it.
+
+    One conversation can be served by several cached agents whose managers
+    share one aliased ``agent.messages`` (``_adopt_session_conversation``).
+    Anything that describes what the list itself reflects has to be shared the
+    same way, or the second manager acts on a list a sibling already changed.
+    ``rewind_epoch`` is the rewind (spec §4) the list has been cut to: the
+    manager that cuts it updates this, and a sibling that adopted the list sees
+    the update instead of cutting again.
+    """
+
+    __slots__ = ("rewind_epoch",)
+
+    def __init__(self, rewind_epoch: int = 0) -> None:
+        self.rewind_epoch = rewind_epoch
+
+
+# Sentinel for "no session row read is stashed", distinct from a stashed
+# ``None`` (the read ran and found no row).
+_NO_STASHED_ROW = object()
 
 
 _LTM_PREFETCH_POOL: Optional["ThreadPoolExecutor"] = None
@@ -139,7 +166,7 @@ def memory_retrieval_query(text: str) -> str:
 COMPACTION_EVENT_KINDS = frozenset({
     "applied", "checkpoint", "forced", "floor_unreachable",
     "document_stripped", "document_rehydrated", "document_offload",
-    "truncation_anchor",
+    "truncation_anchor", "image_restored",
 })
 _MAX_PENDING_COMPACTION_EVENTS = 8
 
@@ -175,6 +202,16 @@ class _SkipExtractionClient:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._client, name)
+
+
+def _agent_model_id(agent: Any) -> Optional[str]:
+    """The model id an agent sends to (Strands keeps it in ``model.config``)."""
+    try:
+        config = getattr(getattr(agent, "model", None), "config", None)
+        value = config.get("model_id") if isinstance(config, dict) else None
+        return str(value) if value else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _is_bidi_agent(agent: Any) -> bool:
@@ -220,7 +257,8 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         compaction_config: Optional[CompactionConfig] = None,
         user_id: Optional[str] = None,
         summarization_strategy_id: Optional[str] = None,
-        long_term_memory: bool = True,
+        memory_retrieval: bool = True,
+        memory_extraction: bool = True,
         **kwargs: Any,
     ):
         """
@@ -232,12 +270,13 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             compaction_config: Compaction configuration (None = disabled)
             user_id: User ID for DynamoDB session lookup
             summarization_strategy_id: Strategy ID for LTM summary retrieval
-            long_term_memory: False for an Agent conversation. Nothing is
-                retrieved into its messages, and every event it writes skips
-                long-term extraction (``_SkipExtractionClient``), so its
-                knowledge-base-augmented prompts never become facts about the
-                user. Compaction then has no extracted summary for the session
-                and uses ``_generate_fallback_summary``.
+            memory_retrieval: False means nothing is retrieved into messages
+                (Agent conversations and the "off" memory mode).
+            memory_extraction: False means every event written skips long-term
+                extraction (``_SkipExtractionClient``), so the conversation never
+                becomes facts about the user (Agent conversations, "read only"
+                and "off"). Compaction then has no extracted summary for the
+                session and uses ``_generate_fallback_summary``.
         """
         super().__init__(
             agentcore_memory_config=agentcore_memory_config,
@@ -245,8 +284,9 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             **kwargs,
         )
 
-        self.long_term_memory = long_term_memory
-        if not long_term_memory:
+        self.memory_retrieval = memory_retrieval
+        self.memory_extraction = memory_extraction
+        if not memory_extraction:
             self.memory_client.gmdp_client = _SkipExtractionClient(self.memory_client.gmdp_client)
 
         self.user_id = user_id
@@ -285,6 +325,11 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         # ``_turn_start_stamp`` is the one every head-of-turn decision reads.
         self._restore_turn_stamp: Optional[str] = None
         self._turn_start_stamp: Optional[str] = None
+        # Absolute history length at the head of this turn when the head
+        # changed the prefix without saving compaction state (a model or agent
+        # switch, a document offload); ``update_after_turn`` persists it as
+        # ``reasoning_live_from``. Per turn, consumed there.
+        self._prefix_rewritten_at: Optional[int] = None
 
         # Session control
         self.cancelled = False
@@ -297,8 +342,35 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         # dev without DynamoDB), which makes steering inert.
         self.turn_lease: Optional[Any] = None
 
-        # Message count tracking (for stream_coordinator compatibility)
+        # Message count tracking (for stream_coordinator compatibility).
+        # PHYSICAL: every stored message, including any a rewind hid, because
+        # it is the fallback base for new message indices and those are never
+        # reused (rewind spec §3, invariant 2).
         self.message_count: int = 0
+
+        # Rewind (docs/specs/conversation-rewind-and-fork.md §4). True only
+        # while the SDK's restore calls ``list_messages``, which is the one
+        # read that filters hidden messages: the coordinator counts messages
+        # with the same method and must see the physical count.
+        self._restoring: bool = False
+        self._restored_physical_count: Optional[int] = None
+        # The rewind epoch this manager's compaction state reflects. Per
+        # manager: siblings each hold their own compaction state.
+        self._rewind_epoch: int = 0
+        # What the live message list reflects; shared with siblings by
+        # ``_adopt_session_conversation``, alongside the list itself.
+        self._live_conversation: LiveConversation = LiveConversation()
+        # The session row read at the head of this turn (or during restore),
+        # handed to the compaction re-read that follows so the two share one
+        # GSI query. Consumed once.
+        self._stashed_session_row: Any = _NO_STASHED_ROW
+        # The row as the restore read it, kept for the one reader that needs it
+        # after compaction has consumed the stash: a fork's first-turn seed
+        # (``fork_origin``). None when the restore did not read the row.
+        self._restore_row: Optional[Dict] = None
+        # Set by the fork seed on a fork's first build, consumed by the first
+        # cost row: ``{"forkedFrom": <parent id>, "forkSeeded": bool}`` (spec §6).
+        self._pending_fork_marker: Optional[Dict[str, Any]] = None
 
         # Log initialization
         if compaction_config and compaction_config.enabled:
@@ -327,8 +399,44 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             logger.debug("Skipping message with empty content")
             return
 
-        super().append_message(filtered_message, agent, **kwargs)
+        super().append_message(self._persisted_form(filtered_message), agent, **kwargs)
         self.message_count += 1
+
+    def _persisted_form(self, message: Dict) -> Dict:
+        """``message`` as written to Memory: under the ``token`` profile each
+        attached document's bytes become a handle (unified-attachment-delivery
+        §6.2). The live message, which the warm agent keeps sending, is never
+        touched. Restore reads a handle as it reads bytes
+        (``document_rehydration``), so the restored prefix is the same.
+
+        The upload id comes from the rows this turn already resolved
+        (``remember_session_uploads``), matched as restore matches, so no read
+        is added. Never raises: on any doubt the message keeps its bytes.
+        """
+        try:
+            from apis.shared.files.attachment_plan import persist_document_handles
+
+            if not persist_document_handles():
+                return message
+            from apis.shared.files.attachment_handle import persisted_message, session_uploads, turn_images
+
+            from .document_rehydration import match_document
+
+            owner = (getattr(self, "user_id", None), getattr(self.config, "session_id", None))
+            uploads = session_uploads(*owner)
+            used: Set[str] = set()
+
+            def _resolve(name: str, fmt: str, size: int) -> Optional[str]:
+                ref = match_document(name, fmt, size, uploads, used) if uploads else None
+                if ref is None:
+                    return None
+                used.add(ref.upload_id)
+                return ref.upload_id
+
+            return persisted_message(message, _resolve, turn_images(*owner))
+        except Exception as e:  # noqa: BLE001 - persisting the bytes is always correct
+            logger.warning("Document handles skipped for this message: %s", e)
+            return message
 
     # ------------------------------------------------------------------
     # Long-term memory retrieval, bounded
@@ -435,7 +543,7 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         content = messages[-1].get("content")
         if not content or "text" not in content[0]:
             return None
-        if not getattr(self, "long_term_memory", True):
+        if not getattr(self, "memory_retrieval", True):
             return None
         if not getattr(self.config, "retrieval_config", None):
             return None
@@ -613,6 +721,72 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             logger.error("Failed to retrieve customer context: %s", e)
         return all_context
 
+    def list_messages(
+        self,
+        session_id: str,
+        agent_id: str,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        **kwargs: Any,
+    ) -> Any:
+        """The SDK's message list; during a restore, without rewound messages.
+
+        Filtering here, at the load, rather than after ``super().initialize()``
+        is deliberate: the SDK repairs broken tool-use pairs on the list it
+        loaded, and a repair that inserted messages would shift every position
+        a filter applied afterwards relies on (rewind spec §4.3).
+
+        Every other caller gets the unfiltered, physical list. The stream
+        coordinator counts with this same method to number the turn's new
+        messages, and those numbers must never reuse a rewound message's.
+        """
+        messages = super().list_messages(session_id, agent_id, limit=limit, offset=offset, **kwargs)
+        if not self._restoring:
+            return messages
+        if limit is None:
+            self._restored_physical_count = offset + len(messages)
+
+        from apis.shared.feature_flags import session_fork_enabled, session_rewind_enabled
+
+        rewind_on = session_rewind_enabled()
+        if not rewind_on and not session_fork_enabled():
+            return messages
+        row = self._read_session_row()
+        # The compaction load right after this restore reads the same row.
+        self._stashed_session_row = row
+        self._restore_row = row
+        if not rewind_on:
+            return messages
+        state = RewindState.from_row(row)
+        self._rewind_epoch = state.epoch
+        if not state.active:
+            return messages
+        kept = [m for i, m in enumerate(messages) if not state.is_hidden(offset + i)]
+        logger.info(
+            "Restore: rewind epoch %d hides %d of %d stored message(s)",
+            state.epoch, len(messages) - len(kept), len(messages),
+        )
+        return kept
+
+    def document_ancestor_session_ids(self) -> Tuple[str, ...]:
+        """A fork's parent and root, whose upload rows its copied document
+        blocks name; empty for any other session.
+
+        Read off the row the restore already loaded (``_restore_row``), so it
+        costs no read. Both attributes are written once when the fork is made,
+        so holding them on this instance can never go stale (unlike the
+        per-session state CLAUDE.md warns about).
+        """
+        config = getattr(self, "config", None)
+        session_id = getattr(config, "session_id", None)
+        if not session_id:
+            return ()
+        return ancestor_session_ids(session_id, getattr(self, "_restore_row", None))
+
+    def fork_origin(self) -> Optional[ForkOrigin]:
+        """Where this session was forked from, as its restore read it; None if not a fork."""
+        return ForkOrigin.from_row(self._restore_row)
+
     def read_session(self, session_id: str, **kwargs: Any) -> Any:
         """The SDK's session read, preceded by a build-stage mark.
 
@@ -649,15 +823,36 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             super().initialize(agent, **kwargs)
             return
 
+        try:
+            self._restore_text_agent(agent, **kwargs)
+        finally:
+            # Whatever the restore produced is the list this manager's
+            # siblings may adopt, so its rewind epoch is fixed here.
+            self._live_conversation = LiveConversation(self._rewind_epoch)
+
+    def _restore_text_agent(self, agent: "Agent", **kwargs: Any) -> None:
+        """``initialize`` for a text agent: the SDK restore, then compaction."""
         # Let the SDK handle all session restore logic:
         # - read/create agent in session repository
         # - restore agent state, internal state, conversation manager state
-        # - load messages from AgentCore Memory
+        # - load messages from AgentCore Memory (rewound ones filtered out,
+        #   see ``list_messages``)
         # - fix broken tool-use histories
-        super().initialize(agent, **kwargs)
+        self._restoring = True
+        self._restored_physical_count = None
+        try:
+            super().initialize(agent, **kwargs)
+        finally:
+            self._restoring = False
 
         self._total_message_count_at_init = len(agent.messages)
-        self.message_count = self._total_message_count_at_init
+        # Physical when a restore listed messages: a rewind hides some from
+        # ``agent.messages`` without freeing their indices.
+        self.message_count = (
+            self._restored_physical_count
+            if self._restored_physical_count is not None
+            else self._total_message_count_at_init
+        )
 
         # Slice 0 diagnostic: confirm what restored history a turn actually
         # sees at init. Decisive for the max_tokens "Continue" flow — on the
@@ -719,6 +914,14 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         # preserves the reference for the model without re-sending bytes.
         # Images are handled the same way inside _truncate_tool_contents, but
         # that method is gated on compaction being enabled — this one is not.
+        # Images persisted as handles (unified-attachment-delivery §6.2) are
+        # read back from the stored copy each names, byte for byte, before any
+        # other pass sees the history. A no-op without a handle.
+        try:
+            agent.messages = self._restore_image_handles(agent.messages)
+        except Exception as e:
+            logger.warning(f"Image handle restore failed, continuing: {e}", exc_info=True)
+
         try:
             agent.messages = self._strip_document_bytes(agent.messages)
         except Exception as e:
@@ -924,6 +1127,9 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             gap_seconds, previous_anchor, sliding_anchor,
         )
         state.truncation_anchor = sliding_anchor
+        # Tool results ahead of every stored message change: no replayed
+        # reasoning before this point is billed from now on.
+        state.reasoning_live_from = len(self._all_messages_for_summary)
         self._save_compaction_state(state)
         self.record_compaction_event(
             "truncation_anchor",
@@ -1032,17 +1238,32 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             logger.debug(f"GSI lookup failed: {e}")
             return None
 
+    def _read_session_row(self) -> Optional[Dict]:
+        """This session's metadata row, or None. One GSI query; never raises."""
+        if not self.user_id:
+            return None
+        try:
+            table = self._get_dynamodb_table()
+            return self._get_session_via_gsi(table) if table else None
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Session row read failed: {e}")
+            return None
+
+    def _take_session_row(self) -> Optional[Dict]:
+        """The row stashed earlier in this turn's head or restore, else a fresh read."""
+        row, self._stashed_session_row = self._stashed_session_row, _NO_STASHED_ROW
+        if row is _NO_STASHED_ROW:
+            return self._read_session_row()
+        return row
+
     def _load_compaction_state(self) -> CompactionState:
         """Load compaction state from DynamoDB session metadata."""
         if not self.user_id or not self.compaction_config or not self.compaction_config.enabled:
+            self._stashed_session_row = _NO_STASHED_ROW
             return CompactionState()
 
         try:
-            table = self._get_dynamodb_table()
-            if not table:
-                return CompactionState()
-
-            session_item = self._get_session_via_gsi(table)
+            session_item = self._take_session_row()
             if not session_item:
                 return CompactionState()
 
@@ -1353,6 +1574,7 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         current_messages: Optional[List[Dict]] = None,
         context_window: Optional[int] = None,
         history_tokens: Optional[int] = None,
+        model_id: Optional[str] = None,
     ) -> Optional[CompactionResult]:
         """
         Update compaction state after a turn completes.
@@ -1380,6 +1602,9 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
                 prompt (the ``messages`` partition of the context breakdown);
                 calibrates the per-message estimates. ``None`` → use
                 ``input_tokens``, which biases the cut slightly deeper.
+            model_id: the turn's model. Prices the per-message estimates at
+                its tokenizer factor (``tokenizer_costs``), so a held PDF's
+                page images weigh against text as that model bills them.
         """
         # In-process "when did the last turn end" for the document-offload
         # cache-gap decision when compaction (whose state stamps updated_at
@@ -1399,8 +1624,21 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         state.last_input_tokens = input_tokens
         if self._current_prefix_key:
             state.last_prefix_key = self._current_prefix_key
+        rewritten_at = getattr(self, "_prefix_rewritten_at", None)
+        if rewritten_at is not None:
+            state.reasoning_live_from = max(state.reasoning_live_from or 0, rewritten_at)
+            self._prefix_rewritten_at = None
 
         policy = CompactionPolicy.resolve(self.compaction_config, context_window)
+        # The thresholds this turn ran under, every turn, so the next turn's
+        # ``over_ceiling`` offload judges the model's own ceiling. Until a cut
+        # wrote ``policy`` the offload fell back to the window-less fixed
+        # threshold (100k): too high on Haiku 5.5's 50k ceiling, too low under
+        # a 200k cap. Merged, so a cut's own keys (``forced``,
+        # ``retainedTokensEstimate``, ``tailBounded``, ``keptTurns``) survive
+        # the turns that do not cut.
+        state.policy = {**(state.policy or {}), **policy.to_dict()}
+        documents = self.document_index(model_id)
 
         if input_tokens <= policy.ceiling:
             if policy.hysteresis_enabled and not state.armed:
@@ -1472,8 +1710,21 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         cutoffs = self._valid_cutoff_indices
         total_turns = len(cutoffs)
         protected_turns = self.compaction_config.protected_turns
+        # Token bound on the protected tail (spec §3.2): the ceiling. Only
+        # under the model-relative policy, and only while the rollout switch
+        # is on; ``None`` keeps the tail whole whatever its size.
+        tail_bound: Optional[int] = (
+            policy.ceiling
+            if policy.floor is not None and self.compaction_config.tail_token_bound_enabled
+            else None
+        )
 
-        if total_turns <= protected_turns:
+        # A conversation no older than the protected turns is never cut on
+        # the ceiling alone — every cut would land inside the tail. At the
+        # hard ceiling it is: a young conversation at 160k is the same cost
+        # problem as an old one, and turn count is no reason to carry it.
+        young = total_turns <= protected_turns
+        if young and not (tail_bound is not None and at_hard_ceiling):
             logger.debug(
                 f"Only {total_turns} turns available (need > {protected_turns}), "
                 f"keeping all messages"
@@ -1484,6 +1735,10 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         # Choose the cut in LIVE-LIST coordinates, then translate to absolute.
         messages = self._all_messages_for_summary
         retained_estimate: Optional[int] = None
+        if policy.floor is not None:
+            # A cut is being chosen, after the turn: the one moment a row read
+            # for a document whose facts this process has not seen is allowed.
+            documents = await self._fill_document_index(documents, messages)
         if policy.floor is None:
             # Legacy (kill switch): keep the last N turns, whatever their size.
             relative_cut = cutoffs[-protected_turns]
@@ -1494,7 +1749,18 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
                 protected_turns,
                 policy.floor,
                 history_tokens if history_tokens is not None else input_tokens,
+                tail_bound_tokens=tail_bound,
+                documents=documents,
+                reasoning_live_from=(
+                    state.reasoning_live_from - getattr(self, "_live_offset", 0)
+                    if state.reasoning_live_from is not None
+                    else None
+                ),
             )
+        # Whole turns the cut keeps, and whether it went inside the protected
+        # tail to get there — persisted on the policy snapshot, numbers only.
+        kept_turns = sum(1 for idx in cutoffs if idx >= relative_cut) if relative_cut > 0 else total_turns
+        tail_bounded = relative_cut > 0 and kept_turns < min(protected_turns, total_turns)
 
         if relative_cut <= 0:
             # Everything already fits under the floor — the excess is system
@@ -1574,6 +1840,9 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             state.pending_since = datetime.now(timezone.utc).isoformat()
         else:
             state.checkpoint = new_checkpoint
+            # The next request carries the summary ahead of every message now
+            # stored.
+            state.reasoning_live_from = getattr(self, "_live_offset", 0) + len(messages)
             # The anchor rides the checkpoint: everything the slice retains stays
             # byte-identical until the next compaction-state change, so the single
             # mutation (slice + summary) is paid with exactly one cache re-write.
@@ -1589,6 +1858,10 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             "forced": forced,
             "inputTokens": input_tokens,
             "retainedTokensEstimate": retained_estimate,
+            # The protected tail was over its token bound and the cut kept
+            # only ``keptTurns`` of the newest turns (spec §3.2).
+            "tailBounded": tail_bounded,
+            "keptTurns": kept_turns,
             # Summary provenance — what the admin profile and the cost
             # anatomy read to explain a cut without reading the conversation.
             "summarySource": summary_source,
@@ -1640,6 +1913,16 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
     # Paid-when-free application (spec §3.5)
     # =========================================================================
 
+    def _mark_prefix_rewritten(self, live_len: int) -> None:
+        """Note that this turn's head changed the prefix ahead of the live list's
+        first ``live_len`` messages, for ``CompactionState.reasoning_live_from``.
+
+        In memory only (a head-of-turn save would sit on the TTFT path);
+        ``update_after_turn`` persists it with the state it saves anyway.
+        """
+        mark = getattr(self, "_live_offset", 0) + int(live_len)
+        self._prefix_rewritten_at = max(getattr(self, "_prefix_rewritten_at", None) or 0, mark)
+
     def apply_pending_compaction(self, agent: "Agent", *, prefix_key: Optional[str] = None) -> Optional[str]:
         """Head-of-turn: apply a parked cut to the live list if the re-write is free.
 
@@ -1681,6 +1964,11 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             self._turn_start_stamp = turn_stamp
             previous_key = state.last_prefix_key
             self._current_prefix_key = prefix_key
+            messages = getattr(agent, "messages", None)
+            if prefix_key and previous_key and prefix_key != previous_key and isinstance(messages, list):
+                # Another model or agent: a new system prompt ahead of every
+                # replayed reasoning block. Persisted after the turn.
+                self._mark_prefix_rewritten(len(messages))
             if state.pending_checkpoint is None:
                 return None
 
@@ -1701,7 +1989,6 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
                 )
                 return None
 
-            messages = getattr(agent, "messages", None)
             if not isinstance(messages, list):
                 return None
             applied = self._apply_pending_in_place(messages, state)
@@ -1718,6 +2005,8 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             promoted = state.pending_checkpoint
             state.checkpoint = promoted
             state.truncation_anchor = max(state.truncation_anchor, promoted)
+            # The summary now heads every retained message.
+            state.reasoning_live_from = getattr(self, "_live_offset", 0) + len(messages)
             state.summary = state.pending_summary
             state.pending_checkpoint = None
             state.pending_summary = None
@@ -1764,10 +2053,138 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             return None
 
     # =========================================================================
+    # Rewind (docs/specs/conversation-rewind-and-fork.md §4.3)
+    # =========================================================================
+
+    def apply_rewind(self, agent: "Agent") -> Optional[int]:
+        """Head-of-turn: cut the live list to a rewind app-api recorded since the last turn.
+
+        Called by the stream coordinator before ``apply_pending_compaction`` on
+        every turn, cached and freshly restored agents alike. The cut is a slice
+        assignment (``messages[:] = messages[:k]``), never a rebind: it keeps
+        the #741 alias, so every cached agent of this conversation sees it, and
+        it re-serializes nothing. The retained messages are the exact bytes the
+        earlier turns sent, which is why a rewind on a warm agent reads its
+        history from the prompt cache (spec §2.3) where a re-restore would not.
+
+        The row read here is handed to the compaction re-read that follows, so
+        with compaction on a turn still pays one GSI query. Returns the logical
+        length cut to, or None. Never raises.
+        """
+        from apis.shared.feature_flags import session_rewind_enabled
+
+        if not session_rewind_enabled():
+            return None
+        try:
+            row = self._take_session_row()
+            if self.compaction_config and self.compaction_config.enabled:
+                # Only when something this turn will consume it: a stash left
+                # unread would be handed to the NEXT turn as if it were fresh.
+                self._stashed_session_row = row
+            state = RewindState.from_row(row)
+            if state.epoch <= self._rewind_epoch and state.epoch <= self._live_conversation.rewind_epoch:
+                return None
+
+            cut_to: Optional[int] = None
+            live = self._live_conversation
+            messages = getattr(agent, "messages", None)
+            if state.epoch > live.rewind_epoch and isinstance(messages, list):
+                cut_to = self._cut_live_list(messages, state, live.rewind_epoch)
+                live.rewind_epoch = state.epoch
+
+            # This manager's own compaction state, which a sibling that cut the
+            # shared list did not touch. The anchor clamp is the one §5 makes
+            # required: left above the cut, it would truncate the new messages
+            # that take the cut's indices, and the adoption re-read that follows
+            # keeps the larger of the persisted and live anchors.
+            if state.epoch > self._rewind_epoch:
+                cuts = state.cuts_since(self._rewind_epoch)
+                if cuts and self.compaction_state is not None:
+                    floor = min(c.cut for c in cuts)
+                    current = self.compaction_state
+                    current.truncation_anchor = min(current.truncation_anchor, floor)
+                    if current.reasoning_live_from is not None:
+                        current.reasoning_live_from = min(current.reasoning_live_from, floor)
+                    current.pending_checkpoint = None
+                    current.pending_summary = None
+                    current.pending_hard_ceiling = None
+                    current.pending_since = None
+                self._rewind_epoch = state.epoch
+            return cut_to
+        except Exception as e:  # noqa: BLE001 - never break a turn
+            logger.warning(f"apply_rewind skipped: {e}", exc_info=True)
+            return None
+
+    def rewound_copy(self, messages: List[Dict], row: Optional[Dict]) -> List[Dict]:
+        """A deep copy of ``messages`` cut to any rewind the next turn's head would apply.
+
+        For a call that reads the history without being a turn (a handoff brief,
+        agent-handoffs-and-consults.md §4.5.1): ``apply_rewind`` cuts the live list only
+        at the head of the next turn, so between a rewind and that turn the live list
+        still holds what the user hid. The copy is cut the same way; the live list,
+        this manager's rewind epoch and the stashed row are left for the next turn.
+        ``row`` is the session's metadata row, read by the caller this request.
+        """
+        copied = copy.deepcopy(messages)
+        from apis.shared.feature_flags import session_rewind_enabled
+
+        if not session_rewind_enabled() or not row:
+            return copied
+        try:
+            state = RewindState.from_row(row)
+            applied = self._live_conversation.rewind_epoch
+            if state.epoch > applied:
+                self._cut_live_list(copied, state, applied)
+        except Exception as e:  # noqa: BLE001 - a failed cut must not fail the caller
+            logger.warning(f"rewound_copy: rewind not applied to the copy: {e}")
+        return copied
+
+    def _cut_live_list(self, messages: List[Dict], state: RewindState, applied_epoch: int) -> Optional[int]:
+        """Slice ``messages`` in place to the rewinds after ``applied_epoch``.
+
+        Every rewind hides from its cut to the end, and nothing is appended in
+        this process between a rewind and the next turn's head (this runs
+        first), so the list is the conversation as it stood before the first
+        unapplied rewind and the right length is the smallest cut since. A list
+        that does not match that state (another replica wrote turns in between)
+        is still cut to it, which errs towards dropping a turn rather than
+        showing the model one the user rewound away.
+        """
+        cuts = state.cuts_since(applied_epoch)
+        if not cuts:
+            logger.warning(
+                "Rewind epoch %d -> %d with no cut records; live list left as is",
+                applied_epoch, state.epoch,
+            )
+            return None
+        target = min(c.cut for c in cuts)
+        live_length = self._live_offset + len(messages)
+        if live_length != cuts[0].visible_before or not state.covers_epochs_since(applied_epoch):
+            logger.warning(
+                "Rewind: live list (%d) does not match the state the cut was taken against (%d); cutting to %d",
+                live_length, cuts[0].visible_before, target,
+            )
+        keep = target - self._live_offset
+        if keep < 0 or (keep == 0 and self._live_offset > 0):
+            # The cut lands in what the summary covers. app-api refuses those,
+            # so this is a state it never wrote; leave the list alone.
+            logger.warning("Rewind cut %d is at or before the live offset %d; not applied", target, self._live_offset)
+            return None
+        if keep < len(messages):
+            messages[:] = messages[:keep]
+        logger.info(
+            "Rewind applied in place: epoch %d, live length %d -> %d",
+            state.epoch, live_length, self._live_offset + len(messages),
+        )
+        return target
+
+    # =========================================================================
     # Document offload (offload spec §4C / §4D, PR-4)
     # =========================================================================
 
-    def apply_document_offload(self, agent: "Agent", *, prompt: Any = None) -> Optional[str]:
+    def apply_document_offload(
+        self, agent: "Agent", *, prompt: Any = None, model_id: Optional[str] = None
+    ) -> Optional[str]:
         """Head-of-turn: swap unpinned, large inline documents for their digests
         — and stub aged ``document_read`` page slices — when the prefix
         re-write is free or unavoidable.
@@ -1808,8 +2225,11 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             messages = getattr(agent, "messages", None)
             if not isinstance(messages, list) or not messages:
                 return None
+            documents = self.document_index(model_id or _agent_model_id(agent))
             pinned = pinned_document_names(messages, prompt, pin_turns=DOCUMENT_OFFLOAD_PIN_TURNS)
-            candidates = candidate_documents(messages, pinned, min_tokens=DOCUMENT_OFFLOAD_MIN_TOKENS)
+            candidates = candidate_documents(
+                messages, pinned, min_tokens=DOCUMENT_OFFLOAD_MIN_TOKENS, documents=documents
+            )
             has_slices = any(
                 isinstance(b, dict) and isinstance(b.get("toolResult"), dict)
                 for m in messages if isinstance(m, dict) and isinstance(m.get("content"), list)
@@ -1827,10 +2247,16 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
                     )
                 return None
 
-            result = offload_documents(messages, candidates, session_id=session_id, user_id=self.user_id)
-            result.slices_aged, result.slice_tokens = age_document_slices(messages, max_turns=DOCUMENT_SLICE_MAX_TURNS)
+            result = offload_documents(
+                messages, candidates, session_id=session_id, user_id=self.user_id,
+                ancestor_session_ids=self.document_ancestor_session_ids(),
+            )
+            result.slices_aged, result.slice_tokens = age_document_slices(
+                messages, max_turns=DOCUMENT_SLICE_MAX_TURNS, documents=documents
+            )
             if not result.offloaded and not result.slices_aged:
                 return None
+            self._mark_prefix_rewritten(len(messages))
 
             logger.info(
                 "document_offload: reason=%s documents=%d evicted≈%d tok digests≈%d tok slices=%d gap=%ss unmatched=%d",
@@ -1860,6 +2286,56 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
         except Exception as e:  # noqa: BLE001 - never break a turn
             logger.warning(f"apply_document_offload skipped: {e}", exc_info=True)
             return None
+
+    def document_index(self, model_id: Optional[str] = None) -> "DocumentIndex":
+        """The row facts this session's document blocks are estimated from.
+
+        Read from the process-wide store keyed by ``(user, session)``
+        (``apis.shared.files.document_estimate``), never held on this manager:
+        another agent serving the session reads the same facts. Facts are
+        immutable per set of bytes, so there is nothing to go stale.
+
+        ``model_id`` is the turn's model, passed by the caller rather than
+        held here: the estimate prices text at that model's tokenizer factor,
+        the planner's (``tokenizer_costs``). ``None`` keeps the facts' own count.
+        """
+        from apis.shared.files.document_estimate import session_document_facts
+
+        from .document_estimate import DocumentIndex
+
+        config = getattr(self, "config", None)
+        return DocumentIndex(
+            session_document_facts(getattr(self, "user_id", None), getattr(config, "session_id", None)),
+            model_id=model_id,
+        )
+
+    async def _fill_document_index(self, documents: "DocumentIndex", messages: Optional[List[Dict]]) -> "DocumentIndex":
+        """``documents``, plus the session's rows when a block in ``messages`` has no facts.
+
+        Runs after the turn, only when a cut is being chosen, so the one
+        Query it may cost is never before a first token. Never raises.
+        """
+        try:
+            if not messages or not documents.unmatched(messages):
+                return documents
+            session_id = getattr(self.config, "session_id", None)
+            # No files table configured (a local run or a unit test): nothing
+            # to read, and the estimate falls back to the bytes.
+            if not session_id or not os.environ.get("DYNAMODB_USER_FILES_TABLE_NAME"):
+                return documents
+            from apis.shared.files.document_estimate import remember_session_documents
+
+            from .document_rehydration import load_session_documents
+
+            user_id = getattr(self, "user_id", None)
+            rows = await asyncio.to_thread(
+                load_session_documents, session_id, user_id, self.document_ancestor_session_ids()
+            )
+            if remember_session_documents(user_id, session_id, rows):
+                return self.document_index(documents.model_id)
+        except Exception as e:  # noqa: BLE001 - the estimate falls back to the bytes
+            logger.debug("Document facts lookup skipped: %s", e)
+        return documents
 
     def _document_offload_reason(self) -> Tuple[Optional[str], Optional[int]]:
         """``(reason, cache gap seconds)`` — why a prefix re-write is free or
@@ -1987,6 +2463,9 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
                 "CompactionFloorUnreachable": (
                     1 if (policy.floor is not None and retained_estimate is not None and retained_estimate > policy.floor) else 0
                 ),
+                # The protected tail alone exceeded the ceiling and the cut
+                # kept fewer than ``protected_turns`` turns (spec §3.2).
+                "CompactionTailBounded": 1 if (state.policy or {}).get("tailBounded") else 0,
             },
             {
                 "policySource": policy.source,
@@ -2191,6 +2670,26 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             return block
         return {**block, "toolResult": {**tool_result, "content": repaired}}
 
+    def _restore_image_handles(self, messages: List[Dict]) -> List[Dict]:
+        """Put each image handle's stored bytes back (``image_restore``) and
+        record ``image_restored`` (count, bytes, milliseconds) on the ledger."""
+        from agents.main_agent.session.image_restore import restore_image_handles
+
+        result = restore_image_handles(messages, user_id=getattr(self, "user_id", None))
+        if result.restored or result.failed:
+            logger.info(
+                "image_restore: restored=%d failed=%d bytes=%d ms=%d",
+                result.restored, result.failed, result.bytes_read, result.elapsed_ms,
+            )
+            self.record_compaction_event(
+                "image_restored",
+                images=result.restored,
+                failed=result.failed,
+                bytes=result.bytes_read,
+                ms=result.elapsed_ms,
+            )
+        return result.messages
+
     def _strip_document_bytes(self, messages: List[Dict]) -> List[Dict]:
         """Replace document content blocks' inline bytes with their digest — or,
         when the block cannot be matched to an upload, a text placeholder.
@@ -2221,6 +2720,7 @@ class TurnBasedSessionManager(AgentCoreMemorySessionManager):
             messages,
             session_id=getattr(self.config, "session_id", None),
             user_id=self.user_id,
+            ancestor_session_ids=self.document_ancestor_session_ids(),
         )
         if result.rehydrated:
             logger.info(

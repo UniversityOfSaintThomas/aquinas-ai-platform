@@ -31,11 +31,13 @@ class ChatInputStub {
   readonly sessionId = input<string | null>(null);
   readonly allowFolderAttachments = input<boolean>(false);
   readonly showScopePicker = input<boolean>(false);
+  readonly offerIncognito = input<boolean>(false);
   readonly project = input<{ projectId: string; name: string } | null>(null);
   readonly draftKey = input<string | null>(null);
   readonly isChatLoading = input<boolean>(false);
   readonly showFileControls = input<boolean>(true);
   readonly showVoiceControl = input<boolean>(true);
+  readonly voiceAgentId = input<string | null>(null);
   readonly showAnnouncements = input<boolean>(true);
   readonly announcementPlacement = input<'above' | 'below'>('above');
   readonly messageSubmitted = output<unknown>();

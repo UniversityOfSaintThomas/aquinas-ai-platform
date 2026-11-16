@@ -79,6 +79,8 @@ export interface AppApiSsmParams {
   voiceTicketReplayTableName: string;
   voiceTicketReplayTableArn: string;
   voiceTicketSigningSecretArn: string;
+  // The browser sign-in viewer's own origin (never the mcp-sandbox origin).
+  browserLiveViewOrigin: string;
   // Inference
   inferenceApiRuntimeEndpointUrl: string;
   /** AgentCore Runtime CloudWatch log group (spans + content log records) for eval sampling. */
@@ -206,6 +208,7 @@ export function resolveAppApiParams(
     voiceTicketReplayTableName: refs.voiceTicketReplayTable.tableName,
     voiceTicketReplayTableArn: refs.voiceTicketReplayTable.tableArn,
     voiceTicketSigningSecretArn: refs.voiceTicketSigningSecret.secretArn,
+    browserLiveViewOrigin: refs.browserLiveViewOrigin,
     // Inference
     inferenceApiRuntimeEndpointUrl: overrides.inferenceApiRuntimeEndpointUrl,
     agentCoreRuntimeLogGroupName: overrides.agentCoreRuntimeLogGroupName,
@@ -253,6 +256,10 @@ export function buildAppApiEnvironment(
     MANAGED_KB_PER_OWNER_DEFAULT_BYTES: String(config.managedKb.perOwnerDefaultBytes),
     MANAGED_KB_PER_OWNER_ELEVATED_BYTES: String(config.managedKb.perOwnerElevatedBytes),
     MANAGED_KB_PER_KB_CEILING_BYTES: String(config.managedKb.perKnowledgeBaseCeilingBytes),
+    // Per-file knowledge-base upload limit, enforced at presign and import and
+    // returned to the SPA as `kbUsage.maxFileBytes`. The managed ingestion
+    // consumer holds stored objects to the same value (kb-migration-construct.ts).
+    KB_UPLOAD_MAX_FILE_BYTES: String(config.managedKb.uploadMaxFileBytes),
     // Gates the owner-facing upgrade offer (Requirement 23.1), which is served by
     // THIS task — `apis/app_api/kb_upgrade/service.py` reads this exact variable.
     //
@@ -383,6 +390,20 @@ export function buildAppApiEnvironment(
     // Session prewarm (opt-in while in development): gates POST /chat/prewarm.
     // app-api only; the Runtime's warm action is a no-op behind this route.
     SESSION_PREWARM_ENABLED: config.sessionPrewarm.enabled ? 'true' : 'false',
+    // Quota requests (opt-in while in development): gates /quota/* and the
+    // admin request queue. app-api only; extensions resolve everywhere.
+    QUOTA_REQUESTS_ENABLED: config.quotaRequests.enabled ? 'true' : 'false',
+    // AWS Limits (opt-in while in development): gates /admin/aws-limits.
+    // app-api only; the Runtime never reads Service Quotas.
+    AWS_LIMITS_ENABLED: config.awsLimits.enabled ? 'true' : 'false',
+    // Handoffs (opt-in while in development): gates /sessions/{id}/handoffs.
+    HANDOFFS_ENABLED: config.handoffs.enabled ? 'true' : 'false',
+    // Conversation rewind (opt-in while in development): gates
+    // POST /sessions/{id}/rewind and GET /messages' hiding of rewound turns.
+    SESSION_REWIND_ENABLED: config.sessionRewind.enabled ? 'true' : 'false',
+    // Conversation fork (opt-in while in development): gates
+    // POST /sessions/{id}/fork and a fork's pinning to its root's microVM.
+    SESSION_FORK_ENABLED: config.sessionFork.enabled ? 'true' : 'false',
     // Client-measured time to first token (default on): gates
     // POST /telemetry/turn-timing, which records the SPA's own measurement.
     CLIENT_TURN_TIMING_ENABLED: config.clientTurnTiming.enabled ? 'true' : 'false',
@@ -403,6 +424,47 @@ export function buildAppApiEnvironment(
     // Folder sync (default on): app-api accepts a
     // `drive_folder` KB sync policy. The kb-sync Lambdas carry it too.
     FOLDER_SYNC_ENABLED: config.folderSync.enabled ? 'true' : 'false',
+
+    // Source provenance verification (docs/specs/source-provenance-verification.md).
+    // app-api's share is the read side: `GET /messages` replays the stored
+    // `SRCV#` verdicts, which the SSE event does not re-stream. In development,
+    // so only "true" enables.
+    SOURCE_PROVENANCE_ENABLED: config.sourceProvenance.enabled ? 'true' : 'false',
+
+    // Attachment planner's token profile (docs/specs/unified-attachment-delivery.md
+    // phase 3). app-api's share is `GET /files/limits`, which reports the active
+    // profile. In development, so only "true" enables.
+    ATTACHMENT_PLAN_ENABLED: config.attachmentPlan.enabled ? 'true' : 'false',
+
+    // MCP form elicitation (docs/specs/mcp-elicitation.md). app-api's share is
+    // admin capability discovery, which advertises form elicitation to an
+    // opted-in server so its elicitation-gated tools can be listed and allowed.
+    // In development, so only "true" enables.
+    MCP_ELICITATION_ENABLED: config.mcpElicitation.enabled ? 'true' : 'false',
+
+    // Release ledger writes (docs/specs/release-ledger.md §5.2). app-api's share
+    // is the api-converse cost rows it writes; the Runtime writes the rest. In
+    // development, so only "true" enables.
+    RELEASE_LEDGER_ENABLED: config.releaseLedger.enabled ? 'true' : 'false',
+
+    // Typed structured extraction (docs/specs/structured-extraction.md).
+    // app-api's share is the read side: `GET /messages` replays the stored
+    // `EXTR#` rows, which the SSE event does not re-stream. In development, so
+    // only "true" enables. The model id is deliberately NOT set here — app-api
+    // never makes the extraction call.
+    DOCUMENT_EXTRACT_ENABLED: config.documentExtract.enabled ? 'true' : 'false',
+
+    // Field-set authoring (docs/specs/field-set-authoring.md §7): the
+    // `/skills/mine/{id}/field-sets` routes. app-api only; the Runtime resolves
+    // field sets the same way either way. In development, so only "true" enables.
+    FIELD_SET_AUTHORING_ENABLED: config.fieldSetAuthoring.enabled ? 'true' : 'false',
+
+    // Assistant KB full-context mode. app-api never sends a knowledge base to a
+    // model; its share is `GET /assistants/{id}/knowledge-base/mode`, which tells
+    // an Agent's author which mode the Runtime runs it in, and so must see the
+    // Runtime's flag and budget. In development, so only "true" enables.
+    ASSISTANT_KB_FULL_CONTEXT_ENABLED: config.assistantKbFullContext.enabled ? 'true' : 'false',
+    ASSISTANT_KB_FULL_CONTEXT_MAX_TOKENS: String(config.assistantKbFullContext.maxTokens),
     ...(params.largeDocumentPrepareQueueUrl
       ? { LARGE_DOCUMENT_PREPARE_QUEUE_URL: params.largeDocumentPrepareQueueUrl }
       : {}),
@@ -432,5 +494,12 @@ export function buildAppApiEnvironment(
     DICTATION_LANGUAGES: config.dictation.languages,
     VOICE_TICKET_REPLAY_TABLE_NAME: params.voiceTicketReplayTableName,
     VOICE_TICKET_SIGNING_SECRET_ARN: params.voiceTicketSigningSecretArn,
+    // The origin the SPA frames the browser sign-in viewer from, returned on
+    // the live-view mint response beside the signed URL it is the only place
+    // to send (docs/specs/authenticated-web-assessment.md D3). Its own
+    // CloudFront distribution, so no MCP App ever shares an origin with the
+    // page a user types a password into. app-api only: the Runtime never
+    // frames anything, and its environment budget stays untouched.
+    BROWSER_LIVE_VIEW_ORIGIN: params.browserLiveViewOrigin,
   };
 }

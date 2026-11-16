@@ -48,6 +48,7 @@ from pydantic import BaseModel, Field
 from apis.shared.aws_clients import get_client
 
 from .document_read import _open_pdf, _pdf_page_text, docx_paragraphs, document_format_for
+from .pdfium_lock import pdfium_lock
 
 logger = logging.getLogger(__name__)
 
@@ -168,11 +169,15 @@ def _strip_html(text: str) -> str:
 def _units_for(fmt: str, raw: bytes) -> Tuple[str, List[str]]:
     """``(unit name, unit texts)`` — one string per page / paragraph / line."""
     if fmt == "pdf":
-        pdf = _open_pdf(raw)
-        try:
-            return "page", [_pdf_page_text(pdf, i) for i in range(len(pdf))]
-        finally:
-            pdf.close()
+        # The whole document under one hold of the PDFium lock: two digests
+        # built on ``to_thread`` at once (two imports in one request burst)
+        # must not interleave inside the library.
+        with pdfium_lock():
+            pdf = _open_pdf(raw)
+            try:
+                return "page", [_pdf_page_text(pdf, i) for i in range(len(pdf))]
+            finally:
+                pdf.close()
     if fmt == "docx":
         return "paragraph", docx_paragraphs(raw)
     text = raw.decode("utf-8", errors="replace")
@@ -257,6 +262,8 @@ class DocumentText(BaseModel):
     truncated: bool
     unit: str
     count: int
+    #: Length of the whole text layer, even when ``text`` is an excerpt of it.
+    chars: int = 0
 
 
 def document_text(fmt: str, raw: bytes, limit: int) -> DocumentText:
@@ -274,8 +281,10 @@ def document_text(fmt: str, raw: bytes, limit: int) -> DocumentText:
     separator = "\n\n" if fmt == "pdf" else "\n"
     full = separator.join(t.strip() if fmt == "pdf" else t for t in texts if t.strip())
     if len(full) <= limit:
-        return DocumentText(text=full, truncated=False, unit=unit, count=len(texts))
-    return DocumentText(text=_sample_units(fmt, texts, limit), truncated=True, unit=unit, count=len(texts))
+        return DocumentText(text=full, truncated=False, unit=unit, count=len(texts), chars=len(full))
+    return DocumentText(
+        text=_sample_units(fmt, texts, limit), truncated=True, unit=unit, count=len(texts), chars=len(full)
+    )
 
 
 # ---------------------------------------------------------------------------

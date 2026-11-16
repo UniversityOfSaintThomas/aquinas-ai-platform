@@ -41,7 +41,8 @@ import { UserConnector } from '../../../settings/connectors/models/user-connecto
 import { ConnectorStatusService } from '../../../settings/connectors/services/connector-status.service';
 import { UserConnectorsService } from '../../../settings/connectors/services/user-connectors.service';
 import { OAuthConsentService } from '../../../services/oauth-consent/oauth-consent.service';
-import { MAX_FILES_PER_MESSAGE } from '../../../services/file-upload';
+import { AttachmentLimitsService } from '../../../services/file-upload';
+import { ConversationBindingService } from '../../services/session/conversation-binding.service';
 import { SkillCommand, SkillCommandService } from '../../../services/skill/skill-command.service';
 import { ToastService } from '../../../services/toast/toast.service';
 import { Tool, ToolService, isRetiring } from '../../../services/tool/tool.service';
@@ -117,9 +118,11 @@ export class ComposerAddMenuComponent {
   private readonly connectorsService = inject(UserConnectorsService);
   private readonly connectorStatus = inject(ConnectorStatusService);
   private readonly consentService = inject(OAuthConsentService);
+  private readonly binding = inject(ConversationBindingService);
+  private readonly attachmentLimits = inject(AttachmentLimitsService);
 
   /** How many more files the message can take; zero disables the file rows. */
-  readonly remainingFiles = input<number>(MAX_FILES_PER_MESSAGE);
+  readonly remainingFiles = input<number>(this.attachmentLimits.filesPerMessage());
   /**
    * How many more folders the message can take (drive-folder spec §4.5). Zero,
    * the default, hides "Attach this folder" in the browser: a composer that
@@ -146,6 +149,23 @@ export class ComposerAddMenuComponent {
 
   protected readonly fileSources = signal<FileSourceConnector[]>([]);
   private fileSourcesLoaded = false;
+
+  // --- Project ----------------------------------------------------------------
+
+  /**
+   * The project this conversation runs in, or null. A project's tools and skills
+   * are set on the project for everyone in it, and the member's own Customize
+   * choices do not reach its turns, so "Manage" goes to the project's pages.
+   */
+  protected readonly project = this.binding.boundProject;
+  protected readonly manageToolsPath = computed(() => {
+    const project = this.project();
+    return project ? `/projects/${project.projectId}/tools` : '/customize/tools';
+  });
+  protected readonly manageSkillsPath = computed(() => {
+    const project = this.project();
+    return project ? `/projects/${project.projectId}/skills` : '/customize/skills';
+  });
 
   // --- Skills -----------------------------------------------------------------
 
@@ -307,7 +327,7 @@ export class ComposerAddMenuComponent {
   private warnFileLimit(): void {
     this.toast.warning(
       'File limit',
-      `Maximum ${MAX_FILES_PER_MESSAGE} files per message. Remove one to add another.`,
+      `Maximum ${this.attachmentLimits.filesPerMessage()} files per message. Remove one to add another.`,
     );
   }
 

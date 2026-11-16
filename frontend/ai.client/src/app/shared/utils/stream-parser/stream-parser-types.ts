@@ -73,6 +73,23 @@ export interface QuotaSessionNoticeEvent {
 }
 
 /**
+ * The user's spend has passed the central allowance onto a fund
+ * (quota-requests spec §8.2). Emitted at the head of every turn while the
+ * overage lands on a `chargeback` extension; dismissal is client-side per period.
+ */
+export interface QuotaFundingNoticeEvent {
+  type: 'quota_funding_notice';
+  /** The fund being charged, as a person reads it. */
+  label: string;
+  chargedThisPeriod: number;
+  /** Per-period cap; absent when uncapped. */
+  cap?: number;
+  remainingUnderCap?: number;
+  standing?: boolean;
+  message: string;
+}
+
+/**
  * Quota exceeded event from the stream
  */
 export interface QuotaExceededEvent {
@@ -470,6 +487,125 @@ export interface AgentStatusEvent {
  * Gated by `TOOL_SUMMARIES_ENABLED`. Absence means the deterministic line
  * stands — a downgrade in specificity, never a blank.
  */
+/**
+ * Where in a document a cited passage was located
+ * (`docs/specs/source-provenance-verification.md` §5).
+ *
+ * `kind` is the unit the document actually HAS, so a Word document cites a
+ * paragraph and never invents a page. `precision` is always present: an
+ * optional flag whose absence reads as exact is how an estimated position gets
+ * rendered as a confident `p. 234`, so an `estimated` locator is hedged.
+ */
+export interface SourceLocator {
+  kind: 'page' | 'paragraph' | 'line';
+  value: number;
+  precision: 'measured' | 'estimated';
+}
+
+/**
+ * The verdict for one asserted value: is its quoted passage in the document,
+ * and does the value actually appear in that passage?
+ *
+ * The two questions are answered separately on the backend and collapsed into
+ * `state` in exactly one place, so no consumer re-derives it. Treat `state` as
+ * the whole answer — in particular `quote_unsupported` means the passage is
+ * real and the value is NOT in it, which is the hallucination signal and must
+ * never render like a located citation.
+ */
+export interface SourceProvenanceClaim {
+  id: string;
+  state: 'supported' | 'quote_unsupported' | 'unassessed' | 'unverified';
+  /** How the state was reached (`literal`, `no_match`, `enum_field`, …). Measurement, not a verdict. */
+  method: string;
+  /**
+   * The value as the model stated it. Optional: a backend older than the
+   * field sends none, and the renderer falls back to the claim's own label
+   * rather than inventing one.
+   */
+  value?: string;
+  quote: string;
+  locator: SourceLocator | null;
+  uploadId: string;
+  filename: string;
+}
+
+/**
+ * Verdicts for one `verify_sources` call, emitted mid-turn and never
+ * re-streamed — `GET /messages` replays them under `sourceProvenance`.
+ *
+ * Gated by `SOURCE_PROVENANCE_ENABLED` on the backend and
+ * `features.sourceProvenance` here. Absence means no provenance is shown at
+ * all, which is the honest fallback: the SPA must never infer a citation.
+ */
+export interface SourceProvenanceEvent {
+  type: 'source_provenance';
+  sessionId: string;
+  toolUseId: string;
+  claims: SourceProvenanceClaim[];
+}
+
+/**
+ * One extracted field of a `document_extract` run
+ * (`docs/specs/structured-extraction.md` §9).
+ *
+ * `state` is the source-provenance verdict for this value, in exactly the
+ * vocabulary of {@link SourceProvenanceClaim} — the extraction tool asks the
+ * same module the same question, so the renderer must not invent a fifth
+ * reading. `value` is already a single display line (`""` when the document
+ * did not answer the field), and `quote` is `null` when the model gave none
+ * or the stored row had to drop it.
+ */
+export interface DocumentExtractionField {
+  name: string;
+  title: string;
+  /** The field set's declared type (`string`, `number`, `date`, `enum`, `list`, …). */
+  type: string;
+  value: string;
+  state: SourceProvenanceClaim['state'];
+  method: string;
+  quote: string | null;
+  locator: SourceLocator | null;
+}
+
+/**
+ * A named field set run over ONE document. A call over N documents produces N
+ * of these, all sharing the call's `toolUseId`, and the renderer groups them
+ * back into one table.
+ */
+export interface DocumentExtractionRun {
+  toolUseId: string;
+  fieldSet: string;
+  fieldSetVersion: string;
+  uploadId: string;
+  filename: string;
+  /** Extraction runs on its own model, not the turn's, so it is disclosed. */
+  modelId: string;
+  /**
+   * `false` when the typed schema could not be applied and the types were
+   * requested rather than guaranteed. Never silent: the table says so.
+   */
+  schemaEnforced: boolean;
+  artifactId: string | null;
+  downloadUploadId: string | null;
+  /** Documents the whole call succeeded on (live event only). */
+  documentCount?: number;
+  /** The stored row dropped its quotes to fit the item limit (replay only). */
+  quotesOmitted?: boolean;
+  fields: DocumentExtractionField[];
+}
+
+/**
+ * One document's extraction, emitted mid-turn and never re-streamed —
+ * `GET /messages` replays the same shape under `extractions`.
+ *
+ * Gated by `DOCUMENT_EXTRACT_ENABLED` on the backend and
+ * `features.documentExtract` here.
+ */
+export interface DocumentExtractionEvent extends DocumentExtractionRun {
+  type: 'document_extraction';
+  sessionId: string;
+}
+
 export interface ToolGroupSummaryEvent {
   type: 'tool_group_summary';
   sessionId: string;
@@ -609,6 +745,7 @@ export type StreamEventType =
   | 'reasoning'
   | 'quota_warning'
   | 'quota_session_notice'
+  | 'quota_funding_notice'
   | 'quota_exceeded'
   | 'stream_error'
   | 'citation'
@@ -622,7 +759,9 @@ export type StreamEventType =
   | 'model_retry'
   | 'agent_notice'
   | 'agent_status'
-  | 'tool_group_summary';
+  | 'tool_group_summary'
+  | 'source_provenance'
+  | 'document_extraction';
 
 /**
  * Union type of all possible event data types
@@ -639,6 +778,7 @@ export type StreamEventData =
   | ReasoningEvent
   | QuotaWarningEvent
   | QuotaSessionNoticeEvent
+  | QuotaFundingNoticeEvent
   | QuotaExceededEvent
   | StreamErrorEvent
   | ConversationalStreamErrorEvent
@@ -654,6 +794,8 @@ export type StreamEventData =
   | AgentNoticeEvent
   | AgentStatusEvent
   | ToolGroupSummaryEvent
+  | SourceProvenanceEvent
+  | DocumentExtractionEvent
   | null
   | undefined;
 

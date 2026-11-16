@@ -102,8 +102,9 @@ one-line quality fix — would push the full document back into the prefix on
 every turn and regress cost. Fixing quality without paying that is exactly what
 the digest path below is for.
 
-The `s3Location` path referenced in the comment at line 971 was never
-implemented. Every document is inline bytes.
+Converse `s3Location` document sources were never implemented. Every inline
+document is bytes. unified-attachment-delivery.md §2.1 records Claude on Bedrock
+as accepting `bytes` sources only; see #401.
 
 ---
 
@@ -303,6 +304,16 @@ document_read(upload_id, page_range={start,end} | pattern, max_pages=8)
 - `pattern` greps the extracted text layer and returns the *page numbers* that
   match plus surrounding lines, so the model can then ask for those pages.
 - Hard cap `max_pages` so one call cannot re-inject the whole document.
+- **A page count is not a byte bound.** A tool round's results are written to
+  AgentCore Memory as one event, held to the same 10 MB quota as a turn's
+  attachments, and past it `CreateEvent` returns 413 and the turn is
+  force-stopped. In prod (30 days to 2026-11-06) page reads ran p90 5.3 MB and
+  up to 86.5 MB for one 8-page slice of a scan, and about 21 turns died this
+  way, one of them from five parallel ~3.3 MB reads. So a round's page reads
+  share `DOCUMENT_READ_MAX_BATCH_BYTES` (7.0 MB raw, the attachment budget):
+  each call, in turn under a per-round lock, slices to what is left — fewer
+  pages with `next_start`, or the pages' text layer when not even the first
+  page fits — and records `DocumentReadByteBudgetLimited`.
 
 Modelled on `retrieve_offloaded_content`'s interface deliberately — same three
 modes (pattern / range / full-as-last-resort), same guidance text shape.
@@ -648,7 +659,13 @@ visual fidelity before any digest comparison is scored.
    (already pinned for thumbnails); DOCX text comes from a stdlib
    `zipfile` + `ElementTree` extractor over `word/document.xml`. `page_range`
    is PDF-only; DOCX and text use `pattern` or bounded `offset` reads
-   (the workspace read bound, 48 KB).
+   (the workspace read bound, 48 KB). **PDFium is not thread-safe**, and
+   every PDF path here runs on a worker thread (`asyncio.to_thread` for the
+   digest, the executor for thumbnails), so every pypdfium2 call takes the
+   one process-wide re-entrant lock in `apis/shared/files/pdfium_lock.py`.
+   Two PDFs imported 90 ms apart once had their digests parse concurrently
+   and the app-api process died with SIGSEGV (exit 139, no traceback); the
+   lock is what makes "off the request path" safe.
 8. **Token numbers are heuristics.** Bedrock reports no per-block usage;
    `documentTokens` is bytes/4 (documents) and a flat estimate per image,
    the compaction estimator's own numbers. They are comparable across rows and

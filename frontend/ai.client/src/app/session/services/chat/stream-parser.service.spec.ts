@@ -7,6 +7,7 @@ import { ChatStateService } from './chat-state.service';
 import { ErrorService } from '../../../services/error/error.service';
 import { QuotaWarningService } from '../../../services/quota/quota-warning.service';
 import { SessionService } from '../session/session.service';
+import { QuotaStatusService } from '../../../services/quota/quota-status.service';
 
 describe('StreamParserService - Citation Handling', () => {
   let service: StreamParserService;
@@ -390,6 +391,56 @@ describe('StreamParserService - max_tokens Continue affordance', () => {
     expect(chatState.lastTurnContinuable()).toBe(true);
   });
 
+  it('marks a refused resume so the post-resume reload is skipped', () => {
+    service.parseEventSourceMessage('s1', 'stream_error', {
+      type: 'stream_error',
+      code: 'bad_request',
+      message: 'Send your message again.',
+      recoverable: false,
+      metadata: { error_kind: 'resume_unavailable', reason: 'expired' },
+    });
+
+    expect(chatState.takeResumeUnavailable('s1')).toBe(true);
+    expect(chatState.lastTurnContinuable()).toBe(false);
+  });
+
+  it('records a provider outage, with the model it named', () => {
+    service.parseEventSourceMessage('s1', 'stream_error', {
+      type: 'stream_error',
+      code: 'provider_unavailable',
+      message: "⚠️ **Claude Opus 5.5 isn't responding right now**",
+      recoverable: true,
+      metadata: {
+        error_kind: 'provider_unavailable',
+        model_id: 'global.anthropic.claude-opus-5-5',
+        model_name: 'Claude Opus 5.5',
+        provider: 'bedrock',
+      },
+    });
+
+    expect(chatState.lastTurnProviderOutage()).toEqual({
+      modelId: 'global.anthropic.claude-opus-5-5',
+      modelName: 'Claude Opus 5.5',
+      provider: 'bedrock',
+    });
+    expect(chatState.lastTurnContinuable()).toBe(false);
+  });
+
+  it('retires a provider outage when the next assistant turn starts streaming', () => {
+    service.parseEventSourceMessage('s1', 'stream_error', {
+      type: 'stream_error',
+      code: 'provider_unavailable',
+      message: 'down',
+      recoverable: true,
+      metadata: { error_kind: 'provider_unavailable' },
+    });
+    expect(chatState.lastTurnProviderOutage()).not.toBeNull();
+
+    service.parseEventSourceMessage('s1', 'message_start', { role: 'assistant' });
+
+    expect(chatState.lastTurnProviderOutage()).toBeNull();
+  });
+
   it('does not mark continuable for a non-max_tokens stream_error', () => {
     service.parseEventSourceMessage('s1', 'stream_error', {
       type: 'stream_error',
@@ -733,5 +784,90 @@ describe('StreamParserService - hasReceivedDone (Stop guard)', () => {
     });
     service.parseEventSourceMessage('s1', 'done', null);
     expect(service.hasReceivedDone('s1')).toBe(true);
+  });
+});
+
+describe('StreamParserService - quota state per turn', () => {
+  afterEach(() => TestBed.resetTestingModule());
+
+  it('starts each turn without a blocked state or a funding notice from an earlier one', () => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [StreamParserService, ChatStateService, ErrorService, QuotaWarningService],
+    });
+    const quota = TestBed.inject(QuotaWarningService);
+    quota.setFundingNotice({
+      type: 'quota_funding_notice', label: 'Fund 100000', chargedThisPeriod: 19.6, cap: 20, standing: true,
+      message: 'Included quota used · charging Fund 100000 · $19.60 this month of $20.00',
+    });
+    quota.setQuotaExceeded({
+      type: 'quota_exceeded', currentUsage: 50, quotaLimit: 50, percentageUsed: 100,
+      periodType: 'monthly', resetInfo: '', message: '',
+    });
+
+    TestBed.inject(StreamParserService).reset('s1');
+
+    expect(quota.fundingNotice()).toBeNull();
+    expect(quota.isQuotaExceeded()).toBe(false);
+  });
+
+  const sessionNotice = {
+    type: 'quota_session_notice' as const, sessionId: 's1', sessionCost: 0.01, quotaLimit: 0.01,
+    sessionPercentageOfLimit: 100, thresholdPercentage: 25,
+    message: 'This conversation has used $0.01 of your $0.01 monthly quota',
+  };
+
+  it('starts each turn without the session notice, which named the limit before an approval', () => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [StreamParserService, ChatStateService, ErrorService, QuotaWarningService],
+    });
+    const quota = TestBed.inject(QuotaWarningService);
+    quota.setSessionNotice(sessionNotice);
+
+    TestBed.inject(StreamParserService).reset('s1');
+
+    expect(quota.sessionNotice()).toBeNull();
+    expect(quota.hasVisibleSessionNotice()).toBe(false);
+  });
+
+  it('keeps a dismissal when the same session notice comes back next turn, and drops it when it moves', () => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [StreamParserService, ChatStateService, ErrorService, QuotaWarningService],
+    });
+    const quota = TestBed.inject(QuotaWarningService);
+    const parser = TestBed.inject(StreamParserService);
+    quota.setSessionNotice(sessionNotice);
+    quota.dismissSessionNotice();
+
+    parser.reset('s1');
+    quota.setSessionNotice(sessionNotice);
+    expect(quota.hasVisibleSessionNotice()).toBe(false);
+
+    parser.reset('s1');
+    quota.setSessionNotice({ ...sessionNotice, sessionCost: 0.02 });
+    expect(quota.hasVisibleSessionNotice()).toBe(true);
+  });
+
+  it('re-reads the quota status when a turn is blocked', () => {
+    const reload = vi.fn();
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        StreamParserService, ChatStateService, ErrorService, QuotaWarningService,
+        { provide: QuotaStatusService, useValue: { reload } },
+      ],
+    });
+    const parser = TestBed.inject(StreamParserService);
+    parser.reset('s1');
+
+    parser.parseEventSourceMessage('s1', 'quota_exceeded', {
+      type: 'quota_exceeded', currentUsage: 0.013, quotaLimit: 0.01, percentageUsed: 130,
+      periodType: 'monthly', resetInfo: '', message: '',
+    });
+
+    expect(TestBed.inject(QuotaWarningService).isQuotaExceeded()).toBe(true);
+    expect(reload).toHaveBeenCalledTimes(1);
   });
 });

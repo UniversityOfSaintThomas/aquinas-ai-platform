@@ -11,7 +11,7 @@ import * as bedrock from 'aws-cdk-lib/aws-bedrockagentcore';
 import * as path from 'path';
 import { createHash } from 'crypto';
 import { Construct } from 'constructs';
-import { AppConfig, getResourceName, getTruncatedResourceName, applyStandardTags, buildCorsOrigins } from '../../config';
+import { AppConfig, DEFAULT_ASSISTANT_KB_FULL_CONTEXT_MAX_TOKENS, getResourceName, getTruncatedResourceName, applyStandardTags, buildCorsOrigins } from '../../config';
 import { AlarmFactory } from '../observability/alarm-factory';
 import { PlatformComputeRefs } from '../platform-compute-refs';
 import {
@@ -404,6 +404,20 @@ export class InferenceAgentCoreConstruct extends Construct {
         // Assistant KB full-context mode (in development, default off). Spread in
         // only while on: the code reads unset as off. Runtime only.
         ...(config.assistantKbFullContext.enabled ? { ASSISTANT_KB_FULL_CONTEXT_ENABLED: 'true' } : {}),
+        // Its token budget, only while the flag is on and the budget is not the
+        // code's own default: either way the default spends no V2 env bytes.
+        ...(config.assistantKbFullContext.enabled &&
+        config.assistantKbFullContext.maxTokens !== DEFAULT_ASSISTANT_KB_FULL_CONTEXT_MAX_TOKENS
+          ? { ASSISTANT_KB_FULL_CONTEXT_MAX_TOKENS: String(config.assistantKbFullContext.maxTokens) }
+          : {}),
+        // knowledge_files for ordinary Agents (in development, default off).
+        // Written only while ON, so the default costs nothing against the V2
+        // payload budget.
+        ...(config.agentKnowledgeFiles.enabled ? { AGENT_KNOWLEDGE_FILES_ENABLED: 'true' } : {}),
+        // Meeting transcripts → GitHub issues tool families (in development,
+        // default off). Spread in only while on: the code reads unset as off.
+        // Runtime only; the tools are built on the invocation path.
+        ...(config.meetingTasks.enabled ? { MEETING_TASKS_ENABLED: 'true' } : {}),
         // Folder attachments (default on): a turn's folder_attachment_ids are
         // resolved and rendered as manifests. Spread in only while off, like
         // skill authoring; app-api carries its own copy.
@@ -413,6 +427,77 @@ export class InferenceAgentCoreConstruct extends Construct {
         // deployment, never per session. Spread in only while on, like
         // full-context mode; must match app-api's and the prepare Lambda's copies.
         ...(config.attachmentKb.enabled ? { ATTACHMENT_KB_ENABLED: 'true' } : {}),
+        // Source provenance verification: the Runtime builds `verify_sources`,
+        // runs the check and emits `source_provenance`. Written only while ON,
+        // so the default costs nothing against the V2 payload budget.
+        ...(config.sourceProvenance.enabled ? { SOURCE_PROVENANCE_ENABLED: 'true' } : {}),
+        // Attachment planner's token profile: the Runtime plans each turn's
+        // attachments against a per-model document budget. Written only while
+        // ON, so the default costs nothing against the V2 payload budget.
+        ...(config.attachmentPlan.enabled ? { ATTACHMENT_PLAN_ENABLED: 'true' } : {}),
+        // MCP form elicitation: the Runtime advertises form elicitation to
+        // opted-in servers, pauses the turn on a server's form and replays the
+        // call with the answer. Written only while ON, so the default costs
+        // nothing against the V2 payload budget.
+        ...(config.mcpElicitation.enabled ? { MCP_ELICITATION_ENABLED: 'true' } : {}),
+        // Release ledger writes: every cost row the Runtime stores also bumps
+        // the version-keyed LEDGER# rollups, after the stream. Written only
+        // while ON, so the default costs nothing against the V2 payload budget.
+        ...(config.releaseLedger.enabled ? { RELEASE_LEDGER_ENABLED: 'true' } : {}),
+        // Web Search result default: a `___WebSearch` call that names no
+        // maxResults asks for 5. Written only while ON, so the default costs
+        // nothing against the V2 payload budget.
+        ...(config.webSearchDefaultMaxResults.enabled
+          ? { WEB_SEARCH_DEFAULT_MAX_RESULTS_ENABLED: 'true' }
+          : {}),
+        // Word skill scripts: create/modify_word_document can run a bound
+        // skill's scripts/*.py in Code Interpreter. Written only while ON, so
+        // the default costs nothing against the V2 payload budget.
+        ...(config.wordSkillScripts.enabled ? { WORD_SKILL_SCRIPTS_ENABLED: 'true' } : {}),
+        // Documents as text: non-PDF attachments reach a Converse model as
+        // rendered text, not document blocks. Written only while ON, so the
+        // default costs nothing against the V2 payload budget.
+        ...(config.converseDocumentsAsText.enabled ? { CONVERSE_DOCUMENTS_AS_TEXT_ENABLED: 'true' } : {}),
+        // Project file readiness: a project turn names the files the model cannot
+        // see yet. Written only while ON, so the default costs nothing against
+        // the V2 payload budget.
+        ...(config.projectFileReadiness.enabled ? { PROJECT_FILE_READINESS_ENABLED: 'true' } : {}),
+        // Handoffs (in development): the Runtime accepts `handoff_context` on a
+        // target's first turn and keeps the source's HANDOFF# row current. Written
+        // only while ON, so the default costs nothing against the V2 payload budget.
+        ...(config.handoffs.enabled ? { HANDOFFS_ENABLED: 'true' } : {}),
+        // The handoff brief (in development): the source's own model writes the
+        // context card from its prompt cache. Meaningless without handoffs, so
+        // written only while both are ON; the default costs nothing.
+        ...(config.handoffs.enabled && config.handoffs.briefEnabled ? { HANDOFF_BRIEF_ENABLED: 'true' } : {}),
+        // Conversation rewind (in development): the Runtime filters rewound
+        // messages at restore and cuts a warm agent's list in place. Written
+        // only while ON, so the default costs nothing against the V2 payload budget.
+        ...(config.sessionRewind.enabled ? { SESSION_REWIND_ENABLED: 'true' } : {}),
+        // Conversation fork (in development): a fork's first turn starts from
+        // its parent's live history. Written only while ON (V2 payload budget).
+        ...(config.sessionFork.enabled ? { SESSION_FORK_ENABLED: 'true' } : {}),
+        // Typed structured extraction: the Runtime mounts `document_extract`,
+        // makes the constrained side-channel call, verifies each value through
+        // source_provenance and emits `document_extraction`. Written only while
+        // ON, so the default costs nothing against the V2 payload budget. The
+        // model id rides along only while on for the same reason — it is read
+        // on the extraction path and nowhere else.
+        ...(config.documentExtract.enabled
+          ? {
+              DOCUMENT_EXTRACT_ENABLED: 'true',
+              DOCUMENT_EXTRACT_MODEL_ID: config.documentExtract.modelId,
+              // Only when a deployment overrode it; the backend's default (4)
+              // applies otherwise and costs the V2 payload budget nothing.
+              ...(config.documentExtract.concurrency
+                ? {
+                    DOCUMENT_EXTRACT_CONCURRENCY: String(
+                      config.documentExtract.concurrency,
+                    ),
+                  }
+                : {}),
+            }
+          : {}),
         // Agent Designer harness resolution: the runtime resolves an Agent's
         // bindings + modelConfig at invocation. Default off, mirrors app-api.
         AGENTS_API_ENABLED: config.agents.enabled ? 'true' : 'false',

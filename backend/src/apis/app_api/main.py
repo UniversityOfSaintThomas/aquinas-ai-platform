@@ -16,6 +16,9 @@ import os
 env_path = Path(__file__).parent.parent.parent / '.env'
 load_dotenv(dotenv_path=env_path, override=True)
 
+# After the .env load so a local run can name its version there.
+from apis.shared.build_info import APP_VERSION  # noqa: E402
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -96,20 +99,36 @@ async def lifespan(app: FastAPI):
 
     reconcile_task = asyncio.create_task(run_reconcile_loop())
 
+    # One conditional put per build, so the release ledger knows when this
+    # build went live here (docs/specs/release-ledger.md §5.2). Off the
+    # startup path: a thread, after the app is serving.
+    from apis.shared.costs.deploy_marker import record_deploy_marker
+
+    asyncio.get_running_loop().run_in_executor(None, record_deploy_marker, "app-api")
+
+    # Event-loop lag watchdog: one uvicorn worker means synchronous work on the
+    # loop stalls every request on this task, /health included. This measures
+    # the stall (EventLoopLagMs, alarmed in CDK) so a hang is a number and a
+    # WARNING line, not a gap in the access log. Nothing it does is per request.
+    from apis.app_api.telemetry.event_loop_lag import run_event_loop_lag_monitor
+
+    lag_task = asyncio.create_task(run_event_loop_lag_monitor())
+
     yield  # Application is running
 
     # Shutdown
     logger.info("=== Agent Core Service Shutting Down ===")
     reconcile_task.cancel()
-    # return_exceptions swallows the task's CancelledError, so shutdown waits
-    # for the loop to finish without re-raising it.
-    await asyncio.gather(reconcile_task, return_exceptions=True)
+    lag_task.cancel()
+    # return_exceptions swallows the tasks' CancelledError, so shutdown waits
+    # for the loops to finish without re-raising it.
+    await asyncio.gather(reconcile_task, lag_task, return_exceptions=True)
     # TODO: Cleanup agent pool, MCP clients, etc.
 
 # Create FastAPI app with lifespan
 app = FastAPI(
     title="Agent Core Public Stack - API",
-    version=os.environ.get("APP_VERSION", "unknown"),
+    version=APP_VERSION,
     description="Agent execution and tool orchestration service",
     lifespan=lifespan
 )
@@ -217,6 +236,7 @@ logger.info("Added proxied-redirect middleware")
 # Import routers
 from apis.app_api.health import router as health_router
 from apis.app_api.auth.routes import router as auth_router
+from apis.app_api.auth.bff import cli_router as bff_cli_auth_router
 from apis.app_api.auth.bff import router as bff_auth_router
 from apis.app_api.auth.api_keys.routes import router as api_keys_router
 from apis.app_api.sessions.routes import router as sessions_router
@@ -224,6 +244,7 @@ from apis.app_api.sessions.search_routes import router as session_search_router
 from apis.app_api.admin.routes import router as admin_router
 from apis.app_api.models.routes import router as models_router
 from apis.app_api.costs.routes import router as costs_router
+from apis.app_api.quota.routes import router as quota_requests_router
 from apis.app_api.chat.routes import router as chat_router
 from apis.app_api.chat.converse_routes import router as converse_router
 from apis.app_api.chat.proxy_routes import router as bff_chat_proxy_router
@@ -243,10 +264,13 @@ from apis.app_api.tools.routes import router as tools_router
 from apis.app_api.files.routes import router as files_router
 from apis.app_api.files.folders.routes import recent_router as recent_folders_router
 from apis.app_api.files.folders.routes import router as folder_attachments_router
+from apis.app_api.handoffs.routes import router as handoffs_router
 from apis.app_api.assistants.routes import router as assistants_router
 from apis.app_api.agent_designer.routes import router as agents_router
 from apis.app_api.documents.routes import router as documents_router
 from apis.app_api.kb_upgrade.routes import router as kb_upgrade_router
+from apis.app_api.assistants.knowledge_mode import router as knowledge_mode_router
+from apis.app_api.assistants.knowledge_mode import voice_router as voice_knowledge_mode_router
 from apis.app_api.users.routes import router as users_router
 from apis.app_api.user_settings.routes import router as user_settings_router
 from apis.app_api.connectors.routes import router as connectors_router
@@ -269,20 +293,25 @@ from apis.app_api.schedules.routes import router as schedules_router
 app.include_router(health_router)
 app.include_router(auth_router)
 app.include_router(bff_auth_router)  # BFF Token Handler auth routes (Phase 3, dormant until SPA cutover)
+app.include_router(bff_cli_auth_router)  # CLI device-authorization flow (/auth/cli/*)
 app.include_router(api_keys_router)
 app.include_router(session_search_router)  # GET /sessions/search; 404s while CONVERSATION_SEARCH_ENABLED is off
 app.include_router(sessions_router)
 app.include_router(folder_attachments_router)  # /sessions/{id}/folders (drive-folder PR-A); 404s while FOLDER_ATTACHMENTS_ENABLED is off
 app.include_router(recent_folders_router)  # /folders/recent (composer picker PR-2); 404s while FOLDER_ATTACHMENTS_ENABLED is off
+app.include_router(handoffs_router)  # /sessions/{id}/handoffs (handoffs PR-0.1); 404s while HANDOFFS_ENABLED is off
 app.include_router(admin_router)
 app.include_router(assistants_router)
 app.include_router(agents_router)  # Agent Designer /agents surface; 404s while AGENTS_API_ENABLED off
 app.include_router(documents_router)
+app.include_router(knowledge_mode_router)  # Agent Designer: whole vs searched knowledge base
+app.include_router(voice_knowledge_mode_router)  # Agent Designer: how voice mode uses the knowledge base (#625)
 app.include_router(kb_upgrade_router)  # Owner-facing KB upgrade card; phase "none" (renders nothing) while MANAGED_KB_MIGRATION_ENABLED is off
 app.include_router(users_router)
 app.include_router(user_settings_router)
 app.include_router(models_router)
 app.include_router(costs_router)
+app.include_router(quota_requests_router)  # /quota/* quota requests; 404s while QUOTA_REQUESTS_ENABLED is off
 app.include_router(chat_router)  # Application-specific chat endpoints
 app.include_router(converse_router)  # API-key authenticated /chat/api-converse (Bedrock Converse)
 app.include_router(bff_chat_proxy_router)  # Cookie-authenticated SSE proxy (Phase 4, dormant until SPA cutover)

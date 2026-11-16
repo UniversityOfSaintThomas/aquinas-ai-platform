@@ -7,6 +7,7 @@ import {
   ElementRef,
   OnInit,
   OnDestroy,
+  Injector,
 } from '@angular/core';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import {
@@ -32,6 +33,7 @@ import {
   heroCheck,
   heroAdjustmentsHorizontal,
   heroChevronDown,
+  heroMicrophone,
 } from '@ng-icons/heroicons/outline';
 import { Dialog } from '@angular/cdk/dialog';
 import { PickerComponent } from '@ctrl/ngx-emoji-mart';
@@ -40,9 +42,11 @@ import { AgentService } from '../services/agent.service';
 import {
   Agent,
   AgentBinding,
+  AgentModelConfig,
   BindableItem,
   BindableServerTool,
   ModelParamSpec,
+  ResponseStrictness,
   SupportedParams,
 } from '../models/agent.model';
 import { SidenavService } from '../../services/sidenav/sidenav.service';
@@ -66,6 +70,7 @@ import {
   ShareAgentDialogData,
 } from '../components/share-agent-dialog.component';
 import { KnowledgeBaseSectionComponent } from '../../knowledge-base/knowledge-base-section.component';
+import { KnowledgeModeService, VoiceKnowledgeModeStatus } from '../../knowledge-base/knowledge-mode.service';
 import { ToolService, retirementDetail } from '../../services/tool/tool.service';
 import { modelRetirementDetail } from '../../shared/utils/retirement';
 import { AGENT_TEMPLATE_DRAFT_KEY, TemplateDraft } from './agent-templates';
@@ -147,6 +152,7 @@ const AUTHOR_HIDDEN_PARAMS: ReadonlySet<string> = new Set(['max_tokens']);
       heroCheck,
       heroAdjustmentsHorizontal,
       heroChevronDown,
+      heroMicrophone,
     }),
   ],
 })
@@ -161,6 +167,7 @@ export class AgentFormPage implements OnInit, OnDestroy {
   private dialog = inject(Dialog);
   private host = inject(ElementRef<HTMLElement>);
   private toolService = inject(ToolService);
+  private injector = inject(Injector);
 
   form!: FormGroup;
   private formSub?: Subscription;
@@ -239,6 +246,39 @@ export class AgentFormPage implements OnInit, OnDestroy {
    */
   readonly toolsOpen = signal(true);
   readonly selectedSkillRefs = signal<Set<string>>(new Set());
+  /**
+   * The model as stored on the loaded record. A share editor's palette lists only
+   * their own models, so the agent's model may be absent from it; saving must then
+   * keep the stored `provider` rather than drop it (the runtime routes on it).
+   */
+  private readonly storedModelConfig = signal<AgentModelConfig | null>(null);
+
+  /**
+   * How many of the agent's model, tools and skills are not in the current user's
+   * palettes — typically a share editor who lacks something the owner bound. They are
+   * still sent on save (the backend keeps bindings already on the record), so the
+   * note only explains why they aren't listed. Zero while palettes are loading.
+   */
+  readonly unavailableBindingCount = computed(() => {
+    if (this.loadingPalettes() || this.mode() !== 'edit' || this.isViewer()) return 0;
+    let count = 0;
+    const modelId = this.selectedModelId();
+    if (modelId && !this.models().some((m) => m.ref === modelId)) count++;
+    const toolRefs = new Set(this.tools().map((t) => t.ref));
+    for (const ref of this.selectedToolRefs()) if (!toolRefs.has(baseToolId(ref))) count++;
+    const skillRefs = new Set(this.skills().map((t) => t.ref));
+    for (const ref of this.selectedSkillRefs()) if (!skillRefs.has(ref)) count++;
+    return count;
+  });
+
+  /** The info line for {@link unavailableBindingCount}; empty when there is nothing to say. */
+  readonly unavailableBindingNote = computed(() => {
+    const n = this.unavailableBindingCount();
+    if (n === 0) return '';
+    return n === 1
+      ? "1 model, tool or skill on this agent isn't available to your account, so it isn't listed below. It stays on the agent when you save."
+      : `${n} models, tools or skills on this agent aren't available to your account, so they aren't listed below. They stay on the agent when you save.`;
+  });
 
   // ---- model params (governed by the selected model's supportedParams) --------
   private readonly selectedModel = computed<BindableItem | undefined>(() =>
@@ -283,6 +323,86 @@ export class AgentFormPage implements OnInit, OnDestroy {
   /** #111: mirrors the showCitations control so the template can grey out and
    *  explain the dependent "Allow document downloads" toggle. */
   readonly liveShowCitations = signal(true);
+  /** #112: mirrors the responseStrictness control so the helper text follows the selection. */
+  readonly liveResponseStrictness = signal<ResponseStrictness>('balanced');
+  readonly strictnessOptions: { value: ResponseStrictness; label: string; help: string }[] = [
+    {
+      value: 'strict',
+      label: 'Only use documents',
+      help: "Answers only from its documents. If they don't cover a question, it says so instead of using general knowledge, web search or other tools.",
+    },
+    {
+      value: 'balanced',
+      label: 'Prefer documents',
+      help: "Uses its documents first, and may use general knowledge when they don't cover a question.",
+    },
+    {
+      value: 'flexible',
+      label: 'Use documents as context',
+      help: 'Uses its documents as context alongside general knowledge and its tools.',
+    },
+  ];
+
+  /** #625: mirrors the voiceEnabled control so the voice section's notices show only when it is on. */
+  readonly liveVoiceEnabled = signal(false);
+  /** #625: how the saved knowledge base would reach a voice conversation. Null until read. */
+  readonly voiceKnowledge = signal<VoiceKnowledgeModeStatus | null>(null);
+
+  /**
+   * #625: one sentence about the knowledge base in voice, or null when there is nothing
+   * to say. Voice has no search step, so a knowledge base reaches it whole or not at all.
+   */
+  readonly voiceKnowledgeNotice = computed<{ tone: 'warning' | 'info'; text: string } | null>(() => {
+    const kb = this.voiceKnowledge();
+    if (!this.liveVoiceEnabled() || !kb) return null;
+    const tokens = (n: number) => `about ${n.toLocaleString()} tokens`;
+    switch (kb.mode) {
+      case 'large':
+        return {
+          tone: 'warning',
+          text:
+            `This knowledge base is ${tokens(kb.estimatedTokens)}. Voice sends all of it to each conversation, ` +
+            `so voice sessions may take longer to start, cost more and miss details. Voice works best under ` +
+            `${kb.largeTokens.toLocaleString()} tokens.`,
+        };
+      case 'too_large':
+        return {
+          tone: 'warning',
+          text:
+            kb.estimatedTokens > 0
+              ? `This knowledge base is too large for a voice conversation (${tokens(kb.estimatedTokens)}; the limit ` +
+                `is ${kb.budgetTokens.toLocaleString()}). Voice won't use it.`
+              : "This knowledge base's files are too large for a voice conversation. Voice won't use it.",
+        };
+      case 'unreadable':
+        return {
+          tone: 'warning',
+          text:
+            kb.reason === 'no_text_layer'
+              ? "Voice can't read one of these documents (a scan with no text), so it won't use this knowledge base."
+              : "Voice can only read text documents (PDF, Word, text, Markdown, HTML), so it won't use this knowledge base.",
+        };
+      case 'off':
+        return { tone: 'info', text: "Knowledge bases aren't available in voice mode on this deployment." };
+      case 'whole':
+        return kb.skippedDocuments.length
+          ? { tone: 'info', text: `Voice can't read spreadsheets or presentations: ${kb.skippedDocuments.join(', ')}.` }
+          : null;
+      default:
+        return null;
+    }
+  });
+
+  /**
+   * #625: the selected tools voice mode leaves out. A tool loads in voice only when an
+   * admin marked it as available in voice (fast, and useful to a listener).
+   */
+  readonly toolsNotInVoice = computed<string[]>(() =>
+    this.tools()
+      .filter((t) => this.isToolSelected(t.ref) && t.meta?.['voiceAvailable'] !== true)
+      .map((t) => t.label)
+      .sort((a, b) => a.localeCompare(b)),
+  );
 
   /** Model/params/bindings resolve from the SAVED record, so the preview needs a
    * save to reflect changes to them. Persona/instructions preview live. `form.dirty`
@@ -314,6 +434,17 @@ export class AgentFormPage implements OnInit, OnDestroy {
       // as today. The author opts out per-agent.
       showCitations: [true],
       allowDocumentDownload: [true],
+      // #112: 'balanced' is today's behavior.
+      responseStrictness: ['balanced'],
+      // #625: voice is opt-in per agent; when on, it uses only the agent's instructions
+      // unless the author adds the built-in voice guidelines.
+      voiceEnabled: [false],
+      voiceInstructionsOnly: [true],
+    });
+
+    // #625: read how the knowledge base reaches voice when the author turns voice on.
+    this.form.get('voiceEnabled')!.valueChanges.subscribe((on: boolean) => {
+      if (on) void this.refreshVoiceKnowledge();
     });
 
     // #111 dependency: downloads are only meaningful when citations are shown. When the
@@ -363,6 +494,18 @@ export class AgentFormPage implements OnInit, OnDestroy {
     this.liveFormEmoji.set(this.form.get('emoji')?.value || '');
     this.liveFormStarters.set(this.starters.value || []);
     this.liveShowCitations.set(this.form.get('showCitations')?.value !== false);
+    this.liveResponseStrictness.set(this.form.get('responseStrictness')?.value ?? 'balanced');
+    this.liveVoiceEnabled.set(this.form.get('voiceEnabled')?.value === true);
+  }
+
+  /** #625: re-read the knowledge base's voice mode. Needs a saved agent; editors only. */
+  private async refreshVoiceKnowledge(): Promise<void> {
+    const id = this.agentId();
+    if (!id || this.isViewer()) return;
+    // Resolved on first use: it is only needed once an author turns voice on, and the
+    // knowledge-base section already owns the HTTP-backed mode reads on this page.
+    const knowledgeMode = this.injector.get(KnowledgeModeService);
+    this.voiceKnowledge.set(await knowledgeMode.getVoiceMode(id));
   }
 
   /**
@@ -533,6 +676,10 @@ export class AgentFormPage implements OnInit, OnDestroy {
       // #111: absent (legacy agent or template draft) ⇒ default on.
       showCitations: agent.showCitations ?? true,
       allowDocumentDownload: agent.allowDocumentDownload ?? true,
+      responseStrictness: agent.responseStrictness ?? 'balanced',
+      // #625: absent (legacy agent or template draft) ⇒ voice off, instructions only.
+      voiceEnabled: agent.voiceEnabled ?? false,
+      voiceInstructionsOnly: agent.voiceInstructionsOnly ?? true,
     });
     // Reflect the citations→downloads dependency for the freshly loaded values.
     this.syncDownloadToggleEnabled(agent.showCitations ?? true);
@@ -540,6 +687,7 @@ export class AgentFormPage implements OnInit, OnDestroy {
     (agent.starters ?? []).forEach((s) => this.starters.push(new FormControl(s, Validators.required)));
 
     this.selectedModelId.set(agent.modelConfig?.modelId ?? null);
+    this.storedModelConfig.set(agent.modelConfig ?? null);
     this.modelParams.set(
       stripHiddenParams(
         (agent.modelConfig?.params ?? {}) as Record<string, number | string>,
@@ -930,7 +1078,12 @@ export class AgentFormPage implements OnInit, OnDestroy {
     // Responses API, not Bedrock ConverseStream); without it the binding resolves
     // to provider=None and a Mantle model fails with an invalid-model-identifier
     // error. Mirrors what the normal chat path sends with every request.
-    const provider = this.selectedModel()?.meta?.['provider'] as string | undefined;
+    // A model outside the user's palette (a share editor without the owner's model)
+    // keeps the provider stored on the record.
+    const stored = this.storedModelConfig();
+    const provider =
+      (this.selectedModel()?.meta?.['provider'] as string | undefined) ??
+      (stored?.modelId === this.selectedModelId() ? stored?.provider : undefined);
     const payload = {
       name: v.name,
       description: v.description,
@@ -950,6 +1103,9 @@ export class AgentFormPage implements OnInit, OnDestroy {
       // downloads control is dropped from form.value, so derive it explicitly).
       showCitations: v.showCitations !== false,
       allowDocumentDownload: v.showCitations !== false ? v.allowDocumentDownload !== false : false,
+      responseStrictness: v.responseStrictness ?? 'balanced',
+      voiceEnabled: v.voiceEnabled === true,
+      voiceInstructionsOnly: v.voiceInstructionsOnly !== false,
     };
 
     this.saving.set(true);

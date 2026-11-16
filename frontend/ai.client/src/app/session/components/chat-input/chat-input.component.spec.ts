@@ -4,7 +4,7 @@ import { Router } from '@angular/router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AgentMentionService, MentionableAgent } from '../../../agents/services/agent-mention.service';
 import { SkillCommand, SkillCommandService } from '../../../services/skill/skill-command.service';
-import { FileMetadata, FileUploadService } from '../../../services/file-upload';
+import { FileMetadata, FileUploadService, PendingUpload } from '../../../services/file-upload';
 import { FileSourceService } from '../../../assistants/services/file-source.service';
 import { SystemPromptsService } from '../../../services/system-prompts/system-prompts.service';
 import { ToastService } from '../../../services/toast/toast.service';
@@ -20,10 +20,12 @@ import {
   type DictationStatus,
 } from '../../services/dictation';
 import { SteeringService } from '../../services/chat/steering.service';
+import { ChatStateService } from '../../services/chat/chat-state.service';
 import { ComposerDraftService } from '../../services/session/composer-draft.service';
 import { NEW_CONVERSATION_DRAFT_KEY } from '../../services/session/composer-draft-storage.service';
 import { ChatInputComponent, spliceDictation } from './chat-input.component';
 import { ComposerHandoffService } from './composer-handoff.service';
+import { InlineBudgetNoticeComponent } from './inline-budget-notice.component';
 import { SessionPrewarmService } from '../../services/session/session-prewarm.service';
 import { ShortcutTargetsService } from '../../../components/shortcuts/shortcut-targets.service';
 
@@ -95,6 +97,7 @@ class SkillCommandServiceStub {
   readonly commands = signal<SkillCommand[]>(SKILLS);
   readonly loading = signal(false);
   readonly agentLocked = signal(false);
+  readonly resolving = signal(false);
   async load(): Promise<void> {}
   search(query: string): SkillCommand[] {
     const needle = query.trim().toLowerCase();
@@ -430,6 +433,57 @@ describe('ChatInputComponent — the `/` skill-command menu', () => {
     expect(payload?.invokedSkillIds).toBeUndefined();
   });
 
+  describe('paste count (a length only, never the text)', () => {
+    function paste(text: string): void {
+      // jsdom has no DataTransfer, so the event carries a stub with the one
+      // method the composer reads.
+      const event = new Event('paste', { bubbles: true });
+      Object.defineProperty(event, 'clipboardData', {
+        value: { getData: (type: string) => (type === 'text/plain' ? text : '') },
+      });
+      textarea.dispatchEvent(event);
+      type(textarea.value + text);
+    }
+
+    function sent(): { pastedChars?: number } | undefined {
+      let payload: { pastedChars?: number } | undefined;
+      component.messageSubmitted.subscribe((event) => (payload = event));
+      component.submitChatRequest();
+      return payload;
+    }
+
+    it('sends how many characters were pasted', () => {
+      type('Summarise this: ');
+      paste('x'.repeat(5_000));
+      expect(sent()?.pastedChars).toBe(5_000);
+    });
+
+    it('omits the field when nothing was pasted', () => {
+      type('typed by hand');
+      expect(sent()?.pastedChars).toBeUndefined();
+    });
+
+    it('never counts more than the message holds', () => {
+      paste('y'.repeat(400));
+      type('short');
+      expect(sent()?.pastedChars).toBe(5);
+    });
+
+    it('forgets a paste once the text is cleared', () => {
+      paste('z'.repeat(300));
+      type('');
+      type('fresh message');
+      expect(sent()?.pastedChars).toBeUndefined();
+    });
+
+    it('starts again from zero after a send', () => {
+      paste('a'.repeat(50));
+      sent();
+      type('next one, typed');
+      expect(sent()?.pastedChars).toBeUndefined();
+    });
+  });
+
   it('tints the command in place, and deleting it un-invokes, because the text is the binding', () => {
     type('/brand-deck make me a deck');
     const marked = component['highlightSegments']()?.filter((segment) => segment.mark);
@@ -588,10 +642,9 @@ describe('ChatInputComponent — queueing a follow-up mid-stream', () => {
     expect(component.queuedMessages()).toEqual([]);
   });
 
-  it('flushes after an aborted or failed turn too, not just a clean finish', () => {
-    // The composer cannot tell done from abort from error — it only sees
-    // loading go false. Reading the flush as an invariant rather than a
-    // transition is what makes all three paths behave the same.
+  it('flushes after an aborted turn too, not just a clean finish', () => {
+    // The Stop the user pressed is the end of that turn, so what they queued
+    // while it ran is still what they want next.
     setStreaming(true);
     type('follow-up');
     pressEnter();
@@ -601,6 +654,73 @@ describe('ChatInputComponent — queueing a follow-up mid-stream', () => {
 
     expect(cancelled).toBe(1);
     expect(submitted.map(m => m.content)).toEqual(['follow-up']);
+  });
+
+  describe('when the turn ends in an error', () => {
+    // A turn that fails slowly (a model read timeout: minutes of silence under
+    // the loader's silence hint) is exactly when a user types "is this working?" or the
+    // next request. Sending that the instant the error lands started a new turn
+    // under the failed one's "Please try again" — and the server re-sends the
+    // failed turn's attachments with the first turn after a failure, so the
+    // failed request really did run again, alongside the new one.
+    beforeEach(() => {
+      fixture.componentRef.setInput('sessionId', 'sess-1');
+      fixture.detectChanges();
+    });
+
+    function failTurn(): void {
+      TestBed.inject(ChatStateService).setStopReason('sess-1', 'error');
+      setStreaming(false);
+    }
+
+    it('puts the queued follow-up back in the composer instead of sending it', () => {
+      setStreaming(true);
+      type('is this still working?');
+      pressEnter();
+
+      failTurn();
+
+      expect(submitted).toEqual([]);
+      expect(component.queuedMessages()).toEqual([]);
+      expect(component.userInput()).toBe('is this still working?');
+      expect(textarea.value).toBe('is this still working?');
+    });
+
+    it('returns every queued follow-up, ahead of what is being typed, in order', () => {
+      setStreaming(true);
+      type('one');
+      pressEnter();
+      type('two');
+      pressEnter();
+      type('three, still typing');
+
+      failTurn();
+
+      expect(submitted).toEqual([]);
+      expect(component.userInput()).toBe('one\n\ntwo\n\nthree, still typing');
+    });
+
+    it('sends normally once the user presses Enter on it', () => {
+      setStreaming(true);
+      type('try that again');
+      pressEnter();
+      failTurn();
+
+      pressEnter();
+
+      expect(submitted.map(m => m.content)).toEqual(['try that again']);
+    });
+
+    it('still flushes after a max_tokens ending, which is not a failure', () => {
+      setStreaming(true);
+      type('follow-up');
+      pressEnter();
+
+      TestBed.inject(ChatStateService).setStopReason('sess-1', 'max_tokens');
+      setStreaming(false);
+
+      expect(submitted.map(m => m.content)).toEqual(['follow-up']);
+    });
   });
 
   it('stamps the timestamp at send time, not queue time', () => {
@@ -1470,7 +1590,6 @@ describe('ChatInputComponent — unsent text survives leaving the conversation',
       mimeType: 'application/pdf',
       sizeBytes: 2048,
       sessionId,
-      s3Uri: `s3://bucket/${uploadId}`,
       status: 'ready',
       createdAt: '2026-09-21T00:00:00Z',
     };
@@ -2477,7 +2596,8 @@ describe('ChatInputComponent voice mode options', () => {
     const voice = TestBed.inject(VoiceChatService);
     await openMenu();
     (menu()!.querySelector('[data-testid="voice-menu-start"]') as HTMLButtonElement).click();
-    expect(voice.connect).toHaveBeenCalledWith('s1');
+    // No Agent on this chat, so voice names none (#625).
+    expect(voice.connect).toHaveBeenCalledWith('s1', null);
   });
 });
 
@@ -2622,7 +2742,6 @@ describe('ChatInputComponent — the `+` menu hand-offs', () => {
     mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     sizeBytes: 1234,
     sessionId: 's1',
-    s3Uri: 's3://b/k',
     status: 'ready',
     createdAt: '2026-10-13T00:00:00Z',
   };
@@ -2681,6 +2800,33 @@ describe('ChatInputComponent — the `+` menu hand-offs', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     fixture.detectChanges();
   }
+
+  it('refuses a dropped sixth attachment when the five come from mixed sources', async () => {
+    // Restored, importing and folder attachments all fill slots; the drop
+    // path used to count pendingUploads() only (unified-attachment-delivery §1.3).
+    const upload = TestBed.inject(FileUploadService) as unknown as { uploadFile: ReturnType<typeof vi.fn> };
+    upload.uploadFile = vi.fn(async () => ({}));
+    const toast = TestBed.inject(ToastService);
+    const warning = vi.spyOn(toast, 'warning');
+
+    component.restoredAttachments.set([META, { ...META, uploadId: 'up-2' }, { ...META, uploadId: 'up-3' }]);
+    component.importingAttachments.set([
+      { file: new File(['x'], 'Doc.docx'), uploadId: 'import-1', status: 'uploading', progress: 0 },
+    ]);
+    component.attachedFolders.set([
+      {
+        localId: 'f1', folderAttachId: 'fa1', sessionId: 's1', name: 'Reports', source: 'Google Drive',
+        row: null, phase: 'attached', error: null,
+      },
+    ]);
+    expect(component.remainingFileSlots()).toBe(0);
+
+    const dropped = new File(['SELECT 1;'], 'q.sql', { type: 'text/plain' });
+    await (component as unknown as { processFiles(f: File[]): Promise<void> }).processFiles([dropped]);
+
+    expect(upload.uploadFile).not.toHaveBeenCalled();
+    expect(warning).toHaveBeenCalledWith('File Limit', 'Maximum 5 files per message. You can add 0 more.');
+  });
 
   it('shows a card while app-api fetches a file-source file, then holds it as metadata', async () => {
     let resolve!: (meta: FileMetadata) => void;
@@ -2912,5 +3058,180 @@ describe('ChatInputComponent — a project conversation', () => {
   it("offers `/` as the member's own skills when the project binds none", () => {
     setProject();
     expect(hints()).toContain('Type / to run one of your skills');
+  });
+
+  // A project's harness dictates the skills, to none when it binds none, so a member's
+  // own skills are never offered in one. These pin what the composer says instead.
+  function lockToProjectWithNoSkills(): SkillCommandServiceStub {
+    const commands = TestBed.inject(SkillCommandService) as unknown as SkillCommandServiceStub;
+    commands.agentLocked.set(true);
+    commands.commands.set([]);
+    setProject();
+    return commands;
+  }
+
+  it('says where skills come from when the project binds none', () => {
+    lockToProjectWithNoSkills();
+    expect(hints()).toContain('Skills for this project are chosen on its Skills page');
+    expect(hints().some((hint) => hint.startsWith('Type /'))).toBe(false);
+  });
+
+  it('does not repeat that hint when the project has skills to run', () => {
+    (TestBed.inject(SkillCommandService) as unknown as SkillCommandServiceStub).agentLocked.set(true);
+    setProject();
+    expect(hints()).not.toContain('Skills for this project are chosen on its Skills page');
+  });
+
+  it('keeps that hint out of a plain conversation with no skills', () => {
+    (TestBed.inject(SkillCommandService) as unknown as SkillCommandServiceStub).commands.set([]);
+    fixture.detectChanges();
+    expect(hints()).not.toContain('Skills for this project are chosen on its Skills page');
+  });
+
+  it('opens the `/` menu in a project that binds no skills, so its empty state can point at the Skills page', () => {
+    lockToProjectWithNoSkills();
+    type('/');
+    expect(fixture.componentInstance.isSkillMenuOpen()).toBe(true);
+    expect(fixture.componentInstance.projectSkillsLocked()).toBe(true);
+  });
+
+  it('says nothing about the Skills page while the project\'s skills are still resolving', () => {
+    // A member's commands are empty until the Agent resolves its bound skills for them.
+    // That gap is not "the project has no skills", so the hint and the menu wait.
+    const commands = lockToProjectWithNoSkills();
+    commands.resolving.set(true);
+    fixture.detectChanges();
+    expect(hints()).not.toContain('Skills for this project are chosen on its Skills page');
+    type('/');
+    expect(fixture.componentInstance.isSkillMenuOpen()).toBe(false);
+
+    commands.resolving.set(false);
+    fixture.detectChanges();
+    expect(hints()).toContain('Skills for this project are chosen on its Skills page');
+    expect(fixture.componentInstance.isSkillMenuOpen()).toBe(true);
+  });
+
+  it('keeps the `/` menu shut outside a project when there are no skills', () => {
+    (TestBed.inject(SkillCommandService) as unknown as SkillCommandServiceStub).commands.set([]);
+    type('/');
+    expect(fixture.componentInstance.isSkillMenuOpen()).toBe(false);
+  });
+
+  it("sends Browse to the project's Skills page, not Customize, in a project", () => {
+    const router = TestBed.inject(Router);
+    const navigate = vi.spyOn(router, 'navigate');
+    lockToProjectWithNoSkills();
+    fixture.componentInstance.onSkillBrowseAll();
+    expect(navigate).toHaveBeenCalledWith(['/projects', 'p1', 'skills']);
+
+    fixture.componentRef.setInput('project', null);
+    fixture.detectChanges();
+    fixture.componentInstance.onSkillBrowseAll();
+    expect(navigate).toHaveBeenLastCalledWith(['/customize/skills']);
+  });
+});
+
+describe('ChatInputComponent — the combined inline budget, before send', () => {
+  let fixture: ComponentFixture<ChatInputComponent>;
+  let component: ChatInputComponent;
+  const pendingUploads = signal<PendingUpload[]>([]);
+  const MB = 1_000_000;
+
+  /** A local upload of `size` bytes; only name, type and size are read. */
+  function upload(uploadId: string, name: string, size: number, type = 'application/pdf', status: PendingUpload['status'] = 'ready'): PendingUpload {
+    return { file: { name, type, size } as File, uploadId, status, progress: 100 };
+  }
+
+  function restored(uploadId: string, filename: string, sizeBytes: number): FileMetadata {
+    return { uploadId, filename, mimeType: 'application/pdf', sizeBytes, sessionId: 's1', status: 'ready', createdAt: '' };
+  }
+
+  function notice(): HTMLElement | null {
+    return (fixture.nativeElement as HTMLElement).querySelector('[data-testid="inline-budget-notice"]');
+  }
+
+  beforeEach(async () => {
+    pendingUploads.set([]);
+    await TestBed.configureTestingModule({
+      imports: [ChatInputComponent],
+      providers: [
+        { provide: AgentMentionService, useClass: MentionServiceStub },
+        { provide: SkillCommandService, useClass: SkillCommandServiceStub },
+        {
+          provide: FileUploadService,
+          useValue: {
+            pendingUploadsList: pendingUploads,
+            hasActivePendingUploads: signal(false),
+            readyUploadIds: computed(() => pendingUploads().filter(u => u.status === 'ready').map(u => u.uploadId)),
+            readyUploads: signal([]),
+            clearReadyUploads: () => undefined,
+            clearPendingUpload: () => undefined,
+            listSessionFiles: async () => [],
+            registerKnownFile: () => undefined,
+          },
+        },
+        { provide: ToastService, useValue: { error: () => undefined, warning: () => undefined, info: () => undefined } },
+        { provide: ToolService, useValue: {} },
+        { provide: ModelService, useClass: ModelServiceStub },
+        {
+          provide: VoiceChatService,
+          useValue: { status: signal('idle'), isVoiceActive: signal(false), agentTranscript: signal('') },
+        },
+        { provide: SystemPromptsService, useValue: { activePrompt: signal(null) } },
+        { provide: Router, useValue: { navigate: () => Promise.resolve(true) } },
+        { provide: SteeringService, useClass: SteeringServiceStub },
+      ],
+    })
+      .overrideComponent(ChatInputComponent, { set: { imports: [InlineBudgetNoticeComponent], schemas: [NO_ERRORS_SCHEMA] } })
+      .compileComponents();
+
+    fixture = TestBed.createComponent(ChatInputComponent);
+    component = fixture.componentInstance;
+    fixture.componentRef.setInput('showVoiceControl', false);
+    fixture.componentRef.setInput('autoFocus', false);
+    fixture.componentRef.setInput('sessionId', 's1');
+    fixture.detectChanges();
+  });
+
+  it('says nothing while the attachments fit', () => {
+    pendingUploads.set([upload('u1', 'policy-b.pdf', 3.9 * MB), upload('u2', 'policy-c.pdf', 2.7 * MB)]);
+    fixture.detectChanges();
+
+    expect(component.budgetOverflow()).toBeNull();
+    expect(notice()).toBeNull();
+    // The live region is already there, so the notice is announced when it comes.
+    expect((fixture.nativeElement as HTMLElement).querySelector('app-inline-budget-notice')?.getAttribute('role')).toBe('status');
+  });
+
+  it('names the file that will not fit as soon as it is attached, before send', () => {
+    pendingUploads.set([
+      upload('u1', 'policy-a.pdf', 5.7 * MB),
+      upload('u2', 'policy-b.pdf', 3.9 * MB),
+      upload('u3', 'policy-c.pdf', 0.17 * MB),
+      // Still uploading: it will travel, so it counts.
+      upload('u4', 'policy-d.pdf', 4.0 * MB, 'application/pdf', 'uploading'),
+      upload('u5', 'policy-e.pdf', 2.7 * MB),
+    ]);
+    fixture.detectChanges();
+
+    expect(notice()?.textContent?.replace(/\s+/g, ' ')).toContain(
+      'policy-d.pdf will be read from storage instead, in the parts the answer needs.',
+    );
+  });
+
+  it('judges restored attachments first, in the order the send carries them', () => {
+    component.restoredAttachments.set([restored('r1', 'earlier.pdf', 3.9 * MB)]);
+    pendingUploads.set([upload('u1', 'photo.png', 3.5 * MB, 'image/png')]);
+    fixture.detectChanges();
+
+    expect(component.budgetOverflow()?.dropped.map(f => f.filename)).toEqual(['photo.png']);
+    expect(notice()?.textContent).toContain("won't be included. Send it in a follow-up message.");
+  });
+
+  it('ignores a failed upload, which does not travel', () => {
+    pendingUploads.set([upload('u1', 'a.pdf', 3.9 * MB), upload('u2', 'b.pdf', 3.9 * MB, 'application/pdf', 'error')]);
+    fixture.detectChanges();
+
+    expect(notice()).toBeNull();
   });
 });

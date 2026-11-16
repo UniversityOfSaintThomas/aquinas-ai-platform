@@ -50,6 +50,22 @@ describe('MessageActionsComponent — Continue affordance', () => {
     expect(continueButton(fixture)).not.toBeNull();
   });
 
+  it('says the answer hit the output limit and that Continue resumes it', () => {
+    fixture.componentRef.setInput('canContinue', true);
+    fixture.detectChanges();
+    const notice = fixture.nativeElement.querySelector('[data-testid="max-tokens-notice"]') as HTMLElement;
+    expect(notice).not.toBeNull();
+    // Names the cause (the model's output cap, not a failure) and what the
+    // button does, so a user does not resend the whole request instead.
+    expect(notice.textContent).toContain("Cut off at the model's output limit.");
+    expect(notice.textContent).toContain('Continue picks up where it stopped.');
+  });
+
+  it('shows no output-limit notice without canContinue', () => {
+    fixture.detectChanges();
+    expect(fixture.nativeElement.querySelector('[data-testid="max-tokens-notice"]')).toBeNull();
+  });
+
   it('emits continueRequested when the Continue button is clicked', () => {
     fixture.componentRef.setInput('canContinue', true);
     fixture.detectChanges();
@@ -119,7 +135,7 @@ describe('MessageActionsComponent — interrupted-turn chip', () => {
     fixture.detectChanges();
 
     // The truncated-turn label wins; the interrupted chip is not also shown.
-    expect(fixture.nativeElement.textContent).toContain('Response length limit reached');
+    expect(fixture.nativeElement.textContent).toContain("Cut off at the model's output limit");
     expect(fixture.nativeElement.textContent).not.toContain('Response interrupted');
   });
 });
@@ -321,5 +337,57 @@ describe('MessageActionsComponent — the copy shortcut', () => {
     fixture.componentRef.setInput('latest', true);
     fixture.detectChanges();
     expect(targets.canCopyLatestResponse()).toBe(false);
+  });
+});
+
+describe('MessageActionsComponent — provider outage row', () => {
+  let fixture: ComponentFixture<MessageActionsComponent>;
+  let component: MessageActionsComponent;
+
+  const offer = { label: 'AWS service issue', modelName: 'Claude Opus 5.5' };
+
+  function row(): HTMLElement | null {
+    return fixture.nativeElement.querySelector('[data-testid="provider-outage-row"]');
+  }
+
+  function button(label: string): HTMLButtonElement | null {
+    return fixture.nativeElement.querySelector(`button[aria-label="${label}"]`);
+  }
+
+  beforeEach(async () => {
+    await TestBed.configureTestingModule({
+      imports: [MessageActionsComponent],
+      providers: [provideMarkdown()],
+    }).compileComponents();
+    TestBed.inject(MarkdownService).parse = () => '';
+
+    fixture = TestBed.createComponent(MessageActionsComponent);
+    component = fixture.componentInstance;
+    fixture.componentRef.setInput('messages', [makeMessage('⚠️ down')]);
+  });
+
+  it('shows nothing without an outage', () => {
+    fixture.detectChanges();
+    expect(row()).toBeNull();
+  });
+
+  it('says whose fault it is and offers Try again, with no model switch', () => {
+    fixture.componentRef.setInput('outageOffer', offer);
+    fixture.detectChanges();
+
+    expect(row()?.textContent).toContain('AWS service issue');
+    expect(button('Send your last message again on Claude Opus 5.5')?.textContent).toContain('Try again');
+    expect(row()?.textContent).not.toContain('Try with');
+  });
+
+  it('emits when Try again is clicked', () => {
+    fixture.componentRef.setInput('outageOffer', { ...offer, modelName: null });
+    fixture.detectChanges();
+    let clicks = 0;
+    component.outageRetryRequested.subscribe(() => clicks++);
+
+    button('Send your last message again')!.click();
+
+    expect(clicks).toBe(1);
   });
 });

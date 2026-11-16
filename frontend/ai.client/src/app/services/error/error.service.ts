@@ -17,6 +17,8 @@ export enum ErrorCode {
   INTERNAL_ERROR = 'internal_error',
   SERVICE_UNAVAILABLE = 'service_unavailable',
   TIMEOUT = 'timeout',
+  /** The model provider (Bedrock, OpenAI, Gemini) failed on its side. */
+  PROVIDER_UNAVAILABLE = 'provider_unavailable',
 
   // Agent-specific errors
   AGENT_ERROR = 'agent_error',
@@ -160,11 +162,10 @@ export class ErrorService {
         };
       } else {
         // Fallback to status-based message
-        errorMessage = this.createErrorMessageFromStatus(status, error.message);
-        // Add technical details to the detail field
-        if (!errorMessage.detail) {
-          errorMessage.detail = this.buildTechnicalDetails(error);
-        }
+        // Angular's HttpErrorResponse.message embeds the request URL, so go
+        // through buildTechnicalDetails (which redacts it) rather than
+        // passing error.message straight into the toast detail.
+        errorMessage = this.createErrorMessageFromStatus(status, this.buildTechnicalDetails(error));
       }
     } else if (error instanceof Error) {
       errorMessage = this.createErrorMessage(
@@ -295,6 +296,7 @@ export class ErrorService {
       [ErrorCode.INTERNAL_ERROR]: 'Server Error',
       [ErrorCode.SERVICE_UNAVAILABLE]: 'Service Unavailable',
       [ErrorCode.TIMEOUT]: 'Request Timeout',
+      [ErrorCode.PROVIDER_UNAVAILABLE]: 'Model Provider Unavailable',
       [ErrorCode.AGENT_ERROR]: 'Agent Error',
       [ErrorCode.TOOL_ERROR]: 'Tool Error',
       [ErrorCode.MODEL_ERROR]: 'Model Error',
@@ -380,14 +382,16 @@ export class ErrorService {
     // Add status information
     details.push(`Status: ${error.status} ${this.getStatusText(error.status)}`);
 
-    // Add URL if available
-    if (error.url) {
-      details.push(`URL: ${error.url}`);
-    }
+    // The request URL is deliberately omitted: it carries API paths and
+    // resource IDs (e.g. a tool the user cannot access) that users don't need.
+    // The URL is still on the HttpErrorResponse for devtools / console logging.
 
     // Add HTTP error message (technical, not user-facing)
-    if (error.message) {
-      details.push(`HTTP Message: ${error.message}`);
+    // HttpErrorResponse.message reads "Http failure response for <url>: ...",
+    // so strip the URL from it as well.
+    const message = error.url ? error.message?.split(error.url).join('[redacted]') : error.message;
+    if (message) {
+      details.push(`HTTP Message: ${message}`);
     }
 
     // Add structured error details if available

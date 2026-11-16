@@ -56,6 +56,13 @@ export interface AppConfig {
   // target for each origin so an operator can create the records by hand.
   manageDnsRecords: boolean;
   albSubdomain?: string; // Subdomain for ALB (e.g., 'api' for api.yourdomain.com)
+  // Restrict ALB ingress to CloudFront's origin-facing IP ranges (the AWS
+  // managed prefix list `com.amazonaws.global.cloudfront.origin-facing`).
+  // Defaults to `true`: every browser and API-key request already arrives
+  // through the SPA distribution's `/api/*` behavior, so a directly
+  // reachable ALB only serves callers who skip CloudFront. Set to `false`
+  // only if something outside AWS must call the ALB hostname directly.
+  albRestrictToCloudFront: boolean;
   certificateArn?: string; // ACM certificate ARN for HTTPS on the ALB (MUST be in the stack's own region)
   // Shared ACM certificate ARN for ALL CloudFront origins (SPA / artifacts /
   // mcp-sandbox). MUST be in us-east-1 (CloudFront requirement) and SHOULD be
@@ -80,6 +87,11 @@ export interface AppConfig {
   projects: ProjectsConfig;
   userGrants: UserGrantsConfig;
   sessionPrewarm: SessionPrewarmConfig;
+  handoffs: HandoffsConfig;
+  sessionRewind: SessionRewindConfig;
+  sessionFork: SessionForkConfig;
+  quotaRequests: QuotaRequestsConfig;
+  awsLimits: AwsLimitsConfig;
   clientTurnTiming: ClientTurnTimingConfig;
   ttftProbe: TtftProbeConfig;
   memoryLint: MemoryLintConfig;
@@ -91,10 +103,22 @@ export interface AppConfig {
   skillAuthoring: SkillAuthoringConfig;
   wordTrackedChanges: WordTrackedChangesConfig;
   assistantKbFullContext: AssistantKbFullContextConfig;
+  agentKnowledgeFiles: AgentKnowledgeFilesConfig;
+  meetingTasks: MeetingTasksConfig;
   largeDocumentAttachments: LargeDocumentAttachmentsConfig;
   attachmentKb: AttachmentKbConfig;
   folderAttachments: FolderAttachmentsConfig;
   folderSync: FolderSyncConfig;
+  sourceProvenance: SourceProvenanceConfig;
+  attachmentPlan: AttachmentPlanConfig;
+  mcpElicitation: McpElicitationConfig;
+  releaseLedger: ReleaseLedgerConfig;
+  documentExtract: DocumentExtractConfig;
+  fieldSetAuthoring: FieldSetAuthoringConfig;
+  webSearchDefaultMaxResults: WebSearchDefaultMaxResultsConfig;
+  wordSkillScripts: WordSkillScriptsConfig;
+  converseDocumentsAsText: ConverseDocumentsAsTextConfig;
+  projectFileReadiness: ProjectFileReadinessConfig;
   agents: AgentsConfig;
   agentMarketplace: AgentMarketplaceConfig;
   dictation: DictationConfig;
@@ -216,7 +240,6 @@ export interface FrontendConfig {
   certificateArn?: string;
   bucketName?: string;
   cloudFrontPriceClass: string;
-  additionalCorsOrigins?: string; // Extra CORS origins to append (comma-separated)
   /**
    * CloudFront standard access logging for the SPA distribution. Default ON
    * with a kill switch; `undefined` is treated as on so a hand-built config
@@ -359,6 +382,14 @@ export interface ManagedKbConfig {
   perOwnerElevatedBytes: number;
   /** Per-knowledge-base ceiling, bounding a single runaway corpus. Default 500 MB. */
   perKnowledgeBaseCeilingBytes: number;
+  /**
+   * Largest single file a knowledge base accepts, in bytes
+   * (`KB_UPLOAD_MAX_FILE_BYTES`, from `CDK_KB_UPLOAD_MAX_FILE_BYTES`). Default
+   * 50 MiB, at most 50 MiB (Bedrock Knowledge Bases' own non-adjustable
+   * per-document limit). The classic engine stays at its 20 MiB processing
+   * limit; a value below that lowers both.
+   */
+  uploadMaxFileBytes: number;
   /** Rollback window during `retain`, in days. At least 30 (Requirement 15.11). */
   retentionWindowDays: number;
   /** Fleet-wide managed-storage alarm threshold, in GB. */
@@ -371,6 +402,8 @@ export interface ManagedKbConfig {
 export const MANAGED_KB_DEFAULT_PER_OWNER_BYTES = 100 * 1024 * 1024; // 100 MB
 export const MANAGED_KB_ELEVATED_PER_OWNER_BYTES = 1024 * 1024 * 1024; // 1 GB
 export const MANAGED_KB_PER_KB_CEILING_BYTES = 500 * 1024 * 1024; // 500 MB
+/** Per-file knowledge-base upload limit, and Bedrock's own ceiling for it. */
+export const KB_UPLOAD_MAX_FILE_BYTES = 50 * 1024 * 1024; // 50 MiB
 /** Minimum legacy-data rollback window (Requirement 15.11). */
 export const MANAGED_KB_RETENTION_WINDOW_DAYS = 30;
 
@@ -459,6 +492,87 @@ export interface UserGrantsConfig {
  * which reclaims idle memory, and billed at peak memory on V1.
  */
 export interface SessionPrewarmConfig {
+  enabled: boolean;
+}
+
+/**
+ * Quota requests and extensions (docs/specs/quota-requests-and-extensions.md).
+ * **Opt-in while the feature is in development**: off unless
+ * CDK_QUOTA_REQUESTS_ENABLED=true (or a `quotaRequests.enabled: true` cdk.json
+ * context). Sets QUOTA_REQUESTS_ENABLED on **app-api only**, which serves the
+ * `/quota/*` request routes and `/admin/quota-requests` + `/admin/quota-extensions`.
+ * The Runtime needs no copy: quota resolution reads extensions wherever it runs,
+ * so turning this off stops new grants without revoking existing ones, and it
+ * spends none of the Runtime's environment-variable budget. No new resources:
+ * requests, extensions and the policy live in the existing user-quotas table.
+ */
+export interface QuotaRequestsConfig {
+  enabled: boolean;
+}
+
+/**
+ * AWS Limits admin page (GitHub issue #12): the account's Service Quotas for
+ * the services this stack uses, with usage and increase requests.
+ * **Opt-in while the feature is in development**: off unless
+ * CDK_AWS_LIMITS_ENABLED=true (or an `awsLimits.enabled: true` cdk.json
+ * context). Sets AWS_LIMITS_ENABLED on **app-api only**, which serves
+ * `/admin/aws-limits`, and only while on grants the App API task role the
+ * Service Quotas reads, cloudwatch:GetMetricData and ListMetrics, the AgentCore
+ * memory/gateway/target lists, RequestServiceQuotaIncrease
+ * (conditioned to the monitored services) and creation of the Service Quotas
+ * service-linked role. The Runtime needs no copy. No new resources: increase
+ * submissions are audited in the existing audit-log table.
+ */
+export interface AwsLimitsConfig {
+  enabled: boolean;
+}
+
+/**
+ * Handoffs (docs/specs/agent-handoffs-and-consults.md, Phase 0). **Opt-in while
+ * the feature is in development**: off unless CDK_HANDOFFS_ENABLED=true (or a
+ * `handoffs.enabled: true` cdk.json context). Sets HANDOFFS_ENABLED on **app-api**,
+ * which serves `/sessions/{id}/handoffs`, and on the **AgentCore Runtime** (only
+ * while on, so the default spends none of the V2 environment budget), which
+ * accepts `handoff_context` on a target's first turn and keeps the source's row
+ * current. No new resources: `HANDOFF#` rows live in sessions-metadata on the
+ * existing SessionLookupIndex.
+ */
+export interface HandoffsConfig {
+  enabled: boolean;
+  /**
+   * The model-written brief for a handoff's context card (spec §4.5.1). **Opt-in
+   * while in development**: off unless CDK_HANDOFF_BRIEF_ENABLED=true (or a
+   * `handoffs.briefEnabled: true` cdk.json context). Sets HANDOFF_BRIEF_ENABLED on
+   * the **AgentCore Runtime** only, and only while both it and `enabled` are on,
+   * so the default spends none of the V2 environment budget. No new resources.
+   */
+  briefEnabled: boolean;
+}
+
+/**
+ * Conversation rewind (docs/specs/conversation-rewind-and-fork.md §4). **Opt-in
+ * while the feature is in development**: off unless CDK_SESSION_REWIND_ENABLED=true
+ * (or a `sessionRewind.enabled: true` cdk.json context). Sets SESSION_REWIND_ENABLED
+ * on **app-api**, which serves `POST /sessions/{id}/rewind` and filters rewound
+ * messages out of `GET /messages`, and on the **AgentCore Runtime** (only while
+ * on, so the default spends none of the V2 environment budget), which filters
+ * them at restore and cuts a warm agent's history in place. No new resources: the
+ * state is one attribute on the existing session metadata row.
+ */
+export interface SessionRewindConfig {
+  enabled: boolean;
+}
+
+/**
+ * Conversation fork (docs/specs/conversation-rewind-and-fork.md §7). **Opt-in
+ * while the feature is in development**: off unless CDK_SESSION_FORK_ENABLED=true
+ * (or a `sessionFork.enabled: true` cdk.json context). Sets SESSION_FORK_ENABLED
+ * on **app-api**, which serves `POST /sessions/{id}/fork` and lets a fork's turns
+ * pin to their root conversation's microVM, and on the **AgentCore Runtime**
+ * (only while on), which starts a fork's first turn from its parent's live
+ * history so the shared prefix reads from the prompt cache. No new resources.
+ */
+export interface SessionForkConfig {
   enabled: boolean;
 }
 
@@ -683,8 +797,55 @@ export interface WordTrackedChangesConfig {
  * ASSISTANT_KB_FULL_CONTEXT_ENABLED on the AgentCore Runtime; while off, the
  * variable is absent. The text comes from the documents bucket, which the
  * Runtime can always read (`AssistantDocumentsRead`). No SPA switch.
+ *
+ * `maxTokens` is the budget (CDK_ASSISTANT_KB_FULL_CONTEXT_MAX_TOKENS, or an
+ * `assistantKbFullContext.maxTokens` context; 0 switches full context off with
+ * the flag on). Written as ASSISTANT_KB_FULL_CONTEXT_MAX_TOKENS only when it
+ * differs from the code's default, 50,000, so the default spends none of the V2
+ * payload budget. app-api carries both values too: its
+ * `GET /assistants/{id}/knowledge-base/mode` tells an Agent's author which mode
+ * the knowledge base runs in, and must answer as the Runtime decides.
  */
 export interface AssistantKbFullContextConfig {
+  enabled: boolean;
+  maxTokens: number;
+}
+
+/** The code's own default (`DEFAULT_FULL_CONTEXT_MAX_TOKENS` in kb_full_context.py). */
+export const DEFAULT_ASSISTANT_KB_FULL_CONTEXT_MAX_TOKENS = 50_000;
+
+/**
+ * `knowledge_files` for ordinary Agents
+ * (backend/src/agents/builtin_tools/project_files_tool.py): an Agent turn that
+ * is not a project harness's gets one tool that lists its Knowledge documents
+ * and reads one by name, and the retrieved-excerpts preamble names it.
+ * **Opt-in while in development**: off unless
+ * CDK_AGENT_KNOWLEDGE_FILES_ENABLED=true (or an
+ * `agentKnowledgeFiles.enabled: true` context). Sets
+ * AGENT_KNOWLEDGE_FILES_ENABLED on the AgentCore Runtime only, and **only while
+ * on**, so the default spends none of the V2 payload budget. No resources and no
+ * IAM: the Runtime already reads the assistants table and the documents bucket
+ * for full-context mode. No SPA switch.
+ */
+export interface AgentKnowledgeFilesConfig {
+  enabled: boolean;
+}
+
+/**
+ * Meeting transcripts → GitHub issues
+ * (backend/src/agents/local_tools/meeting_tasks.py,
+ * docs/specs/meeting-transcripts-to-github-issues.md): the Google Calendar,
+ * Zoom and GitHub tool families, built per request for users whose roles are
+ * granted the `google_calendar_meetings` / `zoom_meeting_transcripts` /
+ * `github_issues_local` catalog tools, each calling the vendor API with the user's
+ * own OAuth token from the connector an admin bound to the row. **Opt-in while
+ * in development**: off unless CDK_MEETING_TASKS_ENABLED=true (or a
+ * `meetingTasks.enabled: true` cdk.json context). While on, sets
+ * MEETING_TASKS_ENABLED on the AgentCore Runtime; while off, the variable is
+ * absent. No IAM: the tokens come from the AgentCore Identity vault the Runtime
+ * already reads for OAuth-gated MCP tools. No SPA switch.
+ */
+export interface MeetingTasksConfig {
   enabled: boolean;
 }
 
@@ -750,6 +911,204 @@ export interface FolderAttachmentsConfig {
  * No resources: the worker already holds every grant a folder run uses.
  */
 export interface FolderSyncConfig {
+  enabled: boolean;
+}
+
+/**
+ * Source provenance verification (docs/specs/source-provenance-verification.md):
+ * a session with a readable document also gets `verify_sources`, which answers
+ * two separate questions about a cited passage — is it in the document, and does
+ * the asserted value actually appear in it — and collapses them into one of four
+ * states. **Opt-in while in development**: off unless
+ * CDK_SOURCE_PROVENANCE_ENABLED=true (or a `sourceProvenance.enabled: true`
+ * cdk.json context). A feature switch, and therefore permanent: it adds a tool
+ * to toolConfig and changes what the product asserts about a user's document.
+ * Sets SOURCE_PROVENANCE_ENABLED on the AgentCore Runtime (which builds the
+ * tool, verifies and emits the event) and on app-api (which replays the stored
+ * verdicts on GET /messages). Written to the Runtime's environment **only while
+ * on**, so the default spends none of the V2 payload budget. No resources: the
+ * verdicts are `SRCV#` rows on the existing sessions-metadata table and its
+ * SessionLookupIndex GSI.
+ */
+export interface SourceProvenanceConfig {
+  enabled: boolean;
+}
+
+/**
+ * Attachment planner, `token` profile (docs/specs/unified-attachment-delivery.md
+ * phase 3): each turn's attachments are decided in tokens against a per-model
+ * document budget of half the compaction ceiling. A PDF goes native within the
+ * model's page limit and the budget, other documents as text, and anything over
+ * it on demand (a digest plus `document_read`). **Opt-in while in development**:
+ * off unless CDK_ATTACHMENT_PLAN_ENABLED=true (or an `attachmentPlan.enabled:
+ * true` cdk.json context). A rollout switch, retired in the spec's phase 6.
+ * Sets ATTACHMENT_PLAN_ENABLED on the AgentCore Runtime (which plans the turn),
+ * written there **only while on**, and on app-api (`GET /files/limits` reports
+ * the active profile). No resources.
+ */
+export interface AttachmentPlanConfig {
+  enabled: boolean;
+}
+
+/**
+ * MCP form elicitation (docs/specs/mcp-elicitation.md): an external MCP server
+ * whose catalog row sets `elicitationEnabled` may ask the user for structured
+ * input partway through a tool call. The turn pauses on an interrupt, the SPA
+ * shows the server's form, and the call is replayed with the answer. Form mode
+ * on 2026-07-28 connections only. **Opt-in while in development**: off unless
+ * CDK_MCP_ELICITATION_ENABLED=true (or a `mcpElicitation.enabled: true` cdk.json
+ * context). A feature switch, and therefore permanent: it widens what users can
+ * do, since a server can expose tools gated on elicitation. Sets
+ * MCP_ELICITATION_ENABLED on the AgentCore Runtime (which advertises the
+ * capability, pauses and replays) and on app-api (admin discovery). Written to
+ * the Runtime's environment **only while on**, so the default spends none of the
+ * V2 payload budget. No resources.
+ */
+export interface McpElicitationConfig {
+  enabled: boolean;
+}
+
+/**
+ * Release ledger writes (docs/specs/release-ledger.md §5.2, D8): each model
+ * call's cost row also `ADD`s itself into version-keyed `LEDGER#VERSION` /
+ * `#MODEL` / `#TOOL` / `#AGENT` / `#PROJECT` rollups in the existing
+ * system-cost-rollup table, after the stream and beside the `ROLLUP#` bumps.
+ * **Opt-in while in development**: off unless CDK_RELEASE_LEDGER_ENABLED=true
+ * (or a `releaseLedger.enabled: true` cdk.json context). A feature switch once
+ * finished: the writes are a per-call cost a deployment may decline. Sets
+ * RELEASE_LEDGER_ENABLED on app-api (api-converse rows) and on the AgentCore
+ * Runtime (every chat, voice, brief and extraction row), the Runtime copy
+ * **only while on**, so the default spends none of the V2 payload budget. No
+ * resources and no IAM: both roles already hold UpdateItem on the table.
+ */
+export interface ReleaseLedgerConfig {
+  enabled: boolean;
+}
+
+/**
+ * AgentCore Web Search result default
+ * (docs/specs/web-search-default-comparison-findings.md). On, a Web Search call
+ * (`<target>___WebSearch`) whose input names no `maxResults` asks for 5 results
+ * instead of the connector's 10, which halves the ~5.3k tokens an unqualified
+ * search puts into the conversation. A count the model chose passes through.
+ * **Opt-in while in development**: off unless
+ * CDK_WEB_SEARCH_DEFAULT_MAX_RESULTS_ENABLED=true (or a
+ * `webSearchDefaultMaxResults.enabled: true` cdk.json context). A feature
+ * switch, and therefore permanent: results per search is a product choice
+ * between context spent and breadth. Sets WEB_SEARCH_DEFAULT_MAX_RESULTS_ENABLED
+ * on the AgentCore Runtime only, and **only while on**, so the default spends
+ * none of the V2 payload budget. No resources, and nothing reaches the prompt.
+ */
+export interface WebSearchDefaultMaxResultsConfig {
+  enabled: boolean;
+}
+
+/**
+ * Word skill scripts. On, create_word_document and modify_word_document also
+ * take `skill_name` / `path` / `params` and run a `scripts/*.py` file from a
+ * skill bound to the turn inside the Code Interpreter sandbox, instead of the
+ * model retyping it into `python_code`. The script never runs on the Runtime
+ * host. **Opt-in while in development**: off unless
+ * CDK_WORD_SKILL_SCRIPTS_ENABLED=true (or a `wordSkillScripts.enabled: true`
+ * cdk.json context). Sets WORD_SKILL_SCRIPTS_ENABLED on the AgentCore Runtime
+ * only, and **only while on**, so the default spends none of the V2 payload
+ * budget. No resources and no IAM: the Runtime already reads skill resources
+ * and already runs Code Interpreter sessions.
+ */
+export interface WordSkillScriptsConfig {
+  enabled: boolean;
+}
+
+/**
+ * Documents as text on Converse. On, the per-call document projection the
+ * Runtime installs on every Bedrock Converse model sends each non-PDF
+ * attachment (docx, txt, md, csv, html) as text the deployment rendered,
+ * instead of a Bedrock `document` block; PDFs stay native. There is then no
+ * five-document limit to reach. The stored conversation is unchanged.
+ * **Opt-in while in development**: off unless
+ * CDK_CONVERSE_DOCUMENTS_AS_TEXT_ENABLED=true (or a
+ * `converseDocumentsAsText.enabled: true` cdk.json context). A feature switch
+ * once finished. Sets CONVERSE_DOCUMENTS_AS_TEXT_ENABLED on the AgentCore
+ * Runtime only, and **only while on**, so the default spends none of the V2
+ * payload budget. No resources.
+ */
+export interface ConverseDocumentsAsTextConfig {
+  enabled: boolean;
+}
+
+/**
+ * Project file readiness. On, a Shared Project turn whose files include any that
+ * are still being prepared or that failed gets a short `<project_files_status>`
+ * note in the user message naming them, so the model says it cannot use them
+ * instead of answering as though they did not exist; a turn whose files are all
+ * ready is unchanged. The SPA half (`features.projectFileReadiness`) shows their
+ * progress above the project chat's composer. **Opt-in while in development**:
+ * off unless CDK_PROJECT_FILE_READINESS_ENABLED=true (or a
+ * `projectFileReadiness.enabled: true` cdk.json context). A feature switch once
+ * finished. Sets PROJECT_FILE_READINESS_ENABLED on the AgentCore Runtime only,
+ * and **only while on**, so the default spends none of the V2 payload budget. No
+ * resources, and nothing reaches the system prompt or `toolConfig`.
+ */
+export interface ProjectFileReadinessConfig {
+  enabled: boolean;
+}
+
+/**
+ * Typed structured extraction (docs/specs/structured-extraction.md). On, a turn
+ * whose active skills declare a field set also gets `document_extract`: a named,
+ * typed field set is run over one document and comes back as rows, each value
+ * carrying a source-provenance state rather than a bare answer. **Opt-in while
+ * in development**: off unless CDK_DOCUMENT_EXTRACT_ENABLED=true (or a
+ * `documentExtract.enabled: true` cdk.json context). A feature switch, and
+ * therefore permanent: each run spends a model call whose input scales with the
+ * document, and it has the product assert typed values about a user's document.
+ *
+ * Sets DOCUMENT_EXTRACT_ENABLED on the AgentCore Runtime (which mounts the tool,
+ * extracts, verifies and emits `document_extraction`) and on app-api (which
+ * replays the stored `EXTR#` rows on GET /messages). Written to the Runtime's
+ * environment **only while on**, so the default spends none of the V2 payload
+ * budget. No resources: the rows sit on the existing sessions-metadata table and
+ * its SessionLookupIndex GSI, and the artifact and workbook use existing paths.
+ *
+ * `modelId` is the Bedrock-native Converse model the constrained call runs on —
+ * deliberately not the turn's model, because strict tool use is a Converse
+ * feature a Mantle-hosted model never receives. It **must** have a catalog row:
+ * without one the call prices to null, costs $0, counts against no quota and
+ * fires UnmeteredModelCall. Regional (`us.*`) on dev, Global (`global.*`) in
+ * production, matching how the stack already distinguishes them.
+ */
+export interface DocumentExtractConfig {
+  enabled: boolean;
+  modelId: string;
+  /**
+   * Concurrent extraction calls when one `document_extract` call carries
+   * several documents (structured-extraction.md §17.4). Optional, and written
+   * to the Runtime only when set, so the default spends none of the V2
+   * environment budget. The backend's own default is 4 — deliberately
+   * conservative, because each call is a constrained Converse request carrying
+   * a whole document and this account has a Bedrock throttle alarm that an
+   * over-eager default would trip on the first real batch. Raise it on the
+   * DocumentExtract EMF records plus an absence of throttling, not on
+   * impatience; the backend clamps to 1..16.
+   */
+  concurrency?: number;
+}
+
+/**
+ * Field-set authoring (docs/specs/field-set-authoring.md §7). On, app-api serves
+ * `/skills/mine/{skill_id}/field-sets`: list, read, write and validate one
+ * field set on a skill the caller owns, with the backend parsing and writing
+ * the file in both directions. **Opt-in while in development**: off unless
+ * CDK_FIELD_SET_AUTHORING_ENABLED=true (or a `fieldSetAuthoring.enabled: true`
+ * cdk.json context). A feature switch, and therefore permanent.
+ *
+ * Sets FIELD_SET_AUTHORING_ENABLED on **app-api only**: the Runtime resolves a
+ * field set the same way with this on or off, so it gets no variable and the
+ * V2 environment budget is untouched. No resources: a field set is a file in
+ * the skill's existing bundle. Separate from `documentExtract` because running
+ * extractions and letting users write their own schemas are separate decisions.
+ */
+export interface FieldSetAuthoringConfig {
   enabled: boolean;
 }
 
@@ -979,6 +1338,15 @@ export const OBSERVABILITY_DEFAULT_P99_LATENCY_MS = 120_000;
 export const OBSERVABILITY_DEFAULT_AGENTCORE_ERROR_THRESHOLD = 10;
 
 /**
+ * Chat turns per hour whose Runtime stream broke under app-api mid-turn
+ * (`ChatStreamUpstreamDropped`), above which to alarm. Not zero: production
+ * ran about 3 a day (47 in 14 days to 2026-11-06, at most 10 in a day), mostly
+ * the Runtime closing the connection. Above that baseline, a burst means
+ * something new is cutting streams, such as an idle limit on a silent turn.
+ */
+export const OBSERVABILITY_DEFAULT_CHAT_STREAM_DROP_THRESHOLD = 5;
+
+/**
  * Concurrent AgentCore Runtime sessions (`ActiveSessionCount`, Maximum) above
  * which to alarm.
  *
@@ -1086,6 +1454,8 @@ export interface ObservabilityConfig {
   /** AgentCore Runtime p99 Latency floor, in ms. */
   agentCoreLatencyMs: number;
   agentCoreErrorThreshold: number;
+  /** Chat Runtime streams dropped mid-turn per hour above which to alarm. */
+  chatStreamDropThreshold: number;
   /**
    * Concurrent AgentCore Runtime sessions above which to alarm. A cost signal
    * (Runtime bills memory for session lifetime), not a quota one.
@@ -1218,6 +1588,15 @@ export function loadConfig(scope: cdk.App): AppConfig {
       ?? scope.node.tryGetContext('manageDnsRecords')
       ?? true,
     albSubdomain: process.env.CDK_ALB_SUBDOMAIN || scope.node.tryGetContext('albSubdomain'),
+    albRestrictToCloudFront: parseBooleanEnv(process.env.CDK_ALB_RESTRICT_TO_CLOUDFRONT)
+      // Context may arrive as a boolean (cdk.context.json) or a string
+      // (`--context albRestrictToCloudFront=false`); normalise to a string.
+      ?? parseBooleanEnv(
+        scope.node.tryGetContext('albRestrictToCloudFront') === undefined
+          ? undefined
+          : String(scope.node.tryGetContext('albRestrictToCloudFront')),
+      )
+      ?? true,
     certificateArn: process.env.CDK_CERTIFICATE_ARN || scope.node.tryGetContext('certificateArn'),
     cloudfrontCertificateArn: process.env.CDK_CLOUDFRONT_CERTIFICATE_ARN || scope.node.tryGetContext('cloudfrontCertificateArn'),
     cognito: {
@@ -1244,7 +1623,6 @@ export function loadConfig(scope: cdk.App): AppConfig {
       certificateArn: process.env.CDK_FRONTEND_CERTIFICATE_ARN || scope.node.tryGetContext('frontend').certificateArn,
       bucketName: process.env.CDK_FRONTEND_BUCKET_NAME || scope.node.tryGetContext('frontend')?.bucketName,
       cloudFrontPriceClass: process.env.CDK_FRONTEND_CLOUDFRONT_PRICE_CLASS || scope.node.tryGetContext('frontend')?.cloudFrontPriceClass,
-      additionalCorsOrigins: process.env.CDK_FRONTEND_CORS_ORIGINS || scope.node.tryGetContext('frontend')?.additionalCorsOrigins,
       // Default ON with a kill switch, same empty-string-safe ternary as
       // `projects` below: the workflow forwards an EMPTY STRING when the
       // variable is unset, so treat empty/unset as the default (on) and only
@@ -1396,6 +1774,13 @@ export function loadConfig(scope: cdk.App): AppConfig {
         ?? parseIntEnv(scope.node.tryGetContext('managedKb.perKnowledgeBaseCeilingBytes'))
         ?? scope.node.tryGetContext('managedKb')?.perKnowledgeBaseCeilingBytes
         ?? MANAGED_KB_PER_KB_CEILING_BYTES,
+      // Not prefixed MANAGED_KB_: it also bounds a classic knowledge base's
+      // uploads (downward only), and it is what the SPA shows in the dropzone.
+      uploadMaxFileBytes:
+        parseIntEnv(process.env.CDK_KB_UPLOAD_MAX_FILE_BYTES)
+        ?? parseIntEnv(scope.node.tryGetContext('managedKb.uploadMaxFileBytes'))
+        ?? scope.node.tryGetContext('managedKb')?.uploadMaxFileBytes
+        ?? KB_UPLOAD_MAX_FILE_BYTES,
       retentionWindowDays:
         parseIntEnv(process.env.CDK_MANAGED_KB_RETENTION_WINDOW_DAYS)
         ?? parseIntEnv(scope.node.tryGetContext('managedKb.retentionWindowDays'))
@@ -1485,6 +1870,39 @@ export function loadConfig(scope: cdk.App): AppConfig {
         ? process.env.CDK_SESSION_PREWARM_ENABLED.trim().toLowerCase() === 'true'
         : scope.node.tryGetContext('sessionPrewarm')?.enabled ?? false,
     },
+    handoffs: {
+      // Opt-in while in development, same parsing as sessionPrewarm above.
+      enabled: process.env.CDK_HANDOFFS_ENABLED
+        ? process.env.CDK_HANDOFFS_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('handoffs')?.enabled ?? false,
+      briefEnabled: process.env.CDK_HANDOFF_BRIEF_ENABLED
+        ? process.env.CDK_HANDOFF_BRIEF_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('handoffs')?.briefEnabled ?? false,
+    },
+    sessionRewind: {
+      // Opt-in while in development, same parsing as sessionPrewarm above.
+      enabled: process.env.CDK_SESSION_REWIND_ENABLED
+        ? process.env.CDK_SESSION_REWIND_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('sessionRewind')?.enabled ?? false,
+    },
+    sessionFork: {
+      // Opt-in while in development, same parsing as sessionPrewarm above.
+      enabled: process.env.CDK_SESSION_FORK_ENABLED
+        ? process.env.CDK_SESSION_FORK_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('sessionFork')?.enabled ?? false,
+    },
+    quotaRequests: {
+      // Opt-in while in development, same parsing as sessionPrewarm above.
+      enabled: process.env.CDK_QUOTA_REQUESTS_ENABLED
+        ? process.env.CDK_QUOTA_REQUESTS_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('quotaRequests')?.enabled ?? false,
+    },
+    awsLimits: {
+      // Opt-in while in development, same parsing as quotaRequests above.
+      enabled: process.env.CDK_AWS_LIMITS_ENABLED
+        ? process.env.CDK_AWS_LIMITS_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('awsLimits')?.enabled ?? false,
+    },
     clientTurnTiming: {
       // Default ON with a kill switch, same parsing as projects above.
       enabled: process.env.CDK_CLIENT_TURN_TIMING_ENABLED
@@ -1557,6 +1975,23 @@ export function loadConfig(scope: cdk.App): AppConfig {
       enabled: process.env.CDK_ASSISTANT_KB_FULL_CONTEXT_ENABLED
         ? process.env.CDK_ASSISTANT_KB_FULL_CONTEXT_ENABLED.trim().toLowerCase() === 'true'
         : scope.node.tryGetContext('assistantKbFullContext')?.enabled ?? false,
+      maxTokens: parseFullContextMaxTokens(
+        process.env.CDK_ASSISTANT_KB_FULL_CONTEXT_MAX_TOKENS,
+        scope.node.tryGetContext('assistantKbFullContext')?.maxTokens,
+      ),
+    },
+    agentKnowledgeFiles: {
+      // In development: only "true" enables, and an unset GitHub variable
+      // arrives as "" rather than undefined.
+      enabled: process.env.CDK_AGENT_KNOWLEDGE_FILES_ENABLED
+        ? process.env.CDK_AGENT_KNOWLEDGE_FILES_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('agentKnowledgeFiles')?.enabled ?? false,
+    },
+    meetingTasks: {
+      // Opt-in while in development, same parsing as assistantKbFullContext.
+      enabled: process.env.CDK_MEETING_TASKS_ENABLED
+        ? process.env.CDK_MEETING_TASKS_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('meetingTasks')?.enabled ?? false,
     },
     largeDocumentAttachments: {
       // Default ON with a kill switch, same parsing as skillAuthoring above.
@@ -1581,6 +2016,95 @@ export function loadConfig(scope: cdk.App): AppConfig {
       enabled: process.env.CDK_FOLDER_SYNC_ENABLED
         ? process.env.CDK_FOLDER_SYNC_ENABLED.trim().toLowerCase() !== 'false'
         : scope.node.tryGetContext('folderSync')?.enabled ?? true,
+    },
+    sourceProvenance: {
+      // In development: only "true" enables, and an unset GitHub variable
+      // arrives as "" rather than undefined.
+      enabled: process.env.CDK_SOURCE_PROVENANCE_ENABLED
+        ? process.env.CDK_SOURCE_PROVENANCE_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('sourceProvenance')?.enabled ?? false,
+    },
+    attachmentPlan: {
+      // In development: only "true" enables, and an unset GitHub variable
+      // arrives as "" rather than undefined.
+      enabled: process.env.CDK_ATTACHMENT_PLAN_ENABLED
+        ? process.env.CDK_ATTACHMENT_PLAN_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('attachmentPlan')?.enabled ?? false,
+    },
+    mcpElicitation: {
+      // In development: only "true" enables, and an unset GitHub variable
+      // arrives as "" rather than undefined.
+      enabled: process.env.CDK_MCP_ELICITATION_ENABLED
+        ? process.env.CDK_MCP_ELICITATION_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('mcpElicitation')?.enabled ?? false,
+    },
+    releaseLedger: {
+      // In development: only "true" enables, and an unset GitHub variable
+      // arrives as "" rather than undefined.
+      enabled: process.env.CDK_RELEASE_LEDGER_ENABLED
+        ? process.env.CDK_RELEASE_LEDGER_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('releaseLedger')?.enabled ?? false,
+    },
+    webSearchDefaultMaxResults: {
+      // In development: only "true" enables, and an unset GitHub variable
+      // arrives as "" rather than undefined.
+      enabled: process.env.CDK_WEB_SEARCH_DEFAULT_MAX_RESULTS_ENABLED
+        ? process.env.CDK_WEB_SEARCH_DEFAULT_MAX_RESULTS_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('webSearchDefaultMaxResults')?.enabled ?? false,
+    },
+    wordSkillScripts: {
+      // In development: only "true" enables, and an unset GitHub variable
+      // arrives as "" rather than undefined.
+      enabled: process.env.CDK_WORD_SKILL_SCRIPTS_ENABLED
+        ? process.env.CDK_WORD_SKILL_SCRIPTS_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('wordSkillScripts')?.enabled ?? false,
+    },
+    converseDocumentsAsText: {
+      // In development: only "true" enables, and an unset GitHub variable
+      // arrives as "" rather than undefined.
+      enabled: process.env.CDK_CONVERSE_DOCUMENTS_AS_TEXT_ENABLED
+        ? process.env.CDK_CONVERSE_DOCUMENTS_AS_TEXT_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('converseDocumentsAsText')?.enabled ?? false,
+    },
+    projectFileReadiness: {
+      // In development: only "true" enables, and an unset GitHub variable
+      // arrives as "" rather than undefined.
+      enabled: process.env.CDK_PROJECT_FILE_READINESS_ENABLED
+        ? process.env.CDK_PROJECT_FILE_READINESS_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('projectFileReadiness')?.enabled ?? false,
+    },
+    documentExtract: {
+      // In development: only "true" enables, and an unset GitHub variable
+      // arrives as "" rather than undefined.
+      enabled: process.env.CDK_DOCUMENT_EXTRACT_ENABLED
+        ? process.env.CDK_DOCUMENT_EXTRACT_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('documentExtract')?.enabled ?? false,
+      // Haiku 4.5 carries structured outputs on bedrock-runtime, and the
+      // Regional (`us.*`) profile is what dev runs. Production overrides this
+      // with the Global id through the same variable. Pinned by a config test
+      // because an id with no catalog row is an unmetered call, not an error.
+      modelId:
+        process.env.CDK_DOCUMENT_EXTRACT_MODEL_ID?.trim() ||
+        scope.node.tryGetContext('documentExtract')?.modelId ||
+        'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+      // Left undefined unless a deployment sets it, so the Runtime's
+      // environment carries nothing for the default case. A non-numeric value
+      // is dropped rather than forwarded: the backend would fall back anyway,
+      // and a bad string in the Runtime's env is harder to spot than an absent
+      // one.
+      ...(() => {
+        const raw = process.env.CDK_DOCUMENT_EXTRACT_CONCURRENCY?.trim();
+        const fromContext = scope.node.tryGetContext('documentExtract')?.concurrency;
+        const value = raw ? Number(raw) : fromContext;
+        return Number.isInteger(value) && value > 0 ? { concurrency: value } : {};
+      })(),
+    },
+    fieldSetAuthoring: {
+      // In development: only "true" enables, and an unset GitHub variable
+      // arrives as "" rather than undefined.
+      enabled: process.env.CDK_FIELD_SET_AUTHORING_ENABLED
+        ? process.env.CDK_FIELD_SET_AUTHORING_ENABLED.trim().toLowerCase() === 'true'
+        : scope.node.tryGetContext('fieldSetAuthoring')?.enabled ?? false,
     },
     agents: {
       // Default ON with a kill switch (house style, mirroring memorySpaces /
@@ -1790,6 +2314,11 @@ export function loadConfig(scope: cdk.App): AppConfig {
         ?? parseIntEnv(scope.node.tryGetContext('observability.agentCoreErrorThreshold'))
         ?? scope.node.tryGetContext('observability')?.agentCoreErrorThreshold
         ?? OBSERVABILITY_DEFAULT_AGENTCORE_ERROR_THRESHOLD,
+      chatStreamDropThreshold:
+        parseIntEnv(process.env.CDK_OBSERVABILITY_CHAT_STREAM_DROP_THRESHOLD)
+        ?? parseIntEnv(scope.node.tryGetContext('observability.chatStreamDropThreshold'))
+        ?? scope.node.tryGetContext('observability')?.chatStreamDropThreshold
+        ?? OBSERVABILITY_DEFAULT_CHAT_STREAM_DROP_THRESHOLD,
       agentCoreActiveSessionThreshold:
         parseIntEnv(process.env.CDK_OBSERVABILITY_AGENTCORE_ACTIVE_SESSION_THRESHOLD)
         ?? parseIntEnv(scope.node.tryGetContext('observability.agentCoreActiveSessionThreshold'))
@@ -1915,6 +2444,7 @@ export function loadConfig(scope: cdk.App): AppConfig {
   console.log(`   Production: ${config.production}`);
   console.log(`   Retain Data on Delete: ${config.retainDataOnDelete}`);
   console.log(`   Manage DNS Records: ${config.manageDnsRecords}`);
+  console.log(`   ALB ingress: ${config.albRestrictToCloudFront ? 'CloudFront origin-facing only' : 'internet (0.0.0.0/0)'}`);
   console.log(`   App Version: ${config.appVersion}`);
   // Printed so a deploy log shows which values actually took effect.
   console.log(
@@ -2052,6 +2582,19 @@ function requireWholeNumber(source: string, value: unknown): string | undefined 
     );
   }
   return text;
+}
+
+/**
+ * The full-context token budget: the variable, else the context, else the
+ * code's default. A typo fails synth (requireWholeNumber) rather than quietly
+ * running another budget than the operator meant; an unset GitHub variable
+ * arrives as '' and takes the default.
+ */
+export function parseFullContextMaxTokens(rawEnv: string | undefined, rawContext: unknown): number {
+  const text =
+    requireWholeNumber('CDK_ASSISTANT_KB_FULL_CONTEXT_MAX_TOKENS', rawEnv) ??
+    requireWholeNumber('assistantKbFullContext.maxTokens context', rawContext);
+  return text === undefined ? DEFAULT_ASSISTANT_KB_FULL_CONTEXT_MAX_TOKENS : parseInt(text, 10);
 }
 
 /**
@@ -2227,6 +2770,17 @@ function validateConfig(config: AppConfig): void {
     throw new Error(
       'CDK_FOLDER_ATTACHMENTS_ENABLED=true requires CDK_LARGE_DOCUMENT_ATTACHMENTS_ENABLED (on by default): '
       + 'a folder\'s files are delivered by reference and read from the sidecars the large-document pipeline prepares.',
+    );
+  }
+
+  // The per-file knowledge-base limit is bounded by Bedrock's own, which is not
+  // adjustable: a larger value would admit files Bedrock then refuses after
+  // their bytes are stored and reserved.
+  const uploadMax = config.managedKb.uploadMaxFileBytes;
+  if (!Number.isInteger(uploadMax) || uploadMax < 1 || uploadMax > KB_UPLOAD_MAX_FILE_BYTES) {
+    throw new Error(
+      `CDK_KB_UPLOAD_MAX_FILE_BYTES must be a whole number of bytes from 1 to ${KB_UPLOAD_MAX_FILE_BYTES} `
+      + `(50 MiB, Amazon Bedrock Knowledge Bases' per-file limit). Got: ${uploadMax}`,
     );
   }
 
@@ -2466,6 +3020,13 @@ export function getTruncatedResourceName(config: AppConfig, maxLength: number, .
  * Get the removal policy based on retention configuration
  * @param config The application configuration
  * @returns RETAIN when retainDataOnDelete is true, DESTROY when false
+ *
+ * Buckets deliberately do not set `autoDeleteObjects` alongside DESTROY. That
+ * option costs one `Custom::S3AutoDeleteObjects` per bucket plus a provider
+ * Lambda and role (about 15 resources against PlatformStack's 500), so
+ * `scripts/teardown/destroy.sh` empties the stack's DESTROY buckets before it
+ * deletes the stack instead. A bare `cdk destroy` therefore stops on "bucket not
+ * empty" (docs/specs/platform-stack-resource-budget.md §4).
  */
 export function getRemovalPolicy(config: AppConfig): cdk.RemovalPolicy {
   return config.retainDataOnDelete 
@@ -2474,12 +3035,13 @@ export function getRemovalPolicy(config: AppConfig): cdk.RemovalPolicy {
 }
 
 /**
- * Get the autoDeleteObjects setting for S3 buckets based on retention configuration
- * @param config The application configuration
- * @returns false when retainDataOnDelete is true, true when false
+ * The `Project` tag every resource in the stack carries: the project prefix,
+ * unless the `tags` context sets `Project` itself. IAM conditions on
+ * `aws:ResourceTag/Project` (the deployment-scoped DynamoDB grants) read this,
+ * so they always compare against the value `applyStandardTags` actually wrote.
  */
-export function getAutoDeleteObjects(config: AppConfig): boolean {
-  return !config.retainDataOnDelete;
+export function getProjectTag(config: AppConfig): string {
+  return config.tags?.Project ?? config.projectPrefix;
 }
 
 /**
@@ -2487,10 +3049,11 @@ export function getAutoDeleteObjects(config: AppConfig): boolean {
  */
 export function applyStandardTags(stack: cdk.Stack, config: AppConfig): void {
   // Inject Project tag dynamically from projectPrefix (can't interpolate in context)
-  cdk.Tags.of(stack).add('Project', config.projectPrefix);
+  cdk.Tags.of(stack).add('Project', getProjectTag(config));
   // Add Version tag from appVersion (flows from VERSION file via CI/CD)
   cdk.Tags.of(stack).add('Version', config.appVersion);
   Object.entries(config.tags).forEach(([key, value]) => {
+    if (key === 'Project') return;
     cdk.Tags.of(stack).add(key, value);
   });
 }
