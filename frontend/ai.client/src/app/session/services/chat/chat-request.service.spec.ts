@@ -11,6 +11,8 @@ import { SessionService } from '../session/session.service';
 import { SessionPrewarmService } from '../session/session-prewarm.service';
 import { TurnTimingService } from './turn-timing.service';
 import { FEATURES } from '../../../services/features';
+import { DeliveryStateService } from '../handoff/delivery-state.service';
+import { joinDeliveryBlocks, renderDeliveryBlock } from '../handoff/handoff-prompt';
 import { UserService } from '../../../auth/user.service';
 import { ModelService } from '../model/model.service';
 import { ToolService } from '../../../services/tool/tool.service';
@@ -18,10 +20,13 @@ import { SkillService } from '../../../services/skill/skill.service';
 import { FileUploadService } from '../../../services/file-upload';
 import { OAuthConsentService } from '../../../services/oauth-consent/oauth-consent.service';
 import { ToolApprovalService } from '../../../services/tool-approval/tool-approval.service';
+import { IncognitoChatService } from '../incognito';
+import { HandoffRelayService } from '../handoff/handoff-relay.service';
 
 describe('ChatRequestService', () => {
   let service: ChatRequestService;
   let mockChatHttpService: any;
+  let mockRelay: { beginResume: ReturnType<typeof vi.fn>; endResume: ReturnType<typeof vi.fn> };
   let mockRouter: any;
   let mockModelService: any;
   let mockToolService: any;
@@ -33,6 +38,8 @@ describe('ChatRequestService', () => {
 
   beforeEach(() => {
     TestBed.resetTestingModule();
+    mockRelay = { beginResume: vi.fn().mockReturnValue(null), endResume: vi.fn() };
+
     mockChatHttpService = {
       sendChatRequest: vi.fn().mockResolvedValue(undefined),
     };
@@ -66,7 +73,8 @@ describe('ChatRequestService', () => {
         ChatRequestService,
         { provide: ChatHttpService, useValue: mockChatHttpService },
         { provide: Router, useValue: mockRouter },
-        { provide: ChatStateService, useValue: { setChatLoading: vi.fn(), setLastTurnContinuable: vi.fn(), setLastTurnInterrupted: vi.fn(), setViewedSession: vi.fn(), isSessionLoading: vi.fn().mockReturnValue(false), lastTurnEndedAt: vi.fn().mockReturnValue(null) } },
+        { provide: ChatStateService, useValue: { setChatLoading: vi.fn(), setLastTurnContinuable: vi.fn(), setLastTurnInterrupted: vi.fn(), setLastTurnProviderOutage: vi.fn(), setViewedSession: vi.fn(), isSessionLoading: vi.fn().mockReturnValue(false), lastTurnEndedAt: vi.fn().mockReturnValue(null), takeResumeRefusal: vi.fn().mockReturnValue(null) } },
+        { provide: HandoffRelayService, useValue: mockRelay },
         { provide: MessageMapService, useValue: { addUserMessage: vi.fn(), startStreaming: vi.fn(), beginContinuationStreaming: vi.fn(), endStreaming: vi.fn(), reloadMessagesForSession: vi.fn().mockResolvedValue(undefined), markSendFailed: vi.fn(), removeTrailingMessage: vi.fn().mockReturnValue(true) } },
         { provide: SessionService, useValue: { addSessionToCache: vi.fn() } },
         // Turn timing and prewarm off: the tests that need them turn them on.
@@ -130,6 +138,76 @@ describe('ChatRequestService', () => {
     );
   });
 
+  it('starts the new conversation incognito when the toggle is on (#1738)', async () => {
+    const incognito = TestBed.inject(IncognitoChatService);
+    vi.spyOn(incognito, 'available').mockReturnValue(true);
+    incognito.toggle();
+
+    await service.submitChatRequest('Hello', null);
+
+    expect(mockChatHttpService.sendChatRequest.mock.calls[0][0]).toMatchObject({ incognito: true });
+    // The toggle is spent: the next new chat starts as not incognito.
+    expect(incognito.pending()).toBe(false);
+  });
+
+  describe('delivery cards (handoffs spec §4.8)', () => {
+    const card = (id: string, minute: number) => ({
+      deliveryId: id,
+      fromSessionId: 'tgt',
+      fromTitle: 'Rubric for BIO 101',
+      origin: 'user' as const,
+      text: `Result ${id}.`,
+      artifacts: [],
+      createdAt: `2026-11-12T00:0${minute}:00Z`,
+    });
+
+    beforeEach(() => {
+      Object.assign(TestBed.inject(FEATURES), { handoffs: true });
+    });
+
+    it('a send carries the waiting cards, and the bubble holds the text the server will store', async () => {
+      const deliveries = TestBed.inject(DeliveryStateService);
+      deliveries.hydrate('session1', [card('b', 2), card('a', 1)]);
+      deliveries.edit('session1', 'b', 'Edited b.');
+      const messageMap = TestBed.inject(MessageMapService) as any;
+
+      await service.submitChatRequest('Reply with OK.', 'session1');
+
+      expect(mockChatHttpService.sendChatRequest.mock.calls[0][0].deliveries).toEqual([
+        { deliveryId: 'a' },
+        { deliveryId: 'b', text: 'Edited b.' },
+      ]);
+      const [, typed, , , modelText] = messageMap.addUserMessage.mock.calls[0];
+      expect(typed).toBe('Reply with OK.');
+      expect(modelText).toBe(
+        joinDeliveryBlocks(
+          [renderDeliveryBlock('Result a.', 'Rubric for BIO 101'), renderDeliveryBlock('Edited b.', 'Rubric for BIO 101')],
+          'Reply with OK.',
+        ),
+      );
+      expect(deliveries.cardsFor('session1')).toEqual([]);
+    });
+
+    it('a send the server refused before starting puts the cards back for the retry', async () => {
+      const deliveries = TestBed.inject(DeliveryStateService);
+      deliveries.hydrate('session1', [card('a', 1)]);
+      (TestBed.inject(MessageMapService) as any).addUserMessage.mockReturnValue({ id: 'msg-session1-4' });
+      mockChatHttpService.sendChatRequest.mockRejectedValueOnce(new StreamNotStartedError('busy'));
+
+      await expect(service.submitChatRequest('Hi', 'session1')).rejects.toBeInstanceOf(StreamNotStartedError);
+
+      expect(deliveries.cardsFor('session1').map((c) => c.deliveryId)).toEqual(['a']);
+    });
+
+    it('a send without cards carries no field and leaves the bubble as typed', async () => {
+      const messageMap = TestBed.inject(MessageMapService) as any;
+      await service.submitChatRequest('Hi', 'session1');
+
+      expect(mockChatHttpService.sendChatRequest.mock.calls[0][0]).not.toHaveProperty('deliveries');
+      expect(messageMap.addUserMessage.mock.calls[0]).toHaveLength(4);
+    });
+  });
+
   describe('folder attachments', () => {
     const folder = {
       folderAttachId: 'fa-1',
@@ -154,6 +232,18 @@ describe('ChatRequestService', () => {
     it('omits the field on a turn without folders', async () => {
       await service.submitChatRequest('Hello', 'session1');
       expect(mockChatHttpService.sendChatRequest.mock.calls[0][0]).not.toHaveProperty('folder_attachment_ids');
+    });
+  });
+
+  describe('pasted characters (a count for the cost row, never the text)', () => {
+    it('sends the count when some of the message was pasted', async () => {
+      await service.submitChatRequest('Hello', 'session1', undefined, undefined, undefined, undefined, undefined, 5);
+      expect(mockChatHttpService.sendChatRequest).toHaveBeenCalledWith(expect.objectContaining({ pasted_chars: 5 }));
+    });
+
+    it('omits the field on a typed turn, so its payload is unchanged', async () => {
+      await service.submitChatRequest('Hello', 'session1');
+      expect(mockChatHttpService.sendChatRequest.mock.calls[0][0]).not.toHaveProperty('pasted_chars');
     });
   });
 
@@ -525,7 +615,7 @@ describe('ChatRequestService', () => {
         new StreamNotStartedError('A response was still finishing for this conversation.', 409),
       );
       await service
-        .submitChatRequest('Hello', 'session1', ['up-1'], undefined, undefined, undefined, [folder])
+        .submitChatRequest('Hello', 'session1', ['up-1'], undefined, undefined, undefined, [folder], 4)
         .catch(() => undefined);
 
       TestBed.inject(FailedSendService).retry('msg-session1-6');
@@ -534,6 +624,7 @@ describe('ChatRequestService', () => {
       expect(mockChatHttpService.sendChatRequest.mock.calls[1][0]).toMatchObject({
         file_upload_ids: ['up-1'],
         folder_attachment_ids: ['fa-1'],
+        pasted_chars: 4,
       });
       const messageMap = TestBed.inject(MessageMapService) as any;
       expect(messageMap.addUserMessage).toHaveBeenLastCalledWith('session1', 'Hello', undefined, [folder]);
@@ -576,6 +667,41 @@ describe('ChatRequestService', () => {
       await service.continueTruncatedTurn(null);
       expect(mockChatHttpService.sendChatRequest).not.toHaveBeenCalled();
     });
+
+    it('re-reads the conversation after the continuation streams, so ids match the server', async () => {
+      // On a prefill-refusing model the backend stored a continue prompt this
+      // tab never saw; ids are positional, so only a re-read realigns them.
+      const messageMap = TestBed.inject(MessageMapService) as any;
+      const order: string[] = [];
+      mockChatHttpService.sendChatRequest.mockImplementationOnce(async () => {
+        order.push('send');
+      });
+      messageMap.reloadMessagesForSession.mockImplementationOnce(async () => {
+        order.push('reload');
+      });
+
+      await service.continueTruncatedTurn('session1');
+
+      expect(messageMap.reloadMessagesForSession).toHaveBeenCalledWith('session1');
+      expect(order).toEqual(['send', 'reload']);
+    });
+
+    it('does not re-read a preview session, which is never persisted', async () => {
+      const messageMap = TestBed.inject(MessageMapService) as any;
+      await service.continueTruncatedTurn('preview-abc');
+      expect(mockChatHttpService.sendChatRequest).toHaveBeenCalled();
+      expect(messageMap.reloadMessagesForSession).not.toHaveBeenCalled();
+    });
+
+    it('does not re-read when the request fails, and clears loading', async () => {
+      const messageMap = TestBed.inject(MessageMapService) as any;
+      mockChatHttpService.sendChatRequest.mockRejectedValueOnce(new Error('boom'));
+
+      await expect(service.continueTruncatedTurn('session1')).rejects.toThrow('boom');
+
+      expect(messageMap.reloadMessagesForSession).not.toHaveBeenCalled();
+      expect(messageMap.endStreaming).toHaveBeenCalledWith('session1');
+    });
   });
 
   describe('resumeFromOAuthConsent', () => {
@@ -604,6 +730,19 @@ describe('ChatRequestService', () => {
       expect(messageMap.reloadMessagesForSession).toHaveBeenCalledWith('session1');
     });
 
+    it('keeps a refused resume\'s streamed explanation instead of reloading over it', async () => {
+      const messageMap = TestBed.inject(MessageMapService) as any;
+      const chatState = TestBed.inject(ChatStateService) as any;
+      chatState.takeResumeRefusal.mockReturnValue('expired');
+
+      await oauthResumeHandler!(['int-1'], { sessionId: 'session1' });
+
+      // The refusal is streamed but never persisted, so a reload would
+      // replace it with history that has no explanation at all.
+      expect(chatState.takeResumeRefusal).toHaveBeenCalledWith('session1');
+      expect(messageMap.reloadMessagesForSession).not.toHaveBeenCalled();
+    });
+
     it('is a no-op without interrupt ids', async () => {
       await oauthResumeHandler!([], { sessionId: 'session1' });
       expect(mockChatHttpService.sendChatRequest).not.toHaveBeenCalled();
@@ -612,6 +751,61 @@ describe('ChatRequestService', () => {
     it('is a no-op without a session id', async () => {
       await oauthResumeHandler!(['int-1'], {});
       expect(mockChatHttpService.sendChatRequest).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * Relayed prompts (handoffs spec §4.3, PR-0.3c): a handoff target's resume is
+   * reported to HandoffRelayService, which turns a lost first-answer race into
+   * "Already answered". These pin what it is told, driven by the resume
+   * guard's own refusal (the streamed `resume_unavailable` reason) and the 409
+   * a turn the other surface already resumed answers with.
+   */
+  describe('resuming a handoff target', () => {
+    const handle = { targetSessionId: 'tgt', kind: 'tool_approval', surface: 'source', sourceSessionId: 'src', handoffId: 'h1', agentName: 'Rubric Builder' };
+
+    beforeEach(() => mockRelay.beginResume.mockReturnValue(handle));
+
+    it('reports a resumed turn, and the answer goes only to the target', async () => {
+      await approvalResumeHandler!('int-9', 'approved', { sessionId: 'tgt' });
+
+      expect(mockRelay.beginResume).toHaveBeenCalledWith('tgt', 'tool_approval');
+      expect(mockChatHttpService.sendChatRequest).toHaveBeenCalledWith(
+        expect.objectContaining({ session_id: 'tgt', interrupt_responses: [{ interruptId: 'int-9', response: 'approved' }] }),
+        { quietConflict: true },
+      );
+      expect(mockRelay.endResume).toHaveBeenCalledWith(handle, 'resumed');
+    });
+
+    it.each([
+      ['missing', 'conflict'],
+      ['unknown_interrupt', 'conflict'],
+      ['expired', 'expired'],
+    ])('reads the resume guard refusal %s as %s', async (reason, outcome) => {
+      const chatState = TestBed.inject(ChatStateService) as any;
+      chatState.takeResumeRefusal.mockReturnValue(reason);
+
+      await approvalResumeHandler!('int-9', 'approved', { sessionId: 'tgt' });
+
+      expect(mockRelay.endResume).toHaveBeenCalledWith(handle, outcome);
+    });
+
+    it('reads a 409 (the other surface already resumed it) as a conflict, not an error', async () => {
+      mockChatHttpService.sendChatRequest.mockRejectedValueOnce(new StreamNotStartedError('busy', 409));
+
+      await expect(approvalResumeHandler!('int-9', 'approved', { sessionId: 'tgt' })).resolves.toBeUndefined();
+
+      expect(mockRelay.endResume).toHaveBeenCalledWith(handle, 'conflict');
+    });
+
+    it('leaves an ordinary resume exactly as it was', async () => {
+      mockRelay.beginResume.mockReturnValue(null);
+      mockChatHttpService.sendChatRequest.mockRejectedValueOnce(new StreamNotStartedError('busy', 409));
+
+      await approvalResumeHandler!('int-9', 'approved', { sessionId: 'session1' }).catch(() => undefined);
+
+      expect(mockChatHttpService.sendChatRequest).toHaveBeenCalledWith(expect.objectContaining({ session_id: 'session1' }));
+      expect(mockRelay.endResume).not.toHaveBeenCalled();
     });
   });
 

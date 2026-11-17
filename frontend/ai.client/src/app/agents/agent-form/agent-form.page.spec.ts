@@ -66,7 +66,7 @@ class StubPreviewComponent {
   openFull = output<void>();
 }
 
-@Component({ selector: 'app-knowledge-base-section', template: '' })
+@Component({ selector: 'app-knowledge-base-section', template: '<ng-content />' })
 class StubKnowledgeBaseComponent {
   entityId = input<string | null>(null);
   userPermission = input('owner');
@@ -193,6 +193,134 @@ describe('AgentFormPage — invalid submit feedback', () => {
 
     expect(mockAgentService.createAgent).toHaveBeenCalled();
     expect(mockToast.error).not.toHaveBeenCalled();
+  });
+
+  describe('response strictness (#112)', () => {
+    function radio(value: string): HTMLInputElement {
+      const radios: HTMLInputElement[] = Array.from(
+        fixture.nativeElement.querySelectorAll('input[type="radio"]'),
+      );
+      // The accessor consumes [value], so the DOM value stays "on"; options render in this order.
+      return radios[['strict', 'balanced', 'flexible'].indexOf(value)];
+    }
+
+    it('defaults a new agent to balanced', () => {
+      expect(component.form.get('responseStrictness')?.value).toBe('balanced');
+      expect(radio('balanced').checked).toBe(true);
+    });
+
+    it('selects the stored value when an agent with strict is loaded', () => {
+      (component as unknown as { applyAgentToForm(agent: unknown): void }).applyAgentToForm({
+        agentId: 'agt-1',
+        name: 'A',
+        description: 'd',
+        instructions: 'i',
+        responseStrictness: 'strict',
+      });
+      fixture.detectChanges();
+
+      expect(component.form.get('responseStrictness')?.value).toBe('strict');
+      expect(radio('strict').checked).toBe(true);
+    });
+
+    it('shows the helper text for the selected option and sends it on save', async () => {
+      radio('strict').click();
+      radio('strict').dispatchEvent(new Event('change'));
+      fixture.detectChanges();
+      expect(fixture.nativeElement.textContent).toContain('Answers only from its documents');
+
+      component.form.patchValue({
+        name: 'Research Assistant',
+        description: 'A short summary of the agent',
+        instructions: 'You are a helpful assistant that answers questions.',
+      });
+      component.selectedModelId.set('anthropic.claude-opus-4-8');
+      await component.onSubmit();
+
+      expect(mockAgentService.createAgent).toHaveBeenCalledWith(
+        expect.objectContaining({ responseStrictness: 'strict' }),
+      );
+    });
+  });
+
+  describe('voice mode (#625)', () => {
+    function checkbox(testId: string): HTMLInputElement | null {
+      return fixture.nativeElement.querySelector(`[data-testid="${testId}"]`);
+    }
+
+    it('defaults a new agent to voice off, and shows the instructions-only option once on', () => {
+      expect(component.form.get('voiceEnabled')?.value).toBe(false);
+      expect(checkbox('agent-voice-instructions-only')).toBeNull();
+
+      checkbox('agent-voice-enabled')!.click();
+      fixture.detectChanges();
+
+      const only = checkbox('agent-voice-instructions-only');
+      expect(only).toBeTruthy();
+      expect(only!.checked).toBe(true);
+    });
+
+    it('sends both settings on save', async () => {
+      component.form.patchValue({
+        name: 'Captain Ahab',
+        description: 'A role-play character for literature class',
+        instructions: 'You are Captain Ahab. Stay in character at all times.',
+        voiceEnabled: true,
+        voiceInstructionsOnly: false,
+      });
+      component.selectedModelId.set('anthropic.claude-opus-4-8');
+      await component.onSubmit();
+
+      expect(mockAgentService.createAgent).toHaveBeenCalledWith(
+        expect.objectContaining({ voiceEnabled: true, voiceInstructionsOnly: false }),
+      );
+    });
+
+    it('loads the stored settings', () => {
+      (component as unknown as { applyAgentToForm(agent: unknown): void }).applyAgentToForm({
+        agentId: 'agt-1',
+        name: 'A',
+        description: 'd',
+        instructions: 'i',
+        voiceEnabled: true,
+        voiceInstructionsOnly: false,
+      });
+      expect(component.form.get('voiceEnabled')?.value).toBe(true);
+      expect(component.form.get('voiceInstructionsOnly')?.value).toBe(false);
+    });
+
+    it('names the selected tools that do not work in voice', () => {
+      component.tools.set([
+        { kind: 'tool', ref: 'calculator', label: 'Calculator', description: '', meta: { voiceAvailable: true } },
+        { kind: 'tool', ref: 'browse_web', label: 'Web Browser', description: '', meta: { voiceAvailable: false } },
+        { kind: 'tool', ref: 'create_visualization', label: 'Charts', description: '', meta: {} },
+      ]);
+      component.selectedToolRefs.set(new Set(['calculator', 'browse_web']));
+      component.form.patchValue({ voiceEnabled: true });
+      fixture.detectChanges();
+
+      expect(component.toolsNotInVoice()).toEqual(['Web Browser']);
+      const notice = checkbox('agent-voice-tools-notice') as HTMLElement | null;
+      expect(notice?.textContent).toContain('Web Browser');
+      expect(notice?.textContent).not.toContain('Calculator');
+    });
+
+    it('warns about a large knowledge base and one too large for voice', () => {
+      component.form.patchValue({ voiceEnabled: true });
+      const base = { reason: null, documentCount: 4, largeTokens: 50_000, budgetTokens: 800_000, skippedDocuments: [] };
+      component.voiceKnowledge.set({ ...base, mode: 'large', estimatedTokens: 120_000 });
+      expect(component.voiceKnowledgeNotice()?.text).toContain('about 120,000 tokens');
+
+      component.voiceKnowledge.set({ ...base, mode: 'too_large', reason: 'over_budget', estimatedTokens: 900_000 });
+      expect(component.voiceKnowledgeNotice()?.text).toContain("Voice won't use it");
+
+      component.voiceKnowledge.set({ ...base, mode: 'whole', estimatedTokens: 2_000 });
+      expect(component.voiceKnowledgeNotice()).toBeNull();
+
+      component.form.patchValue({ voiceEnabled: false });
+      component.voiceKnowledge.set({ ...base, mode: 'large', estimatedTokens: 120_000 });
+      expect(component.voiceKnowledgeNotice()).toBeNull();
+    });
   });
 
   it('is done loading once the palettes resolve', () => {
@@ -558,5 +686,151 @@ describe('AgentFormPage — template prefill (create mode)', () => {
     expect(component.form.get('name')?.value).toBe('');
     expect(localStorage.getItem(AGENT_TEMPLATE_DRAFT_KEY)).toBeNull();
     expect(mockToast.error).toHaveBeenCalled();
+  });
+});
+
+/**
+ * A share editor opening an agent whose owner bound a model, tool or skill the editor
+ * doesn't have. The palettes list only the editor's own capabilities, so those
+ * bindings are unlisted — but they must survive the save (the backend keeps bindings
+ * already on the record), the stored model provider must be kept, and the form says why
+ * they aren't shown.
+ */
+describe('AgentFormPage — share editor without the owner\u2019s bindings', () => {
+  let fixture: ComponentFixture<AgentFormPage>;
+  let component: AgentFormPage;
+
+  const EDITOR_MODEL = { kind: 'model', ref: 'm-editor', label: 'Editor model', description: '', meta: { provider: 'bedrock' } };
+  const EDITOR_TOOL = { kind: 'tool', ref: 'editor_tool', label: 'Editor tool', description: '', meta: {} };
+
+  function agentWith(overrides: Record<string, unknown> = {}) {
+    return {
+      agentId: 'agt-1',
+      name: 'Owner Agent',
+      description: 'An agent shared with an editor',
+      instructions: 'You are the owner\u2019s carefully written assistant.',
+      userPermission: 'editor',
+      modelConfig: { modelId: 'openai.gpt-5.4', provider: 'mantle' },
+      bindings: [
+        { kind: 'tool', ref: 'owner_tool', config: {} },
+        { kind: 'tool', ref: 'editor_tool', config: {} },
+        { kind: 'skill', ref: 'owner_skill', config: {} },
+      ],
+      ...overrides,
+    };
+  }
+
+  const mockAgentService = {
+    loadBindable: vi.fn(),
+    getAgent: vi.fn(),
+    updateAgent: vi.fn().mockResolvedValue({ agentId: 'agt-1' }),
+  };
+
+  async function bootstrap(agent: Record<string, unknown>): Promise<void> {
+    TestBed.resetTestingModule();
+    vi.clearAllMocks();
+    Element.prototype.scrollIntoView = vi.fn();
+    mockAgentService.loadBindable.mockImplementation((kind: string) =>
+      Promise.resolve(kind === 'model' ? [EDITOR_MODEL] : kind === 'tool' ? [EDITOR_TOOL] : []),
+    );
+    mockAgentService.getAgent.mockResolvedValue(agent);
+    mockAgentService.updateAgent.mockResolvedValue({ agentId: 'agt-1' });
+
+    TestBed.configureTestingModule({
+      imports: [ReactiveFormsModule],
+      providers: [
+        provideRouter([{ path: 'agents', children: [] }]),
+        { provide: ToolService, useValue: makeToolService() },
+        { provide: AgentService, useValue: mockAgentService },
+        {
+          provide: ToastService,
+          useValue: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
+        },
+        { provide: SidenavService, useValue: { hide: vi.fn(), show: vi.fn() } },
+        { provide: ThemeService, useValue: { isDark: () => false } },
+        { provide: ActivatedRoute, useValue: { snapshot: { paramMap: { get: () => 'agt-1' } } } },
+      ],
+    });
+    TestBed.overrideComponent(AgentFormPage, {
+      remove: { imports: [AgentPreviewComponent, KnowledgeBaseSectionComponent] },
+      add: { imports: [StubPreviewComponent, StubKnowledgeBaseComponent] },
+    });
+
+    fixture = TestBed.createComponent(AgentFormPage);
+    component = fixture.componentInstance;
+    fixture.detectChanges();
+    await fixture.whenStable();
+    await settle(fixture);
+  }
+
+  function noteText(): string {
+    return (fixture.nativeElement.querySelector('[role="status"]')?.textContent ?? '').trim();
+  }
+
+  it('loads as an editor with the instructions filled in', async () => {
+    await bootstrap(agentWith());
+    expect(component.isViewer()).toBe(false);
+    expect(component.form.get('instructions')!.value).toContain('carefully written');
+    expect(fixture.nativeElement.textContent).not.toContain('You have viewer access');
+  });
+
+  it('counts the model, tool and skill the editor cannot see and explains them', async () => {
+    await bootstrap(agentWith());
+    expect(component.unavailableBindingCount()).toBe(3);
+    expect(noteText()).toContain("3 models, tools or skills on this agent aren't available to your account");
+    expect(noteText()).toContain('They stay on the agent when you save');
+  });
+
+  it('uses the singular wording for one unavailable binding', async () => {
+    await bootstrap(
+      agentWith({
+        modelConfig: { modelId: 'm-editor', provider: 'bedrock' },
+        bindings: [{ kind: 'tool', ref: 'owner_tool::one_tool', config: {} }],
+      }),
+    );
+    expect(component.unavailableBindingCount()).toBe(1);
+    expect(noteText()).toContain("1 model, tool or skill on this agent isn't available");
+  });
+
+  it('shows no note when everything is in the palettes', async () => {
+    await bootstrap(
+      agentWith({
+        modelConfig: { modelId: 'm-editor', provider: 'bedrock' },
+        bindings: [{ kind: 'tool', ref: 'editor_tool', config: {} }],
+      }),
+    );
+    expect(component.unavailableBindingCount()).toBe(0);
+    expect(noteText()).toBe('');
+  });
+
+  it('shows no note to a viewer', async () => {
+    await bootstrap(agentWith({ userPermission: 'viewer' }));
+    expect(component.unavailableBindingCount()).toBe(0);
+  });
+
+  it('sends every binding back and keeps the stored provider on save', async () => {
+    await bootstrap(agentWith());
+    await component.onSubmit();
+    expect(mockAgentService.updateAgent).toHaveBeenCalledWith(
+      'agt-1',
+      expect.objectContaining({
+        modelConfig: { modelId: 'openai.gpt-5.4', provider: 'mantle' },
+        bindings: expect.arrayContaining([
+          { kind: 'tool', ref: 'owner_tool' },
+          { kind: 'tool', ref: 'editor_tool' },
+          { kind: 'skill', ref: 'owner_skill' },
+        ]),
+      }),
+    );
+  });
+
+  it('takes the palette provider once the editor picks one of their own models', async () => {
+    await bootstrap(agentWith());
+    component.selectModel('m-editor');
+    await component.onSubmit();
+    expect(mockAgentService.updateAgent).toHaveBeenCalledWith(
+      'agt-1',
+      expect.objectContaining({ modelConfig: { modelId: 'm-editor', provider: 'bedrock' } }),
+    );
   });
 });

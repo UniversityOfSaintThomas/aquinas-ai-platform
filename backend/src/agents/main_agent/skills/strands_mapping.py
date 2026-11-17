@@ -15,7 +15,7 @@ retired).
 from __future__ import annotations
 
 import logging
-from typing import Any, List, Optional
+from typing import Any, List, NamedTuple, Optional
 
 from strands import AgentSkills, Skill, tool
 
@@ -35,6 +35,7 @@ __all__ = [
     "record_to_strands_skill",
     "fetch_active_skill_records",
     "build_skills_plugin",
+    "SkillsRuntime",
     "build_skills_runtime",
     "make_read_skill_file_tool",
 ]
@@ -44,6 +45,26 @@ _INERT_SCRIPT_NOTICE = (
     "executable on this platform — read it to understand the approach, then "
     "reproduce the steps yourself.]"
 )
+
+# The notice while WORD_SKILL_SCRIPTS_ENABLED is on, when the one path that can
+# run a skill script exists (agents/main_agent/skills/skill_scripts.py). The
+# inert notice would then tell the model to retype a program the Word tools can
+# load by reference. Chosen per deployment, so it is constant for a session.
+_WORD_RUNNABLE_SCRIPT_NOTICE = (
+    "[This script is stored with the skill. It does not run on its own here. "
+    "If it is a Python file that builds or edits a Word document and you have "
+    "create_word_document or modify_word_document, run it with that tool's "
+    "skill_name and path arguments instead of copying it into python_code. "
+    "Otherwise read it to understand the approach, then reproduce the steps "
+    "yourself.]"
+)
+
+
+def _script_notice() -> str:
+    """The notice ``read_skill_file`` puts ahead of a script's text."""
+    from apis.shared.feature_flags import word_skill_scripts_enabled
+
+    return _WORD_RUNNABLE_SCRIPT_NOTICE if word_skill_scripts_enabled() else _INERT_SCRIPT_NOTICE
 
 
 def _manifest_path(ref: Any) -> str:
@@ -163,6 +184,26 @@ def _resolve_resource(record: Any, path: str) -> Optional[Any]:
     return None
 
 
+class SkillsRuntime(NamedTuple):
+    """What one turn's skills contribute to the agent.
+
+    A ``NamedTuple`` so callers can read ``.plugin`` / ``.read_skill_file`` /
+    ``.records`` by name instead of by position.
+
+    **Adding the third element is a breaking change for positional callers**,
+    and that is worth stating plainly rather than glossed: a three-element
+    tuple does not unpack into two names, so every
+    ``plugin, read_tool = build_skills_runtime(...)`` site had to be updated.
+    The alternative — returning a two-tuple and fetching the records again —
+    would have cost the turn a second DynamoDB read of rows it already held,
+    which is the thing this exists to avoid.
+    """
+
+    plugin: Optional[Any]
+    read_skill_file: Optional[Any]
+    records: List[Any]
+
+
 def make_read_skill_file_tool(records: List[Any]):
     """Build the per-turn ``read_skill_file`` tool bound to ``records``.
 
@@ -219,7 +260,7 @@ def make_read_skill_file_tool(records: List[Any]):
 
         kind = getattr(ref, "kind", "reference")
         if kind == "script":
-            return f"{_INERT_SCRIPT_NOTICE}\n\n{raw.decode('utf-8', errors='replace')}"
+            return f"{_script_notice()}\n\n{raw.decode('utf-8', errors='replace')}"
         if kind == "asset" or not is_text_content_type(ref.content_type):
             return (
                 f"'{path}' is a binary {kind} ({ref.content_type or 'unknown type'}, "
@@ -239,13 +280,21 @@ def build_skills_runtime(
     plugin and the ``read_skill_file`` tool bound to those records. Returns
     ``(None, None)`` when there are no accessible/active skills — the caller
     then wires neither and the agent behaves as a plain chat agent.
+
+    The records themselves are available on the returned tuple's
+    :attr:`SkillsRuntime.records`, because a second consumer needs them and
+    re-fetching would double the turn's DynamoDB reads. ``document_extract``
+    (docs/specs/structured-extraction.md §5.2) decides whether to mount from
+    the resource manifest those records already carry, which is why the gate
+    costs no I/O — and resolving a field set has to go through exactly the same
+    records, so access stays structural rather than re-checked.
     """
     if not accessible_skill_ids:
-        return None, None
+        return SkillsRuntime(None, None, [])
 
     records = fetch_active_skill_records(list(accessible_skill_ids))
     if not records:
-        return None, None
+        return SkillsRuntime(None, None, [])
 
     # Deterministic order regardless of fetch order: these records become the
     # <available_skills> system-prompt block, and any order flip between turns
@@ -256,7 +305,7 @@ def build_skills_runtime(
     plugin = AgentSkills(skills=skills)
     read_tool = make_read_skill_file_tool(records)
     logger.info("Built skills runtime: %d skill(s) + read_skill_file", len(skills))
-    return plugin, read_tool
+    return SkillsRuntime(plugin, read_tool, records)
 
 
 def build_skills_plugin(
@@ -267,5 +316,4 @@ def build_skills_plugin(
     Prefer :func:`build_skills_runtime`, which also returns the
     ``read_skill_file`` tool from the same single record fetch.
     """
-    plugin, _ = build_skills_runtime(accessible_skill_ids)
-    return plugin
+    return build_skills_runtime(accessible_skill_ids).plugin

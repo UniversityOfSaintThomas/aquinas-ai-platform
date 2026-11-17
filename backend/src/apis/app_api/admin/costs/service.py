@@ -10,6 +10,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, List
 
+from apis.shared.sessions.ledger_rollups import call_kind
 from apis.shared.sessions.models import FEEDBACK_REASONS
 from apis.shared.storage.dynamodb_storage import DynamoDBStorage
 from apis.shared.observability.prefix_tokens import (
@@ -26,6 +27,8 @@ from .diagnoses import (
 )
 from .models import (
     CompactionEvent,
+    AttachmentPlanFile,
+    AttachmentPlanRecord,
     DocumentReads,
     PrefixTokens,
     AttachmentProfile,
@@ -71,6 +74,25 @@ def _as_int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+#: Census weight fields (release-ledger spec D4): row key -> entry attribute.
+_TOOL_WEIGHT_FIELDS = (
+    ("resultChars", "result_chars"),
+    ("inputChars", "input_chars"),
+    ("durationMs", "duration_ms"),
+    ("timedCalls", "timed_calls"),
+)
+
+
+def _add_tool_weight(slot: Any, entry: Dict[str, Any]) -> None:
+    """Sum one row's tool weight into the session's entry. A field no row
+    carried stays ``None`` (not measured), never ``0``."""
+    for key, attr in _TOOL_WEIGHT_FIELDS:
+        value = _as_int(entry.get(key))
+        if value is None:
+            continue
+        setattr(slot, attr, (getattr(slot, attr) or 0) + value)
 
 
 def _as_float(value: Any) -> Optional[float]:
@@ -300,6 +322,32 @@ def _call_document_reads(record: Dict[str, Any]) -> Optional[DocumentReads]:
         calls=_as_int(raw.get("calls")) or 0,
         pages=_as_int(raw.get("pages")) or 0,
         bytes=_as_int(raw.get("bytes")) or 0,
+    )
+
+
+def _call_attachment_plan(record: Dict[str, Any]) -> Optional[AttachmentPlanRecord]:
+    """The row's ``attachmentPlan``, or ``None`` when absent or malformed."""
+    raw = record.get("attachmentPlan")
+    if not isinstance(raw, dict) or not raw.get("profile"):
+        return None
+    files = []
+    for entry in raw.get("files") or []:
+        if not isinstance(entry, dict) or not entry.get("mode") or not entry.get("reason"):
+            continue
+        files.append(
+            AttachmentPlanFile(
+                mode=str(entry["mode"]),
+                file_class=str(entry.get("class") or ""),
+                tokens=_as_int(entry.get("tokens")) or 0,
+                reason=str(entry["reason"]),
+                upload_id=str(entry["uploadId"]) if entry.get("uploadId") else None,
+                variant=str(entry["variant"]) if entry.get("variant") else None,
+            )
+        )
+    return AttachmentPlanRecord(
+        profile=str(raw["profile"]),
+        files=files,
+        dropped_over_count=_as_int(raw.get("droppedOverCount")) or 0,
     )
 
 
@@ -1037,6 +1085,9 @@ class AdminCostService:
             cache_write = int(token_usage.get("cacheWriteInputTokens") or 0)
             cache_status = record.get("cacheStatus")
             row_wasted = float(record.get("wastedUsd") or 0.0)
+            # An interrupted turn's cut generation: the tokens and cost on this
+            # row are the best estimate of what was billed, not a report.
+            usage_estimated_raw = record.get("usageEstimated")
             # #756 — derived at write time, where the predecessor row was already
             # in hand; read here as a plain projection.
             agent_switched = bool(record.get("agentSwitched"))
@@ -1061,9 +1112,16 @@ class AdminCostService:
 
             gap_raw = record.get("cacheGapSeconds")
             prefix_gap_raw = record.get("cachePrefixGapSeconds")
+            # Not every writer sets `callKind` or uses an integer message id:
+            # `document_extract` writes `extract:<toolUseId>` and voice
+            # `voice:<n>`. Those name no message, so they read as no message id
+            # and their kind comes from the one place that already tells them
+            # apart, rather than failing the whole session's anatomy.
+            row_kind = call_kind(record)
             calls.append(SessionCallRow(
                 timestamp=record.get("timestamp", ""),
-                message_id=record.get("messageId"),
+                message_id=_as_int(record.get("messageId")),
+                call_kind=None if row_kind == "chat" else row_kind,
                 model_id=model_info.get("modelId"),
                 input_tokens=int(token_usage.get("inputTokens") or 0),
                 output_tokens=int(token_usage.get("outputTokens") or 0),
@@ -1076,7 +1134,16 @@ class AdminCostService:
                     int(prefix_gap_raw) if prefix_gap_raw is not None else None
                 ),
                 wasted_usd=row_wasted,
+                usage_estimated=(
+                    {str(key): str(value) for key, value in usage_estimated_raw.items()}
+                    if isinstance(usage_estimated_raw, dict) and usage_estimated_raw
+                    else None
+                ),
                 turn_agent_id=record.get("turnAgentId"),
+                app_version=record.get("appVersion"),
+                build=record.get("build"),
+                outcome=record.get("outcome"),
+                empty_answer=record.get("emptyAnswer") is True,
                 agent_switched=agent_switched,
                 model_switched=model_switched,
                 prefix_fingerprints=(
@@ -1088,6 +1155,7 @@ class AdminCostService:
                 window_trimmed=ledger.trimmed,
                 compaction_events=ledger.events or None,
                 **_document_row_fields(ledger),
+                attachment_plan=_call_attachment_plan(record),
             ))
 
         cache_traffic = total_cache_read + total_cache_write
@@ -1433,6 +1501,8 @@ class AdminCostService:
                     slot = census.setdefault(name, ToolCensusEntry())
                     slot.calls += calls
                     slot.errors += errors
+                    if isinstance(entry, dict):
+                        _add_tool_weight(slot, entry)
 
             ledger = _call_ledger(record, previous_removed)
             if ledger.prefix_tokens is not None:

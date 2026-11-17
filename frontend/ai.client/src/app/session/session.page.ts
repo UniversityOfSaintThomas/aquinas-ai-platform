@@ -15,6 +15,7 @@ import {
   NEW_CONVERSATION_DRAFT_KEY,
 } from './services/session/composer-draft-storage.service';
 import { ChatStateService } from './services/chat/chat-state.service';
+import { lastUserText } from './services/chat/provider-outage';
 import { SidenavService } from '../services/sidenav/sidenav.service';
 import { HeaderService } from '../services/header/header.service';
 import { ModelService } from './services/model/model.service';
@@ -39,7 +40,8 @@ import { ComposerProject } from './components/chat-input/chat-input.component';
 import { ConversationBindingService } from './services/session/conversation-binding.service';
 import { AgentService } from '../agents/services/agent.service';
 import { AgentMentionService } from '../agents/services/agent-mention.service';
-import { routeMention } from './services/chat/mention-routing';
+import { routeMention, stripMention } from './services/chat/mention-routing';
+import { AgentHandoffService } from './services/handoff/agent-handoff.service';
 import { ToastService } from '../services/toast/toast.service';
 import { Agent, AgentRunnability } from '../agents/models/agent.model';
 import { ToolService } from '../services/tool/tool.service';
@@ -98,7 +100,9 @@ export class ConversationPage implements OnDestroy {
   private agentMentionService = inject(AgentMentionService);
   private toast = inject(ToastService);
   private features = inject(FEATURES);
-  private binding = inject(ConversationBindingService);
+  private agentHandoff = inject(AgentHandoffService);
+  /** Protected: the template hands the URL binding to the composer's voice control (#625). */
+  protected readonly binding = inject(ConversationBindingService);
   private platformId = inject(PLATFORM_ID);
   private isBrowser = isPlatformBrowser(this.platformId);
 
@@ -777,7 +781,7 @@ export class ConversationPage implements OnDestroy {
       });
   }
 
-  async onMessageSubmitted(message: { content: string, timestamp: Date, fileUploadIds?: string[], mentionAgentId?: string, invokedSkillIds?: string[], folders?: FolderAttachmentData[] }) {
+  async onMessageSubmitted(message: { content: string, timestamp: Date, fileUploadIds?: string[], mentionAgentId?: string, invokedSkillIds?: string[], folders?: FolderAttachmentData[], pastedChars?: number }) {
     // Use the effective session ID (route sessionId or staged sessionId)
     const sessionIdToUse = this.effectiveSessionId();
 
@@ -812,6 +816,23 @@ export class ConversationPage implements OnDestroy {
       threadHasMessages: this.hasMessages(),
     });
 
+    // Handoffs (docs/specs/agent-handoffs-and-consults.md §4.2): with the feature on, a
+    // mid-thread mention sends nothing yet. The review sheet opens above the composer with
+    // the request and a context card from this thread; Send starts the Agent's conversation
+    // in the background and the user stays here.
+    if (routed.handedOff && message.mentionAgentId && this.features.handoffs && sessionIdToUse) {
+      void this.agentHandoff.open(sessionIdToUse, {
+        agentId: message.mentionAgentId,
+        agentName: this.mentionedAgentName(message.mentionAgentId),
+        request: stripMention(message.content, this.mentionedAgentName(message.mentionAgentId)),
+        fileUploadIds: message.fileUploadIds,
+        invokedSkillIds: message.invokedSkillIds,
+        folders: message.folders,
+        sourceAssistantId: boundAssistantId,
+      });
+      return;
+    }
+
     if (routed.handedOff && message.mentionAgentId) {
       this.toast.info(
         `Starting a new conversation with ${this.mentionedAgentName(message.mentionAgentId)}`,
@@ -834,6 +855,7 @@ export class ConversationPage implements OnDestroy {
       undefined,
       message.invokedSkillIds,
       message.folders,
+      message.pastedChars,
     ).catch((error) => {
       console.error('Error sending chat request:', error);
     });
@@ -871,6 +893,24 @@ export class ConversationPage implements OnDestroy {
       .continueTruncatedTurn(sessionIdToUse, assistantIdToUse)
       .catch((error) => {
         console.error('Error continuing truncated turn:', error);
+      });
+  }
+
+  /**
+   * "Try again" under a provider-outage reply: send the last message again, a
+   * new turn, exactly what the reply advises the user to do by hand. The failed
+   * turn's attachments are still on the server's pending marker (a failed turn
+   * never clears it), so its files go with the resend without being re-attached.
+   */
+  onOutageRetryRequested() {
+    const text = lastUserText(this.messages());
+    if (!text) return;
+    const assistantIdToUse =
+      this.binding.boundAgentId() || this.assistant()?.assistantId || undefined;
+    this.chatRequestService
+      .submitChatRequest(text, this.effectiveSessionId(), undefined, assistantIdToUse)
+      .catch((error) => {
+        console.error('Error resending after a provider outage:', error);
       });
   }
 
@@ -1061,12 +1101,38 @@ export class ConversationPage implements OnDestroy {
     }
 
     const skillIds = agent.bindings.filter(b => b.kind === 'skill').map(b => b.ref);
-    this.skillService.lockToAgentSkills(skillIds);
-    // Load the accessible skills so the locked rows can render their names.
-    // Only fires when an Agent actually binds skills (a skills-enabled
-    // context), so there is no /skills fetch in flag-off environments.
-    if (skillIds.length > 0 && !this.skillService.initialized()) {
-      void this.skillService.loadSkills();
+    this.skillService.lockToAgentSkillIds(skillIds, { resolving: skillIds.length > 0 });
+    // Resolve the bound skills for this viewer. Only fires when an Agent actually
+    // binds skills (a skills-enabled context), so there is no fetch in flag-off
+    // environments.
+    if (skillIds.length > 0) {
+      void this.resolveAgentSkills(agent.agentId);
+    }
+  }
+
+  /**
+   * Replace the id lock with the Agent's skills as the backend resolved them for this
+   * viewer (`GET /agents/{id}/skills`), which is what the `/` menu and the picker rows
+   * are built from. The viewer's own `/skills/` list cannot do it: a skill another
+   * project member authored is not in it, so for every member but the author the
+   * locked set used to intersect to nothing and the menu never opened.
+   *
+   * Best-effort. A failure (an older backend without the route) keeps the id lock and
+   * loads the viewer's own list so the rows it can name still render, which is exactly
+   * the previous behaviour. A result for an Agent that is no longer the conversation's
+   * is dropped.
+   */
+  private async resolveAgentSkills(agentId: string): Promise<void> {
+    try {
+      const skills = await this.agentService.getBoundSkills(agentId);
+      if (this.agent()?.agentId !== agentId || !this.skillService.agentLocked()) return;
+      this.skillService.lockToAgentSkills(skills);
+    } catch {
+      if (this.agent()?.agentId !== agentId || !this.skillService.agentLocked()) return;
+      this.skillService.settleAgentLock();
+      if (!this.skillService.initialized()) {
+        void this.skillService.loadSkills();
+      }
     }
   }
 

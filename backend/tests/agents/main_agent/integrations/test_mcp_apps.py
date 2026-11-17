@@ -3,8 +3,9 @@
 Covers the PR #2 acceptance criteria from
 `docs/kaizen/scoping/mcp-apps-host-renderer.md`:
 
-  (a) `io.modelcontextprotocol/ui` is advertised on the outbound MCP
-      `initialize` when the host flag is on, and absent when it is off.
+  (a) `io.modelcontextprotocol/ui` is advertised in the client capabilities
+      (the legacy `initialize` and the 2026-07-28 per-request `_meta`) when
+      the host flag is on, and absent when it is off.
   (b) A tool whose `_meta.ui.visibility` excludes `"model"` is filtered out
       of the Strands tool list (external client + gateway filtered client).
   (c) `_meta.ui.resourceUri` survives the round-trip into our tool catalog.
@@ -20,13 +21,13 @@ import base64
 import json
 from concurrent.futures import Future
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import anyio
 import mcp.types as mcp_types
 import pytest
 import strands.tools.mcp.mcp_client as strands_mcp_client_mod
-from mcp.shared.session import BaseSession
+from mcp.types.version import LATEST_HANDSHAKE_VERSION, LATEST_MODERN_VERSION
 from strands.types import PaginatedList
 
 from agents.main_agent.integrations import mcp_apps
@@ -42,11 +43,13 @@ from agents.main_agent.integrations.mcp_apps import (
     record_and_filter_ui_tools,
 )
 from agents.main_agent.integrations.gateway_mcp_client import FilteredMCPClient
+from agents.main_agent.integrations.mcp_transport import streamable_http_transport
 from apis.shared.tools.models import (
     DEFAULT_TOOL_VISIBILITY,
     MCPServerConfig,
     ToolUIMetadata,
 )
+from tests.fixtures.flaky_mcp_server import FlakyMCPServer
 
 _ENV_FLAG = "AGENTCORE_MCP_APPS_HOST_ENABLED"
 _ENV_SANDBOX_ORIGIN = "AGENTCORE_MCP_APPS_SANDBOX_ORIGIN"
@@ -111,46 +114,25 @@ class TestToolUIMetadataParsing:
         assert ui.raw == raw
 
 
-# ── (a) initialize advertises the UI extension ────────────────────────────────
+# ── (a) the UI extension is advertised to every kind of server ───────────────
 
 
-async def _run_initialize(monkeypatch, *, enabled):
-    """Drive _UIExtensionClientSession.initialize() with I/O stubbed out and
-    return the ClientCapabilities that went onto the wire."""
-    if enabled:
-        monkeypatch.setenv(_ENV_FLAG, "true")
-    else:
-        monkeypatch.setenv(_ENV_FLAG, "false")
-
-    captured: dict = {}
-
-    async def fake_send_request(request, result_type, *a, **k):
-        captured["request"] = request
-        return mcp_types.InitializeResult(
-            protocolVersion=mcp_types.LATEST_PROTOCOL_VERSION,
-            capabilities=mcp_types.ServerCapabilities(),
-            serverInfo=mcp_types.Implementation(name="fake-server", version="1"),
-        )
-
+def _session():
     send_a, recv_a = anyio.create_memory_object_stream(1)
     send_b, recv_b = anyio.create_memory_object_stream(1)
-    session = _UIExtensionClientSession(recv_a, send_b)
-
-    with patch.object(
-        BaseSession, "send_request", new=AsyncMock(side_effect=fake_send_request)
-    ), patch.object(BaseSession, "send_notification", new=AsyncMock()):
-        await session.initialize()
-
-    request = captured["request"]
-    caps = request.root.params.capabilities
-    return caps.model_dump(by_alias=True, exclude_none=True)
+    return _UIExtensionClientSession(recv_a, send_b)
 
 
-@pytest.mark.asyncio
-async def test_initialize_advertises_ui_extension_when_enabled(
-    mcp_apps_clean, monkeypatch
+@pytest.mark.parametrize("version", [LATEST_HANDSHAKE_VERSION, LATEST_MODERN_VERSION])
+def test_capabilities_advertise_ui_extension_when_enabled(
+    mcp_apps_clean, monkeypatch, version
 ):
-    caps = await _run_initialize(monkeypatch, enabled=True)
+    """mcp 2.x builds one capability set for the legacy `initialize` and for
+    the 2026-07-28 per-request `_meta` envelope; both carry the extension."""
+    monkeypatch.setenv(_ENV_FLAG, "true")
+    caps = _session()._build_capabilities(version).model_dump(
+        by_alias=True, exclude_none=True
+    )
 
     assert caps.get("extensions", {}).get(MCP_APPS_UI_EXTENSION_KEY) == {
         "mimeTypes": [MCP_APPS_UI_MIME_TYPE]
@@ -158,47 +140,85 @@ async def test_initialize_advertises_ui_extension_when_enabled(
     assert MCP_APPS_UI_MIME_TYPE == "text/html;profile=mcp-app"
 
 
-@pytest.mark.asyncio
-async def test_initialize_omits_ui_extension_when_disabled(
-    mcp_apps_clean, monkeypatch
-):
-    caps = await _run_initialize(monkeypatch, enabled=False)
+def test_capabilities_omit_ui_extension_when_disabled(mcp_apps_clean, monkeypatch):
+    monkeypatch.setenv(_ENV_FLAG, "false")
+    caps = _session()._build_capabilities(LATEST_MODERN_VERSION).model_dump(
+        by_alias=True, exclude_none=True
+    )
 
-    assert MCP_APPS_UI_EXTENSION_KEY not in caps.get("extensions", {})
+    assert MCP_APPS_UI_EXTENSION_KEY not in (caps.get("extensions") or {})
 
 
-@pytest.mark.asyncio
-async def test_initialize_captures_server_info(mcp_apps_clean, monkeypatch):
-    """The session stashes `serverInfo` off the `initialize` result so the
-    App header can show the server's name + icon. Neither the SDK session nor
-    Strands retains it, so this seam fails loudly if that ever changes."""
+def test_callers_extensions_are_kept(mcp_apps_clean, monkeypatch):
+    """Strands passes its tasks extension the same way; adding ours must not
+    drop it (its `result_claims` need their extensions entry)."""
     monkeypatch.setenv(_ENV_FLAG, "true")
-
-    async def fake_send_request(request, result_type, *a, **k):
-        return mcp_types.InitializeResult(
-            protocolVersion=mcp_types.LATEST_PROTOCOL_VERSION,
-            capabilities=mcp_types.ServerCapabilities(),
-            serverInfo=mcp_types.Implementation(
-                name="excalidraw-mcp",
-                title="Excalidraw",
-                version="1",
-                icons=[mcp_types.Icon(src="https://cdn.test/x.svg")],
-            ),
-        )
-
     send_a, recv_a = anyio.create_memory_object_stream(1)
     send_b, recv_b = anyio.create_memory_object_stream(1)
-    session = _UIExtensionClientSession(recv_a, send_b)
+    session = _UIExtensionClientSession(
+        recv_a, send_b, extensions={"example.test/other": {"x": 1}}
+    )
+    extensions = session._build_capabilities(LATEST_MODERN_VERSION).extensions
 
-    with patch.object(
-        BaseSession, "send_request", new=AsyncMock(side_effect=fake_send_request)
-    ), patch.object(BaseSession, "send_notification", new=AsyncMock()):
-        await session.initialize()
+    assert extensions["example.test/other"] == {"x": 1}
+    assert MCP_APPS_UI_EXTENSION_KEY in extensions
 
-    info = session._mcp_apps_server_info
-    assert info is not None
-    assert info.title == "Excalidraw"
-    assert info.icons[0].src == "https://cdn.test/x.svg"
+
+def _stop_quietly(client):
+    try:
+        client.stop(None, None, None)
+    except Exception:
+        pass
+
+
+def _client_capabilities(requests, method):
+    for body in requests:
+        if isinstance(body, dict) and body.get("method") == method:
+            return (body.get("params") or {}).get("_meta", {}).get(
+                mcp_types.CLIENT_CAPABILITIES_META_KEY
+            )
+    raise AssertionError(f"no {method} request was sent")
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_a_2026_07_28_server_sees_the_ui_extension(
+    mcp_apps_clean, monkeypatch, enabled
+):
+    """Real wire: Strands' MCPClient over our transport, the patched session,
+    a modern server. The capabilities ride `_meta` on every request."""
+    monkeypatch.setenv(_ENV_FLAG, "true" if enabled else "false")
+    with FlakyMCPServer(fail_calls=False) as server:
+        client = UICapableMCPClient(lambda: streamable_http_transport(server.url))
+        try:
+            client.start()
+            client.list_tools_sync()
+        finally:
+            _stop_quietly(client)
+
+    for method in ("server/discover", "tools/list"):
+        extensions = _client_capabilities(server.requests, method).get("extensions") or {}
+        assert (MCP_APPS_UI_EXTENSION_KEY in extensions) is enabled, method
+
+
+def test_the_server_identity_comes_off_the_session(mcp_apps_clean, monkeypatch):
+    """A 2026-07-28 server names itself on the discover result; the App header
+    reads it from the session's `server_info`."""
+    monkeypatch.setenv(_ENV_FLAG, "true")
+    with FlakyMCPServer(
+        fail_calls=False,
+        name="excalidraw-mcp",
+        title="Excalidraw",
+        icons=[mcp_types.Icon(src="https://cdn.test/x.svg")],
+    ) as server:
+        client = UICapableMCPClient(lambda: streamable_http_transport(server.url))
+        try:
+            client.start()
+            name, icon = mcp_apps._resolve_server_identity(client, "ui://srv/widget")
+        finally:
+            _stop_quietly(client)
+
+    assert name == "Excalidraw"
+    assert icon == "https://cdn.test/x.svg"
 
 
 # ── ClientSession symbol patch ────────────────────────────────────────────────
@@ -456,10 +476,8 @@ class _FakeMCPClient:
         self._raises = raises
         self.read_calls: list = []
         # Mirrors how Strands' MCPClient holds the live SDK session, whose
-        # `_UIExtensionClientSession` stashes the captured `serverInfo`.
-        self._background_thread_session = SimpleNamespace(
-            _mcp_apps_server_info=server_info
-        )
+        # `server_info` is the server's negotiated identity.
+        self._background_thread_session = SimpleNamespace(server_info=server_info)
 
     def read_resource_sync(self, uri):
         self.read_calls.append(uri)
@@ -921,3 +939,110 @@ class TestStartRetry:
             with pytest.raises(MCPClientInitializationError):
                 client.start()
         assert calls["n"] == mcp_apps._MCP_START_MAX_ATTEMPTS
+
+
+# ── Per-user catalog partitioning ─────────────────────────────────────────────
+#
+# The catalog is process-global. A client carrying one user's credential is
+# stamped `owner_user_id` and its entries must never be handed back for any
+# other user — otherwise an app-initiated tools/call (or resources/read) for
+# user A runs on user B's client, with B's token.
+
+
+def _owned_client(owner, label):
+    client = _FakeMCPClient(result=_html_resource(text=f"<p>{label}</p>"))
+    client.owner_user_id = owner
+    client.label = label
+    return client
+
+
+class TestPerUserCatalog:
+    def _record(self, monkeypatch, client, name="widget"):
+        monkeypatch.setenv(_ENV_FLAG, "true")
+        record_and_filter_ui_tools(
+            [_fake_tool(name, ui={"resourceUri": "ui://srv/widget"})],
+            client=client,
+        )
+
+    def test_two_users_same_tool_name_never_cross(self, mcp_apps_clean, monkeypatch):
+        alice = _owned_client("alice", "alice")
+        bob = _owned_client("bob", "bob")
+        self._record(monkeypatch, alice)
+        # Bob's build runs later and would have overwritten Alice's entry.
+        self._record(monkeypatch, bob)
+
+        catalog = get_ui_tool_catalog()
+        assert catalog.get_client("widget", "alice") is alice
+        assert catalog.get_client("widget", "bob") is bob
+
+    def test_owned_entry_invisible_to_other_users_and_anonymous(
+        self, mcp_apps_clean, monkeypatch
+    ):
+        self._record(monkeypatch, _owned_client("alice", "alice"))
+
+        catalog = get_ui_tool_catalog()
+        assert catalog.get("widget", "bob") is None
+        assert catalog.get_client("widget", "bob") is None
+        assert catalog.get("widget") is None
+        assert catalog.get_client("widget") is None
+
+    def test_shared_client_visible_to_everyone(self, mcp_apps_clean, monkeypatch):
+        shared = _FakeMCPClient(result=_html_resource())
+        self._record(monkeypatch, shared)
+
+        catalog = get_ui_tool_catalog()
+        assert catalog.get_client("widget", "alice") is shared
+        assert catalog.get_client("widget", "bob") is shared
+        assert catalog.get_client("widget") is shared
+
+    def test_own_entry_preferred_over_shared(self, mcp_apps_clean, monkeypatch):
+        shared = _FakeMCPClient(result=_html_resource())
+        alice = _owned_client("alice", "alice")
+        self._record(monkeypatch, shared)
+        self._record(monkeypatch, alice)
+
+        catalog = get_ui_tool_catalog()
+        assert catalog.get_client("widget", "alice") is alice
+        assert catalog.get_client("widget", "bob") is shared
+
+    def test_fetch_ui_resource_reads_from_the_callers_client(
+        self, mcp_apps_clean, monkeypatch
+    ):
+        alice = _owned_client("alice", "alice")
+        bob = _owned_client("bob", "bob")
+        self._record(monkeypatch, alice)
+        self._record(monkeypatch, bob)
+
+        payload = fetch_ui_resource("widget", "tu-1", "alice")
+
+        assert payload is not None and "alice" in payload["html"]
+        assert alice.read_calls == ["ui://srv/widget"]
+        assert bob.read_calls == []
+        # And no fetch at all for a user with no client of their own.
+        assert fetch_ui_resource("widget", "tu-2", "carol") is None
+
+    def test_build_ui_app_header_scoped_to_user(self, mcp_apps_clean, monkeypatch):
+        self._record(monkeypatch, _owned_client("alice", "alice"))
+
+        assert build_ui_app_header("widget", "tu-1", "alice") is not None
+        assert build_ui_app_header("widget", "tu-1", "bob") is None
+
+    def test_forget_user_drops_only_that_users_entries(
+        self, mcp_apps_clean, monkeypatch
+    ):
+        shared = _FakeMCPClient(result=_html_resource())
+        self._record(monkeypatch, shared, name="shared_widget")
+        self._record(monkeypatch, _owned_client("alice", "alice"))
+        bob = _owned_client("bob", "bob")
+        self._record(monkeypatch, bob)
+
+        catalog = get_ui_tool_catalog()
+        catalog.forget_user("alice")
+
+        assert catalog.get("widget", "alice") is None
+        assert catalog.get_client("widget", "bob") is bob
+        assert catalog.get_client("shared_widget", "alice") is shared
+
+    def test_ui_capable_client_starts_unowned(self, mcp_apps_clean):
+        client = UICapableMCPClient(lambda: None, server_url="https://x.test/mcp")
+        assert client.owner_user_id is None

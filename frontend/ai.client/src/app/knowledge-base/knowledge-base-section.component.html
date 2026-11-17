@@ -12,6 +12,10 @@
     }
   </div>
 
+  @if (showKnowledgeMode()) {
+    <app-knowledge-mode-line [entityId]="entityIdForMode()" [refreshKey]="knowledgeModeKey()" />
+  }
+
   <!-- ── Knowledge base upgrade (managed-kb-migration, Reqs 21 & 23) ──────
        Renders nothing at all unless the server says there is something to
        say. A knowledge base that works needs no UI, so `phase: 'none'` — the
@@ -243,7 +247,17 @@
     name="file-upload"
     class="sr-only"
     (change)="onFileSelected($event)"
-    accept=".pdf,.docx,.txt,.md,.html,.csv,.xls,.xlsx,.pptx,.csv,.md,.pptx"
+    accept=".pdf,.docx,.txt,.md,.html,.csv,.xls,.xlsx,.pptx,.sql"
+  />
+  <!-- Picker for "Replace with a newer version". Its accept list is set to
+       the original's extension each time it opens (see startReplace). -->
+  <input
+    #replaceInput
+    type="file"
+    class="sr-only"
+    tabindex="-1"
+    aria-hidden="true"
+    (change)="onReplaceFilePicked($event)"
   />
 
   <!-- File Upload -->
@@ -341,7 +355,7 @@
             <path d="M1.5 6a2.25 2.25 0 0 1 2.25-2.25h16.5A2.25 2.25 0 0 1 22.5 6v12a2.25 2.25 0 0 1-2.25 2.25H3.75A2.25 2.25 0 0 1 1.5 18V6ZM3 16.06V18c0 .414.336.75.75.75h16.5A.75.75 0 0 0 21 18v-1.94l-2.69-2.689a1.5 1.5 0 0 0-2.12 0l-.88.879.97.97a.75.75 0 1 1-1.06 1.06l-5.16-5.159a1.5 1.5 0 0 0-2.12 0L3 16.061Zm10.125-7.81a1.125 1.125 0 1 1 2.25 0 1.125 1.125 0 0 1-2.25 0Z" clip-rule="evenodd" fill-rule="evenodd" />
           </svg>
           <p class="mt-4 text-sm/6 text-gray-600 dark:text-gray-400">Drag and drop a file here</p>
-          <p class="text-xs/5 text-gray-500 dark:text-gray-400">PDF, DOCX, TXT, MD, and other document types up to 10&nbsp;MB</p>
+          <p class="text-xs/5 text-gray-500 dark:text-gray-400">{{ dropzoneHint() }}</p>
         </div>
       </div>
     }
@@ -378,7 +392,7 @@
         </div>
       }
       @if (upload.status === 'error' && upload.error) {
-        <p class="mt-2 text-sm/6 text-state-danger-600 dark:text-state-danger-400">{{ upload.error }}</p>
+        <p role="alert" class="mt-2 text-sm/6 text-state-danger-600 dark:text-state-danger-400">{{ upload.error }}</p>
       }
     </div>
   }
@@ -528,7 +542,7 @@
         </div>
       }
       <ul class="divide-y divide-gray-200 overflow-hidden rounded-2xl border border-gray-200 bg-white dark:divide-gray-700 dark:border-gray-700 dark:bg-gray-800">
-        @for (doc of uploadedDocuments(); track doc.documentId) {
+        @for (doc of displayedDocuments(); track doc.documentId) {
           <li class="flex items-start gap-3 px-3 py-2.5 sm:px-4">
             <div class="flex min-w-0 flex-1 items-start gap-3">
               @if (doc.status === 'complete') {
@@ -567,6 +581,14 @@
                   @if (doc.chunkCount) {
                     <span class="text-xs/5 text-gray-400 dark:text-gray-500">&#8226;</span>
                     <span class="text-xs/5 text-gray-500 dark:text-gray-400">{{ doc.chunkCount }} chunks</span>
+                  }
+                  @if (replace.activeOldId() === doc.documentId) {
+                    <span class="text-xs/5 text-gray-400 dark:text-gray-500">&#8226;</span>
+                    <span role="status" class="text-xs/5 font-medium text-state-info-600 dark:text-state-info-400">Replacing…</span>
+                  }
+                  @if (replace.replacementFor(doc.documentId)) {
+                    <span class="text-xs/5 text-gray-400 dark:text-gray-500">&#8226;</span>
+                    <span class="text-xs/5 text-gray-500 dark:text-gray-400">New version of the file above</span>
                   }
                   @if (canManageSync() && isDriveSyncable(doc) && reconnectLabelForDocument(doc); as provider) {
                     <span class="text-xs/5 text-gray-400 dark:text-gray-500">&#8226;</span>
@@ -616,9 +638,22 @@
                 <ng-icon name="heroArrowDownTray" class="size-4" aria-hidden="true" />
               </button>
             }
+            @if (canReplace(doc)) {
+              <button
+                type="button"
+                (click)="startReplace(doc)"
+                [disabled]="replaceDisabled()"
+                title="Replace with a newer version"
+                [attr.aria-label]="'Replace ' + doc.filename"
+                class="flex size-8 shrink-0 items-center justify-center rounded-2xl text-gray-400 hover:bg-gray-100 hover:text-primary-accessible focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 disabled:cursor-not-allowed disabled:opacity-50 dark:text-gray-500 dark:hover:bg-gray-700 dark:hover:text-primary-50"
+              >
+                <ng-icon name="heroArrowUpTray" class="size-4" aria-hidden="true" />
+              </button>
+            }
             <button
               type="button"
               (click)="deleteDocument(doc.documentId)"
+              [disabled]="replace.isBusy(doc.documentId)"
               title="Delete document"
               [attr.aria-label]="'Delete ' + doc.filename"
               class="flex size-8 shrink-0 items-center justify-center rounded-2xl text-gray-400 hover:bg-state-danger-50 hover:text-state-danger-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-state-danger-500 disabled:cursor-not-allowed disabled:opacity-50 dark:text-gray-500 dark:hover:bg-state-danger-900/20 dark:hover:text-state-danger-400"
@@ -631,4 +666,6 @@
     </div>
   }
   }
+  <!-- Host-supplied settings shown at the bottom of the card (the agent form's response strictness, #112). -->
+  <ng-content />
 </section>

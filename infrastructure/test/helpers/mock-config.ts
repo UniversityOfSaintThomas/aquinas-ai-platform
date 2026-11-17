@@ -4,6 +4,33 @@
  * Provides a complete, valid AppConfig and helpers to mock SSM
  * valueFromLookup context entries so stacks can be synthesized
  * without hitting AWS.
+ *
+ * ## Two ways a synth here differs from what a deployment gets
+ *
+ * Both were found by reading dev's live stack against a synth (2026-10-20),
+ * and both make a test's numbers smaller than reality, so they matter to any
+ * test that COUNTS something rather than asserting a shape:
+ *
+ * 1. **`Template.fromStack` never emits `AWS::CDK::Metadata`.** The CDK *CLI*
+ *    adds it to every deployed template (version reporting, on unless
+ *    `versionReporting: false`, which `cdk.json` does not set). So a resource
+ *    count taken from a unit test is **one lower than the deploy's**, always.
+ *    `platform-ceilings.test.ts` adds it back; anything else counting
+ *    resources should too.
+ * 2. **A config-gated block is absent until its value is present.** This
+ *    factory is deliberately an all-off baseline, which is neither the shipped
+ *    default (`loadConfig()`) nor anything a deployment runs, and a block that
+ *    only synthesizes when a value is set simply will not be there.
+ *    `tokenExchange` is the usual one: it is worth 3 env vars
+ *    (`runtime-env-var-limit.test.ts`: "without it this test counts 44 while
+ *    prod and dev deploy 47") and 1 resource (`platform-ceilings.test.ts`).
+ *    This has now been missed twice, in both of those files, by authors who
+ *    had read the other one's warning — so if your test measures against a
+ *    ceiling, start from the config a deployment actually has and work out
+ *    what is missing, rather than from this baseline and what you remember.
+ *
+ * A bare `new cdk.App()` also carries none of `cdk.json`'s CDK feature flags,
+ * which change what is synthesized; pass them when fidelity matters.
  */
 import * as cdk from 'aws-cdk-lib';
 import { AppConfig,
@@ -13,9 +40,11 @@ import { AppConfig,
   MANAGED_KB_DEFAULT_PER_OWNER_BYTES,
   MANAGED_KB_ELEVATED_PER_OWNER_BYTES,
   MANAGED_KB_PER_KB_CEILING_BYTES,
+  KB_UPLOAD_MAX_FILE_BYTES,
   MANAGED_KB_RETENTION_WINDOW_DAYS,
   OBSERVABILITY_DEFAULT_AGENTCORE_ACTIVE_SESSION_THRESHOLD,
   OBSERVABILITY_DEFAULT_AGENTCORE_ERROR_THRESHOLD,
+  OBSERVABILITY_DEFAULT_CHAT_STREAM_DROP_THRESHOLD,
   OBSERVABILITY_DEFAULT_ALB_TARGET_5XX_THRESHOLD,
   OBSERVABILITY_DEFAULT_BEDROCK_TPM_QUOTA_PERCENT,
   OBSERVABILITY_DEFAULT_DYNAMO_THROTTLE_THRESHOLD,
@@ -49,6 +78,7 @@ export function createMockConfig(overrides: Partial<AppConfig> = {}): AppConfig 
     production: false,
     retainDataOnDelete: false,
     manageDnsRecords: true,
+    albRestrictToCloudFront: true,
     vpcCidr: '10.0.0.0/16',
     corsOrigins: 'http://localhost:4200',
     appVersion: '1.0.0-test',
@@ -78,6 +108,7 @@ export function createMockConfig(overrides: Partial<AppConfig> = {}): AppConfig 
       albP99LatencyMs: OBSERVABILITY_DEFAULT_P99_LATENCY_MS,
       agentCoreLatencyMs: OBSERVABILITY_DEFAULT_P99_LATENCY_MS,
       agentCoreErrorThreshold: OBSERVABILITY_DEFAULT_AGENTCORE_ERROR_THRESHOLD,
+      chatStreamDropThreshold: OBSERVABILITY_DEFAULT_CHAT_STREAM_DROP_THRESHOLD,
       agentCoreActiveSessionThreshold:
         OBSERVABILITY_DEFAULT_AGENTCORE_ACTIVE_SESSION_THRESHOLD,
       lambdaErrorThreshold: OBSERVABILITY_DEFAULT_LAMBDA_ERROR_THRESHOLD,
@@ -132,6 +163,7 @@ export function createMockConfig(overrides: Partial<AppConfig> = {}): AppConfig 
       perOwnerDefaultBytes: MANAGED_KB_DEFAULT_PER_OWNER_BYTES,
       perOwnerElevatedBytes: MANAGED_KB_ELEVATED_PER_OWNER_BYTES,
       perKnowledgeBaseCeilingBytes: MANAGED_KB_PER_KB_CEILING_BYTES,
+      uploadMaxFileBytes: KB_UPLOAD_MAX_FILE_BYTES,
       retentionWindowDays: MANAGED_KB_RETENTION_WINDOW_DAYS,
       storageAlarmGb: 500,
       dailyCostAlarmUsd: 100,
@@ -152,6 +184,22 @@ export function createMockConfig(overrides: Partial<AppConfig> = {}): AppConfig 
       enabled: false,
     },
     sessionPrewarm: {
+      enabled: false,
+    },
+    quotaRequests: {
+      enabled: false,
+    },
+    awsLimits: {
+      enabled: false,
+    },
+    handoffs: {
+      enabled: false,
+      briefEnabled: false,
+    },
+    sessionRewind: {
+      enabled: false,
+    },
+    sessionFork: {
       enabled: false,
     },
     clientTurnTiming: {
@@ -186,6 +234,13 @@ export function createMockConfig(overrides: Partial<AppConfig> = {}): AppConfig 
     },
     assistantKbFullContext: {
       enabled: false,
+      maxTokens: 50_000,
+    },
+    agentKnowledgeFiles: {
+      enabled: false,
+    },
+    meetingTasks: {
+      enabled: false,
     },
     largeDocumentAttachments: {
       enabled: false,
@@ -197,6 +252,37 @@ export function createMockConfig(overrides: Partial<AppConfig> = {}): AppConfig 
       enabled: false,
     },
     folderSync: {
+      enabled: false,
+    },
+    sourceProvenance: {
+      enabled: false,
+    },
+    attachmentPlan: {
+      enabled: false,
+    },
+    mcpElicitation: {
+      enabled: false,
+    },
+    releaseLedger: {
+      enabled: false,
+    },
+    webSearchDefaultMaxResults: {
+      enabled: false,
+    },
+    wordSkillScripts: {
+      enabled: false,
+    },
+    converseDocumentsAsText: {
+      enabled: false,
+    },
+    projectFileReadiness: {
+      enabled: false,
+    },
+    documentExtract: {
+      enabled: false,
+      modelId: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+    },
+    fieldSetAuthoring: {
       enabled: false,
     },
     agents: {

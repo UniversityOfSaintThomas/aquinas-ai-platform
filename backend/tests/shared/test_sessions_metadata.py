@@ -38,6 +38,18 @@ class TestStoreMessageMetadata:
         assert cost_items[0]["GSI_PK"] == "SESSION#s1"
 
     @pytest.mark.asyncio
+    async def test_cost_record_names_the_build_that_wrote_it(self, sessions_metadata_table, monkeypatch):
+        """release-ledger spec D1: every C# row carries appVersion and build."""
+        import apis.shared.sessions.metadata as module
+        from apis.shared.sessions.metadata import store_message_metadata
+
+        monkeypatch.setattr(module, "build_stamp", lambda: {"appVersion": "1.33.0", "build": "8f676bb2e1a4c0d2"})
+        await store_message_metadata(session_id="s1", user_id="u1", message_id=1, message_metadata=_make_message_metadata())
+        (row,) = [i for i in sessions_metadata_table.scan()["Items"] if i["SK"].startswith("C#")]
+        assert row["appVersion"] == "1.33.0"
+        assert row["build"] == "8f676bb2e1a4c0d2"
+
+    @pytest.mark.asyncio
     async def test_store_multiple_cost_records(self, sessions_metadata_table):
         from apis.shared.sessions.metadata import store_message_metadata
         for i in range(3):
@@ -1629,3 +1641,79 @@ class TestUpdateSessionTitle:
         await update_session_title("s1", "u1", "Biology Syllabus")
 
         assert sessions_metadata_table.scan()["Items"] == []
+
+
+class TestSessionPinning:
+    """Issue #711: pinned conversations live in the sparse PinnedSessionIndex."""
+
+    @pytest.mark.asyncio
+    async def test_pin_lists_session_as_pinned(self, sessions_metadata_table):
+        from apis.shared.sessions.metadata import (
+            ensure_session_metadata_exists,
+            list_pinned_sessions,
+            set_session_pinned,
+        )
+        await ensure_session_metadata_exists("s1", "u1")
+        await ensure_session_metadata_exists("s2", "u1")
+
+        assert await set_session_pinned("s1", "u1", pinned=True) == "ok"
+
+        pinned = await list_pinned_sessions("u1")
+        assert [s.session_id for s, _ in pinned] == ["s1"]
+        assert pinned[0][1]  # pinnedAt timestamp
+
+    @pytest.mark.asyncio
+    async def test_unpin_removes_session_from_pinned(self, sessions_metadata_table):
+        from apis.shared.sessions.metadata import (
+            ensure_session_metadata_exists,
+            list_pinned_sessions,
+            set_session_pinned,
+        )
+        await ensure_session_metadata_exists("s1", "u1")
+        await set_session_pinned("s1", "u1", pinned=True)
+
+        assert await set_session_pinned("s1", "u1", pinned=False) == "ok"
+
+        assert await list_pinned_sessions("u1") == []
+
+
+class TestDeletedSessionStaysDeleted:
+    """Issue #1764: a write after the delete must not return it to the sidebar."""
+
+    @pytest.mark.asyncio
+    async def test_turn_finishing_after_delete_does_not_relist(self, sessions_metadata_table):
+        from apis.app_api.sessions.services.session_service import SessionService
+        from apis.shared.sessions.metadata import (
+            ensure_session_metadata_exists, list_user_sessions, update_session_activity,
+        )
+        await ensure_session_metadata_exists("s1", "u1")
+        await SessionService().delete_session("u1", "s1")
+
+        assert await update_session_activity(session_id="s1", user_id="u1", last_model="m") is False
+        assert await list_user_sessions("u1") == ([], None)
+
+    @pytest.mark.asyncio
+    async def test_metadata_write_after_delete_does_not_relist(self, sessions_metadata_table):
+        from apis.app_api.sessions.services.session_service import SessionService
+        from apis.shared.sessions.metadata import list_user_sessions, store_session_metadata
+        await store_session_metadata(session_id="s1", user_id="u1", session_metadata=_make_session_metadata())
+        await SessionService().delete_session("u1", "s1")
+
+        await store_session_metadata(session_id="s1", user_id="u1", session_metadata=_make_session_metadata())
+        assert await list_user_sessions("u1") == ([], None)
+
+    @pytest.mark.asyncio
+    async def test_deleting_again_removes_leftover_listing_keys(self, sessions_metadata_table):
+        from apis.app_api.sessions.services.session_service import SessionService
+        from apis.shared.sessions.metadata import list_user_sessions
+        # The row as found in dev: a tombstone that got its recency keys back.
+        _put_migrated_row(
+            sessions_metadata_table, "s1", "2026-01-01T00:00:00Z",
+            status="deleted", deleted=True, deletedAt="2026-01-01T00:00:00Z",
+        )
+        assert [s.session_id for s in (await list_user_sessions("u1"))[0]] == ["s1"]
+
+        assert await SessionService().delete_session("u1", "s1") is True
+        row = sessions_metadata_table.get_item(Key={"PK": "USER#u1", "SK": "S#s1"})["Item"]
+        assert "GSI4_PK" not in row
+        assert await list_user_sessions("u1") == ([], None)

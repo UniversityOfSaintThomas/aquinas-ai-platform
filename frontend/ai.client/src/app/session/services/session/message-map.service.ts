@@ -11,6 +11,8 @@ import { UserQuestionService } from '../../../services/user-question/user-questi
 import { validateUserQuestions } from '../../../shared/utils/stream-parser';
 import { McpAppStateService } from '../mcp-apps/mcp-app-state.service';
 import { ToolInsightService } from '../chat/tool-insight.service';
+import { DeliveryStateService } from '../handoff/delivery-state.service';
+import { HandoffStateService } from '../handoff/handoff-state.service';
 import { normalizeSteeringMessages } from '../chat/steering';
 import { matchToolResultsToToolUses } from './tool-results';
 import { ChatStateService } from '../chat/chat-state.service';
@@ -49,6 +51,15 @@ export class MessageMapService {
    * stream after it.
    */
   private continuationPrefixes = new Map<string, Message[]>();
+
+  /**
+   * Stored messages a session's list does not show, because a rewind hid them
+   * (docs/specs/conversation-rewind-and-fork.md §4). Ids are positional
+   * (`msg-{sessionId}-{index}`) and the server never reuses an index, so the
+   * next message is numbered from the list's length PLUS this. Zero, and so
+   * today's numbering exactly, for a session that was never rewound.
+   */
+  private hiddenCounts = new Map<string, number>();
 
   /**
    * Tracks which session is currently loading messages from the API.
@@ -91,6 +102,8 @@ export class MessageMapService {
   private userQuestionService = inject(UserQuestionService);
   private mcpAppState = inject(McpAppStateService);
   private toolInsight = inject(ToolInsightService);
+  private handoffState = inject(HandoffStateService);
+  private deliveryState = inject(DeliveryStateService);
   private injector = inject(Injector);
   private chatStateService = inject(ChatStateService);
 
@@ -103,11 +116,8 @@ export class MessageMapService {
     this.continuationPrefixes.delete(sessionId);
 
     // Get current message count for this session to enable predictable ID generation
-    const currentMessages = this.messageMap()[sessionId]?.() ?? [];
-    const messageCount = currentMessages.length;
-
     // Reset stream parser with session context for predictable message IDs
-    this.streamParser.reset(sessionId, messageCount);
+    this.streamParser.reset(sessionId, this.nextMessageIndex(sessionId));
 
     this.beginStreamTracking(sessionId);
   }
@@ -124,7 +134,7 @@ export class MessageMapService {
     const currentMessages = this.messageMap()[sessionId]?.() ?? [];
     this.continuationPrefixes.set(sessionId, [...currentMessages]);
 
-    this.streamParser.reset(sessionId, currentMessages.length);
+    this.streamParser.reset(sessionId, this.nextMessageIndex(sessionId));
 
     this.beginStreamTracking(sessionId);
   }
@@ -227,10 +237,14 @@ export class MessageMapService {
     content: string,
     fileAttachments?: FileAttachmentData[],
     folderAttachments?: FolderAttachmentData[],
+    /**
+     * What the model receives when it differs from what was typed (cards from another conversation
+     * before it, handoffs spec §4.8). The bubble then shows `content` as `displayText`, the shape a
+     * reload returns, so the two render alike.
+     */
+    modelText?: string,
   ): Message {
-    // Get current message count for this session to compute ID
-    const currentMessages = this.messageMap()[sessionId]?.() ?? [];
-    const messageIndex = currentMessages.length;
+    const messageIndex = this.nextMessageIndex(sessionId);
 
     // Compute predictable message ID: msg-{sessionId}-{index}
     const messageId = `msg-${sessionId}-${messageIndex}`;
@@ -255,12 +269,13 @@ export class MessageMapService {
     }
 
     // Add text content block
-    contentBlocks.push({ type: 'text', text: content });
+    contentBlocks.push({ type: 'text', text: modelText ?? content });
 
     const message: Message = {
       id: messageId,
       role: 'user',
-      content: contentBlocks
+      content: contentBlocks,
+      ...(modelText !== undefined ? { metadata: { displayText: content } } : {}),
     };
 
     this.messageMap.update(map => {
@@ -276,6 +291,41 @@ export class MessageMapService {
     });
 
     return message;
+  }
+
+  /**
+   * The index the session's next message takes: the list's length plus any
+   * stored messages a rewind hid from it.
+   */
+  nextMessageIndex(sessionId: string): number {
+    const shown = this.messageMap()[sessionId]?.().length ?? 0;
+    return shown + (this.hiddenCounts.get(sessionId) ?? 0);
+  }
+
+  /**
+   * Drop a rewound message and everything after it from the list, once the
+   * server has recorded the rewind. `nextMessageIndex` is the server's count,
+   * so the numbering stays right however the list was built. Returns whether
+   * the message was found.
+   */
+  rewindToMessage(sessionId: string, messageId: string, nextMessageIndex: number): boolean {
+    const sessionSignal = this.messageMap()[sessionId];
+    const msgs = sessionSignal?.() ?? [];
+    const index = msgs.findIndex(m => m.id === messageId);
+    if (!sessionSignal || index === -1) return false;
+    const kept = msgs.slice(0, index);
+    sessionSignal.set(kept);
+    this.setHiddenCount(sessionId, nextMessageIndex, kept.length);
+    return true;
+  }
+
+  private setHiddenCount(sessionId: string, nextMessageIndex: number | undefined, shown: number): void {
+    const hidden = typeof nextMessageIndex === 'number' ? Math.max(0, nextMessageIndex - shown) : 0;
+    if (hidden > 0) {
+      this.hiddenCounts.set(sessionId, hidden);
+    } else {
+      this.hiddenCounts.delete(sessionId);
+    }
   }
 
   /**
@@ -313,8 +363,7 @@ export class MessageMapService {
    * @param metadata - Optional metadata (token usage, cost) for badge display
    */
   addVoiceMessage(sessionId: string, role: 'user' | 'assistant', text: string, metadata?: Record<string, unknown>): Message {
-    const currentMessages = this.messageMap()[sessionId]?.() ?? [];
-    const messageIndex = currentMessages.length;
+    const messageIndex = this.nextMessageIndex(sessionId);
     const messageId = `msg-${sessionId}-${messageIndex}`;
 
     const message: Message = {
@@ -502,6 +551,7 @@ export class MessageMapService {
       });
 
       this.setArchiveServed(sessionId, messagesResponse.fromArchive === true);
+      this.setHiddenCount(sessionId, messagesResponse.nextMessageIndex, processedMessages.length);
 
       // Hydrate OAuth consent service from any persisted pending interrupts
       // so a reload restores the consent prompt anchored to the right turn.
@@ -539,6 +589,32 @@ export class MessageMapService {
         sessionId,
         messagesResponse.toolSummaries ?? [],
       );
+
+      // Source-provenance verdicts: same contract again. The one that matters
+      // is `quote_unsupported` — a warning the user saw live that silently
+      // disappeared on reload would leave the answer looking clean.
+      this.toolInsight.seedProvenanceFromHydration(
+        sessionId,
+        messagesResponse.sourceProvenance ?? [],
+      );
+
+      // Structured-extraction rows: the `document_extraction` event never
+      // re-streams either, and a reloaded conversation without them would
+      // show the model's prose summary of a table the user can no longer see.
+      this.toolInsight.seedExtractionsFromHydration(
+        sessionId,
+        messagesResponse.extractions ?? [],
+      );
+
+      // Handoffs (spec §4.3): the rows this thread sent, and where this
+      // conversation came from if a handoff started it. Neither re-streams.
+      this.handoffState.hydrate(
+        sessionId,
+        messagesResponse.handoffs,
+        messagesResponse.spawnedFrom,
+      );
+      // Cards sent back into this conversation (spec §4.8), for its composer.
+      this.deliveryState.hydrate(sessionId, messagesResponse.deliveries);
     } finally {
       if (showLoading) {
         this._isLoadingSession.set(null);
@@ -761,6 +837,7 @@ export class MessageMapService {
       return rest;
     });
     this.setArchiveServed(sessionId, false);
+    this.hiddenCounts.delete(sessionId);
   }
 
   private setArchiveServed(sessionId: string, served: boolean): void {

@@ -131,8 +131,8 @@ class TestCreateTarget:
                     "oauthCredentialProvider": {
                         "providerArn": config.credential_provider_arn,
                         "scopes": ["repo", "read:user"],
-                        # Defaults to the 3LO authorization-code grant.
-                        "grantType": "AUTHORIZATION_CODE",
+                        # Defaults to the client-credentials grant (#454).
+                        "grantType": "CLIENT_CREDENTIALS",
                     }
                 },
             }
@@ -156,6 +156,21 @@ class TestCreateTarget:
         ][0]["credentialProvider"]["oauthCredentialProvider"]
         assert oauth["grantType"] == "CLIENT_CREDENTIALS"
         assert oauth["customParameters"] == {"audience": "https://api.example.com"}
+
+    def test_token_exchange_row_is_refused_not_a_key_error(self, service, boto_client):
+        # A pre-#454 row may still hold token_exchange; AWS must never see it,
+        # and the failure must be a ValueError (400), not a KeyError (500).
+        config = MCPGatewayConfig(
+            target_name="old-target",
+            endpoint_url="https://old/mcp",
+            credential_type=GatewayCredentialType.OAUTH,
+            credential_provider_arn="arn:aws:bedrock-agentcore:us-west-2:111:token-vault/default/oauth2credentialprovider/old",
+            grant_type=GatewayOAuthGrantType.TOKEN_EXCHANGE,
+        )
+
+        with pytest.raises(ValueError, match="token_exchange"):
+            service.create_target(config)
+        boto_client.create_gateway_target.assert_not_called()
 
     def test_api_key_credential_config(self, service, boto_client):
         boto_client.create_gateway_target.return_value = _create_response()
@@ -407,3 +422,78 @@ class TestLambdaGrant:
         lam.remove_permission.assert_called_once_with(
             FunctionName="mcp-foo-dev", StatementId="agentcore-gw-weather-target"
         )
+
+
+# ------------------------------------------------------- built-in connectors
+
+
+def _web_search_config(**overrides) -> MCPGatewayConfig:
+    base = dict(target_name="web-search", connector_id="web-search")
+    base.update(overrides)
+    return MCPGatewayConfig(**base)
+
+
+class TestConnectorTargets:
+    """A connector target (AgentCore Web Search) is a different payload shape
+    on the same CreateGatewayTarget call — `mcp.connector`, not `mcpServer`."""
+
+    def test_create_sends_pinned_connector_and_bare_iam_credential(self, service, boto_client):
+        boto_client.create_gateway_target.return_value = _create_response(name="web-search")
+
+        service.create_target(_web_search_config())
+
+        kwargs = boto_client.create_gateway_target.call_args.kwargs
+        assert kwargs["targetConfiguration"] == {
+            "mcp": {
+                "connector": {
+                    "source": {"connectorId": "web-search", "version": "1.3.0"},
+                    "configurations": [{"name": "WebSearch", "parameterValues": {}}],
+                }
+            }
+        }
+        # No iamCredentialProvider: there is no service to sign for, and an
+        # mcpServer-style provider would be rejected for a connector.
+        assert kwargs["credentialProviderConfigurations"] == [
+            {"credentialProviderType": "GATEWAY_IAM_ROLE"}
+        ]
+
+    def test_domain_filter_sent_only_for_lists_that_are_set(self, service, boto_client):
+        boto_client.create_gateway_target.return_value = _create_response()
+
+        service.create_target(_web_search_config(domain_exclude=["pinterest.com"]))
+
+        config = boto_client.create_gateway_target.call_args.kwargs["targetConfiguration"]
+        params = config["mcp"]["connector"]["configurations"][0]["parameterValues"]
+        assert params == {"domainFilter": {"exclude": ["pinterest.com"]}}
+
+    def test_update_resends_the_stored_version_not_the_platform_default(self, service, boto_client):
+        boto_client.update_gateway_target.return_value = _create_response()
+
+        service.update_target(
+            target_id="TGT1",
+            config=_web_search_config(
+                connector_version="1.2.0", domain_include=["boisestate.edu"]
+            ),
+        )
+
+        connector = boto_client.update_gateway_target.call_args.kwargs[
+            "targetConfiguration"
+        ]["mcp"]["connector"]
+        assert connector["source"] == {"connectorId": "web-search", "version": "1.2.0"}
+        assert connector["configurations"][0]["parameterValues"] == {
+            "domainFilter": {"include": ["boisestate.edu"]}
+        }
+
+    def test_connector_never_touches_lambda_grants(self, boto_client):
+        boto_client.create_gateway_target.return_value = _create_response()
+        lam = MagicMock()
+        svc = GatewayTargetService(
+            client=boto_client, gateway_id="gw-test-id", lambda_client=lam
+        )
+
+        svc.create_target(_web_search_config())
+        svc.delete_target(target_id="TGT1", config=_web_search_config())
+
+        lam.add_permission.assert_not_called()
+        lam.remove_permission.assert_not_called()
+        boto_client.get_gateway.assert_not_called()

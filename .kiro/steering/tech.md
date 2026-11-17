@@ -11,12 +11,17 @@
 - **State Management**: Angular Signals (`signal()`, `computed()`)
 - **Package Manager**: npm 11.2.0
 
+## Terminal Client
+
+- **Location**: `tui/` (own `pyproject.toml`; Textual + httpx). Consumes app-api only.
+- **Backend surface it depends on**: `/auth/cli/*` device authorization, `Authorization: BFF` sessions, `client_surface` and `client_tools` on `/chat/stream`. All additive; the web app sends none of them. Contract: `docs/specs/TUI_WEB_PARITY_SPEC.md`.
+
 ## Backend
 
 - **Language**: Python 3.13+
 - **Framework**: FastAPI 0.116.1
 - **Server**: Uvicorn 0.35.0 (ASGI)
-- **Agent Framework**: Strands Agents 1.22.0
+- **Agent Framework**: Strands Agents 1.63.0 (pinned in `backend/pyproject.toml`; must stay ≥1.56 and move together with `bedrock-agentcore` ≥1.23.1)
 - **AWS SDK**: boto3 (Bedrock, S3, DynamoDB)
 - **Authentication**: PyJWT with crypto support
 - **Environment**: python-dotenv

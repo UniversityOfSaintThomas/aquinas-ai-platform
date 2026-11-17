@@ -26,6 +26,12 @@ Targets (pick one):
         --base-url https://<alb-or-cloudfront>/api --auth cognito \
         --cognito-domain https://<pool-domain>.auth.<region>.amazoncognito.com
 
+    # Deployed environment through app-api as the eval user that
+    # scripts/seed_eval_user.py seeds (credentials read from its SSM
+    # parameter, never the command line). The nightly dev track runs this way.
+    AWS_PROFILE=dev-ai uv run python scripts/smoke_turns.py \
+        --base-url https://dev.boisestate.ai/api --auth eval-user --prefix dev-boisestateai-v2
+
     # Deployed environment straight at the AgentCore Runtime, as the owner of
     # an active headless grant (apis/shared/harness/grants.py). Bypasses
     # app-api, so the 409 / Stop / steer rows are skipped; persistence is read
@@ -39,6 +45,14 @@ it runs as. Prompts are deliberately tiny, `--model-id` defaults to the user's
 default model, and sessions are deleted at the end unless `--keep`. The script
 refuses a `--prefix` or `--base-url` that looks like production unless
 `--allow-prod` is passed — this is a dev/local tool.
+
+``--publish --prefix <prefix>`` also writes the run's result as one
+``LEDGER#SMOKE`` row into that deployment's system-cost-rollup table
+(docs/specs/release-ledger.md §5.2): pass/fail/skip counts, each row's status,
+the first-token median and the second turn's cache tokens, keyed by the
+Runtime build that served the turns (read from the run's own ``C#`` rows, else
+the Runtime's image tag at the start of the run). Best-effort, content-free,
+and it never changes the exit status.
 
 Exit status: 0 when no row FAILED (SKIP and OBSERVED do not fail a run), 1
 otherwise, 2 for a setup error before any turn ran.
@@ -100,14 +114,24 @@ TAIL_ALLOWED = frozenset(
         "tool_approval_required",
         "user_question_required",
         "browser_login_required",
+        "client_tool_call",
         "metadata",
         "metadata_summary",
         "compaction",
         "session_title",
         "tool_group_summary",
+        # `verify_sources` verdicts drain beside the tool summaries, including
+        # the one flush in the `done` branch, so a turn that verified anything
+        # lands this after the final message_stop.
+        "source_provenance",
         "agent_status",
         "artifact",
         "ui_resource",
+        # Drained on the same pass as the tool-batch summaries, so like them
+        # it can land in the tail when the tool ran in the final batch
+        # (docs/specs/structured-extraction.md §9). `source_provenance` is
+        # added by the PR that dev-validates it, which owns that line.
+        "document_extraction",
         "event",
         "message",
         "result",
@@ -151,6 +175,7 @@ INTERRUPT_EVENTS = frozenset(
         "tool_approval_required",
         "user_question_required",
         "browser_login_required",
+        "client_tool_call",
     }
 )
 
@@ -315,6 +340,8 @@ class AppApiTransport:
             follow_redirects=False,
         )
         self._csrf: Optional[str] = None
+        #: The signed-in user as ``GET /auth/session`` reports it (``user_id``, ``email``…).
+        self.user: Dict[str, Any] = {}
 
     # -- auth -------------------------------------------------------------
 
@@ -375,13 +402,44 @@ class AppApiTransport:
         self._csrf = body.get("csrf_token") or body.get("csrfToken")
         if not self._csrf:
             raise RuntimeError("GET /auth/session returned no csrf_token")
-        logger.info("signed in (cognito) as %s", (body.get("user") or {}).get("email", "?"))
+        # The session payload is flat (user_id, email, name, roles, csrf_token).
+        self.user = {k: body.get(k) for k in ("user_id", "email", "name", "roles") if k in body}
+        logger.info("signed in (cognito) as %s", self.user.get("email") or "?")
+
+    async def enable_headless_grant(self) -> Dict[str, Any]:
+        """Pin a headless grant from this live session (``POST /runs/grant``).
+
+        The eval harness signs in fresh on every run and renews its grant this
+        way, so the grant's 30-day login-recency window never lapses on an
+        account nobody logs into by hand.
+        """
+        r = await self._client.post("/runs/grant", headers=self._headers())
+        if r.status_code == 404:
+            raise RuntimeError("POST /runs/grant -> 404: scheduled runs are off in this environment")
+        if r.status_code != 200:
+            raise RuntimeError(f"POST /runs/grant -> {r.status_code}: {r.text[:200]}")
+        return r.json()
 
     def _headers(self) -> Dict[str, str]:
         h = {"Content-Type": "application/json"}
         if self._csrf:
             h["X-CSRF-Token"] = self._csrf
         return h
+
+    async def call(
+        self, method: str, path: str, *, json_body: Any = None, params: Optional[Dict[str, Any]] = None
+    ) -> Tuple[int, Any]:
+        """One JSON request to app-api as the signed-in user: ``(status, body or None)``.
+
+        For the eval harness's fixture seeding and lookup (``seed_eval_fixtures.py``),
+        which create and list the eval user's own projects and agents.
+        """
+        r = await self._client.request(method, path, json=json_body, params=params, headers=self._headers())
+        try:
+            body = r.json() if r.content else None
+        except ValueError:
+            body = None
+        return r.status_code, body
 
     # -- turn path ----------------------------------------------------------
 
@@ -628,7 +686,9 @@ def _pick_username_field(form: _HtmlForm) -> str:
 # ============================================================
 
 
-RESUME_HEAD_EXTRA = frozenset({"tool_use", "tool_result", "tool_error", "message", "metadata", "tool_group_summary", "ui_resource"})
+RESUME_HEAD_EXTRA = frozenset(
+    {"tool_use", "tool_result", "tool_error", "message", "metadata", "tool_group_summary", "ui_resource", "source_provenance"}
+)
 
 
 def assert_frame_contract(turn: TurnResult, *, allow_interrupt: bool = False, resume: bool = False) -> List[str]:
@@ -725,10 +785,27 @@ def _restore_check(messages_body: Dict[str, Any], user_prompt: str, assistant_te
 
 PDF_TOKEN = "SMOKE-PDF-TOKEN-7731"
 
+#: The one sentence in the source-provenance fixture PDF. Carries an amount the
+#: value check can match literally, and nothing else a stray number could match.
+PROVENANCE_SENTENCE = "The total approved budget is $487,500 for this award."
+PROVENANCE_AMOUNT = "$487,500"
+#: An amount deliberately absent from the document. The point of the row is that
+#: this one comes back quote_unsupported while carrying a real quote.
+PROVENANCE_FABRICATED = "$912,000"
 
-def minimal_pdf(text: str) -> bytes:
-    """A valid single-page PDF whose only content is ``text`` (Helvetica 24pt)."""
-    stream = f"BT /F1 24 Tf 72 700 Td ({text}) Tj ET".encode("latin-1")
+
+def minimal_pdf(text: str, *, font_size: int = 24) -> bytes:
+    """A valid single-page PDF whose only content is ``text`` (Helvetica).
+
+    ``font_size`` defaults to 24, which is what the token rows have always
+    used. Pass something smaller for anything sentence-length: text wider than
+    the 612pt MediaBox runs off the page, and ``get_text_bounded`` clips to the
+    page box, so the text layer comes back **silently truncated** — a 53-char
+    sentence at 24pt extracts as its first 49 characters. A row asserting on
+    that text then fails for a reason that has nothing to do with what it is
+    testing.
+    """
+    stream = f"BT /F1 {font_size} Tf 72 700 Td ({text}) Tj ET".encode("latin-1")
     objs = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
@@ -904,6 +981,94 @@ async def row_tool_turn(ctx: Context) -> RowResult:
     return RowResult("tool_turn", "PASS", f"tools used: {names}; {len(turn.all('tool_result'))} result(s)", warnings, {"tools": names})
 
 
+EMPTY_FINAL_PROMPTS = (
+    "First write one short sentence with your own estimate of 1234*5678. Then call the {tool} tool to "
+    "check it. When the tool result comes back your turn is already finished: reply with an empty "
+    "message containing no text at all.",
+    "Call the {tool} tool to compute 17*23. Write no text at all, neither before nor after the tool "
+    "call. After the tool result arrives, end your turn immediately without writing anything.",
+)
+
+
+def _calls_from_frames(turn: TurnResult) -> List[Dict[str, Any]]:
+    """One entry per model call: each ``message_stop`` and the first usage-bearing
+    ``metadata`` after it.
+
+    Stops count the calls, not starts: Bedrock sends no ``messageStart`` for an
+    empty response, only ``messageStop`` + ``metadata``. The coordinator's
+    turn-level ``metadata`` before ``done`` repeats the last call's usage, and
+    pairing only the first one after each stop leaves it out.
+    """
+    calls: List[Dict[str, Any]] = []
+    awaiting: Optional[Dict[str, Any]] = None
+    for f in turn.frames:
+        if f.name == "message_stop":
+            awaiting = {"usage": None}
+            calls.append(awaiting)
+        elif f.name == "metadata" and awaiting is not None and f.data.get("usage"):
+            awaiting["usage"] = f.data["usage"]
+            awaiting = None
+    return calls
+
+
+async def row_empty_final_call(ctx: Context) -> RowResult:
+    """A model call that streams no ``message_start`` still gets its own ``C#`` row.
+
+    Before PR #1785 the empty call's usage overwrote the previous call's slot:
+    that call went unbilled and the session showed one row fewer than calls.
+    """
+    tool = ctx.args.tool
+    sid = ""
+    turn: Optional[TurnResult] = None
+    calls: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    for attempt, template in enumerate(EMPTY_FINAL_PROMPTS, start=1):
+        sid = ctx.new_session()
+        turn = await ctx.transport.stream_turn(ctx.base_payload(sid, template.format(tool=tool), enabled_tools=[tool]))
+        ctx.note(turn)
+        warnings = assert_frame_contract(turn)
+        calls = _calls_from_frames(turn)
+        if len(calls) > len(turn.all("message_start")):
+            break
+    else:
+        return RowResult(
+            "empty_final_call",
+            "OBSERVED",
+            f"the model wrote text on all {len(EMPTY_FINAL_PROMPTS)} attempts; no empty call to meter",
+            warnings,
+        )
+
+    body: Optional[Dict[str, Any]] = None
+    code = 0
+    for _ in range(8):
+        code, body = await ctx.transport.get_calls(sid)
+        if body and len(body.get("calls") or []) >= len(calls):
+            break
+        await asyncio.sleep(1.5)
+    if code in (401, 403):
+        raise RowSkip(f"cost rows unreadable (admin endpoint -> {code}); run as system_admin")
+    if not body:
+        raise RowSkip(f"cost anatomy unavailable (HTTP {code})")
+
+    rows = sorted(body.get("calls") or [], key=lambda r: r.get("messageId") or 0)
+    if len(rows) != len(calls):
+        raise RowFailure(
+            f"{len(calls)} model calls streamed (one with no message_start) but {len(rows)} C# rows: "
+            "the unannounced call's usage merged into a neighbour's row"
+        )
+    for idx, (call, row) in enumerate(zip(calls, rows)):
+        usage = call["usage"] or {}
+        streamed = (usage.get("inputTokens"), usage.get("outputTokens"))
+        recorded = (row.get("inputTokens"), row.get("outputTokens"))
+        if call["usage"] and streamed != recorded:
+            raise RowFailure(f"call {idx} streamed in/out {streamed} but its row (messageId {row.get('messageId')}) holds {recorded}")
+    ids = [r.get("messageId") for r in rows]
+    if len(set(ids)) != len(ids):
+        raise RowFailure(f"rows share message ids: {ids}")
+    data = {"attempt": attempt, "calls": len(calls), "messageIds": ids, "outputTokens": [r.get("outputTokens") for r in rows]}
+    return RowResult("empty_final_call", "PASS", f"{len(calls)} calls -> {len(rows)} rows, each with its own usage (ids {ids})", warnings, data)
+
+
 ASK_PROMPT = (
     "Do not answer this message directly. Your first and only action is to call the ask_user_question "
     "tool once, with a single question: header 'Color', question 'Which color do you prefer?', options "
@@ -970,6 +1135,82 @@ async def row_ask_user_question(ctx: Context) -> RowResult:
         f"paused with {len(questions)} question(s), resumed with {pick!r}, answer: {resume.final_text[:40]!r}",
         warnings,
         {"options": options},
+    )
+
+
+CLIENT_TOOL_PROMPT = (
+    "Use the local_echo_marker tool exactly once, with marker set to 'smoke-7731', "
+    "and then tell me verbatim what it returned."
+)
+
+
+async def row_client_tool_call(ctx: Context) -> RowResult:
+    """The terminal client's protocol: declare a tool, the model calls it, the
+    turn pauses on `client_tool_call`, the client resumes with the output.
+
+    The declared tool here is a stub nobody runs — this script *is* the client,
+    so it answers the interrupt itself. What this proves is the server half:
+    the spec reaches toolConfig, the pause lands after the final message_stop,
+    and the resume rebuilds the tool from the snapshot and returns our output
+    as the tool result (the answer should echo it).
+    """
+    spec = {
+        "name": "echo_marker",
+        "description": "Runs on the user's machine and returns the marker string it was given, prefixed with OK.",
+        "inputSchema": {"type": "object", "properties": {"marker": {"type": "string"}}, "required": ["marker"]},
+    }
+    warnings: List[str] = []
+    turn: Optional[TurnResult] = None
+    call: Optional[Frame] = None
+    sid = ""
+    for attempt in range(1, 4):
+        sid = ctx.new_session()
+        turn = await ctx.transport.stream_turn(ctx.base_payload(sid, CLIENT_TOOL_PROMPT, client_tools=[spec]))
+        ctx.note(turn)
+        warnings += assert_frame_contract(turn, allow_interrupt=True)
+        call = turn.first("client_tool_call")
+        if call is not None:
+            if attempt > 1:
+                warnings.append(f"model only called the client tool on attempt {attempt}")
+            break
+    assert turn is not None
+    if call is None:
+        raise RowFailure(f"no client_tool_call frame in 3 attempts; frames={sorted(set(turn.names))}; answer: {turn.final_text[:60]!r}")
+    names = turn.names
+    if names.index("client_tool_call") < len(names) - 1 - names[::-1].index("message_stop"):
+        raise RowFailure("client_tool_call arrived before the final message_stop")
+    if call.data.get("toolName") != "echo_marker":
+        raise RowFailure(f"client_tool_call names {call.data.get('toolName')!r}, expected the bare declared name 'echo_marker'")
+    marker = (call.data.get("arguments") or {}).get("marker", "")
+    interrupt_id = call.data.get("interruptId")
+    if not interrupt_id:
+        raise RowFailure(f"client_tool_call lacks interruptId: {call.data}")
+
+    resume = await ctx.transport.stream_turn(
+        {
+            "session_id": sid,
+            "message": "",
+            "enabled_tools": [],
+            "client_tools": [spec],
+            **({"model_id": ctx.args.model_id} if ctx.args.model_id else {}),
+            "interrupt_responses": [{"interruptId": interrupt_id, "response": {"output": f"OK {marker}", "isError": False}}],
+        }
+    )
+    ctx.note(resume)
+    warnings += assert_frame_contract(resume, resume=True)
+    if resume.all("client_tool_call"):
+        raise RowFailure("the resumed turn re-raised client_tool_call (the tool was not rebuilt from the snapshot, or the answer was rejected)")
+    if "7731" not in resume.final_text:
+        warnings.append(f"resumed answer did not echo the marker: {resume.final_text[:60]!r}")
+    code, body = await ctx.transport.get_messages(sid)
+    if code == 200 and body is not None and body.get("pendingInterrupts"):
+        raise RowFailure("pendingInterrupts still non-empty after a successful resume")
+    return RowResult(
+        "client_tool_call_resume",
+        "PASS",
+        f"paused on echo_marker(marker={marker!r}), resumed; answer: {resume.final_text[:40]!r}",
+        warnings,
+        {},
     )
 
 
@@ -1137,6 +1378,122 @@ async def row_attach_pdf(ctx: Context) -> RowResult:
     return RowResult("attach_pdf", "PASS", f"inline PDF accepted, answer streamed, attachment restored; tools={_tools_used(turn)}", warnings)
 
 
+
+async def _register_upload(
+    user_id: str, session_id: str, filename: str, mime_type: str, data: bytes
+) -> str:
+    """Register *data* as a READY session file and return its upload_id.
+
+    A row that needs ``document_read`` / ``verify_sources`` must send a real
+    upload, not base64 ``files``: see ``apis/shared/evals/fixtures.py``, which
+    the eval harness shares. An environment with nowhere to store it skips the
+    row rather than failing it.
+    """
+    from apis.shared.evals.fixtures import FixtureError, register_upload
+
+    try:
+        return await register_upload(user_id, session_id, filename, mime_type, data)
+    except FixtureError as exc:
+        raise RowSkip(str(exc)) from exc
+
+
+async def row_source_provenance(ctx: Context) -> RowResult:
+    """`verify_sources` answers both questions and emits `source_provenance`.
+
+    The row the feature exists for is `quote_unsupported`: a real sentence from
+    the document carrying a value that is not in it. A badge keyed on "did we
+    find the quote" would certify that, so the row asserts the two states
+    differ while both quotes are the same located sentence.
+
+    The prompt is explicit because nothing in the system prompt asks the model
+    to verify before asserting (docs/specs/source-provenance-verification.md D6
+    names that consequence). So this proves the machinery, not the coverage: a
+    turn where the model volunteers the call is not what is being measured here.
+    """
+    if not ctx.args.with_attachments:
+        raise RowSkip("pass --with-attachments")
+    sid = ctx.new_session()
+    prompt = (
+        "The attached smoke.pdf contains exactly one sentence. Do precisely this and nothing else:\n"
+        "1. Call document_read with no arguments to get smoke.pdf's upload_id.\n"
+        "2. Call verify_sources ONCE with that upload_id and exactly two claims:\n"
+        f"   - id \"real\", value \"{PROVENANCE_AMOUNT}\", quote set to that sentence copied verbatim.\n"
+        f"   - id \"bogus\", value \"{PROVENANCE_FABRICATED}\", quote set to the SAME sentence verbatim.\n"
+        "3. Reply with just: real=<state> bogus=<state>"
+    )
+    # A real upload, not base64: see _register_upload for why the document
+    # tools do not exist on an inline-base64 turn.
+    upload_id = await _register_upload(
+        ctx.args.user_id or "", sid, "smoke.pdf", "application/pdf", minimal_pdf(PROVENANCE_SENTENCE, font_size=11)
+    )
+    turn = await ctx.transport.stream_turn(
+        ctx.base_payload(sid, prompt, file_upload_ids=[upload_id], enabled_tools=None)
+    )
+    ctx.note(turn)
+    warnings = assert_frame_contract(turn)
+
+    frames = turn.all("source_provenance")
+    if not frames:
+        raise RowFailure(
+            "no source_provenance frame. Is SOURCE_PROVENANCE_ENABLED=true on the AgentCore "
+            f"Runtime, and did the model call verify_sources? tools={_tools_used(turn)}; "
+            f"answer: {turn.final_text[:80]!r}"
+        )
+
+    claims = {c.get("id"): c for f in frames for c in (f.data.get("claims") or [])}
+    missing = {"real", "bogus"} - set(claims)
+    if missing:
+        raise RowFailure(f"frame carried claims {sorted(claims)}, missing {sorted(missing)}")
+
+    real, bogus = claims["real"], claims["bogus"]
+    if real.get("state") != "supported":
+        raise RowFailure(f"the document's own amount read {real.get('state')!r} ({real.get('method')!r}), not supported")
+    if bogus.get("state") != "quote_unsupported":
+        raise RowFailure(
+            f"a fabricated amount on a real quote read {bogus.get('state')!r} "
+            f"({bogus.get('method')!r}), not quote_unsupported — this is the state the feature exists for"
+        )
+    # Both quotes are the same located sentence, so both must carry a locator.
+    # If only the supported one did, the badge and the warning would disagree
+    # about whether the passage was found.
+    for name, claim in (("real", real), ("bogus", bogus)):
+        locator = claim.get("locator") or {}
+        if locator.get("kind") != "page" or locator.get("value") != 1:
+            raise RowFailure(f"{name} locator was {locator!r}, expected page 1")
+        if locator.get("precision") != "measured":
+            raise RowFailure(
+                f"{name} locator precision was {locator.get('precision')!r}; pypdfium2 measures "
+                "every page boundary, so a hedge here means the precision is being inferred"
+            )
+
+    # The frame never re-streams, so a reload reads the SRCV# rows instead.
+    code, body = await ctx.transport.get_messages(sid)
+    if code != 200 or body is None:
+        raise RowFailure(f"GET /messages -> {code}")
+    replayed = {
+        c.get("id"): c
+        for row in (body.get("sourceProvenance") or [])
+        for c in (row.get("claims") or [])
+    }
+    if not replayed:
+        raise RowFailure("GET /messages returned no sourceProvenance — the verdicts would vanish on reload")
+    for name, expected in (("real", "supported"), ("bogus", "quote_unsupported")):
+        if (replayed.get(name) or {}).get("state") != expected:
+            raise RowFailure(f"replayed {name} was {(replayed.get(name) or {}).get('state')!r}, expected {expected}")
+
+    answer = turn.final_text.lower()
+    if "supported" not in answer:
+        warnings.append(f"model did not read the states back: {turn.final_text[:60]!r}")
+    return RowResult(
+        "source_provenance",
+        "PASS",
+        f"real={real.get('method')} bogus={bogus.get('method')}, both located p.1 measured, "
+        f"replayed on reload; tools={_tools_used(turn)}",
+        warnings,
+        {"real": real, "bogus": bogus},
+    )
+
+
 async def row_attach_csv(ctx: Context) -> RowResult:
     if not ctx.args.with_attachments:
         raise RowSkip("pass --with-attachments")
@@ -1167,6 +1524,68 @@ async def row_attach_csv(ctx: Context) -> RowResult:
     if not seen:
         raise RowFailure("spreadsheet tools ran but no tool_result mentions smoke.csv — the diverted file is not visible to them")
     return RowResult("attach_csv", "PASS", f"CSV diverted, visible to the tools, marker persisted; tools={tools}", warnings)
+
+
+def _generated_fixture(name: str) -> bytes:
+    """A generated eval fixture (``scripts/eval_fixtures``), so smoke and eval send the same file."""
+    from eval_fixtures.build import build
+
+    return build(name)
+
+
+async def row_attach_image(ctx: Context) -> RowResult:
+    if not ctx.args.with_attachments:
+        raise RowSkip("pass --with-attachments")
+    from eval_fixtures.build import SYNC_ERROR_CODE
+
+    sid = ctx.new_session()
+    prompt = "What error code is shown in the attached screenshot? Reply with just the code."
+    files = [{"filename": "smoke.png", "content_type": "image/png",
+              "bytes": base64.b64encode(_generated_fixture("sync_error.png")).decode()}]
+    turn = await ctx.transport.stream_turn(ctx.base_payload(sid, prompt, files=files, enabled_tools=[]))
+    ctx.note(turn)
+    warnings = assert_frame_contract(turn)
+    if SYNC_ERROR_CODE.lower() not in turn.final_text.lower():
+        warnings.append(f"model did not read the code off the image: {turn.final_text[:60]!r}")
+    code, body = await ctx.transport.get_messages(sid)
+    if code != 200 or body is None:
+        raise RowFailure(f"GET /messages -> {code}")
+    has_image = any(
+        c.get("type") == "image" or c.get("image") for m in (body.get("messages") or []) if m.get("role") == "user"
+        for c in (m.get("content") or [])
+    ) or any("smoke.png" in u for u in _message_texts(body, "user"))
+    if not has_image:
+        raise RowFailure("restored user message carries neither an image block nor the attachment marker")
+    return RowResult("attach_image", "PASS", f"image block accepted, answer streamed, attachment restored; tools={_tools_used(turn)}", warnings)
+
+
+async def row_attach_pptx(ctx: Context) -> RowResult:
+    if not ctx.args.with_attachments:
+        raise RowSkip("pass --with-attachments")
+    from eval_fixtures.build import PILOT_SITES
+
+    sid = ctx.new_session()
+    prompt = "According to the attached deck smoke.pptx, how many pilot sites are there this quarter? Reply with just the number."
+    files = [{"filename": "smoke.pptx",
+              "content_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+              "bytes": base64.b64encode(_generated_fixture("quarterly_review.pptx")).decode()}]
+    turn = await ctx.transport.stream_turn(
+        ctx.base_payload(sid, prompt, files=files, enabled_tools=["create_powerpoint_presentation"])
+    )
+    ctx.note(turn)
+    warnings = assert_frame_contract(turn)
+    if PILOT_SITES not in turn.final_text:
+        warnings.append(f"answer did not say {PILOT_SITES}: {turn.final_text[:60]!r}")
+    # A deck is never a document block (Bedrock has no pptx format): the only
+    # way to its text is the PowerPoint tools, so a turn that did not call
+    # one never read the file, whatever it answered.
+    tools = _tools_used(turn)
+    if "read_powerpoint_presentation" not in tools:
+        raise RowFailure(f"model did not read the diverted deck with read_powerpoint_presentation; tools={tools}")
+    seen = any("smoke.pptx" in json.dumps(f.data) for f in turn.all("tool_result"))
+    if not seen:
+        raise RowFailure("the PowerPoint tools ran but no tool_result mentions smoke.pptx; the diverted deck is not visible to them")
+    return RowResult("attach_pptx", "PASS", f"deck diverted and read through the PowerPoint tools; tools={tools}", warnings)
 
 
 async def row_skill_invoke(ctx: Context) -> RowResult:
@@ -1225,13 +1644,18 @@ ROWS: List[Tuple[str, Callable[[Context], Awaitable[Any]]]] = [
     ("second_turn_cache", row_second_turn_cache),
     ("restore_after_reload", row_restore),
     ("tool_turn", row_tool_turn),
+    ("empty_final_call", row_empty_final_call),
     ("ask_user_question_resume", row_ask_user_question),
     ("tool_approval_resume", row_tool_approval),
+    ("client_tool_call_resume", row_client_tool_call),
     ("duplicate_send_409+stop_mid_answer", row_duplicate_and_stop),
     ("preview_session", row_preview_session),
     ("steer_mid_turn", row_steer_observed),
     ("attach_pdf", row_attach_pdf),
+    ("source_provenance", row_source_provenance),
     ("attach_csv", row_attach_csv),
+    ("attach_image", row_attach_image),
+    ("attach_pptx", row_attach_pptx),
     ("skill_invoke", row_skill_invoke),
     ("kb_agent_first_turn", row_kb_agent),
     ("quota_exceeded", row_quota_exceeded),
@@ -1287,9 +1711,40 @@ def resolve_runtime_env(prefix: str, region: str) -> None:
         "DYNAMODB_ASSISTANTS_TABLE_NAME": param("rag/assistants-table-name", f"{prefix}-assistants"),
         "DYNAMODB_USER_SETTINGS_TABLE_NAME": param("settings/user-settings-table-name", f"{prefix}-user-settings"),
         "AGENTCORE_MEMORY_ID": param("inference-api/memory-id", ""),
+        # Session files, for rows that need a real upload rather than inline
+        # base64 (`_register_upload`). Both are `{prefix}-user-file-uploads`,
+        # the bucket suffixed with the account — taken from app-api's live task
+        # definition, not from a bucket-name search: this account also holds an
+        # unrelated `*-user-files-*` bucket from another stack.
+        "DYNAMODB_USER_FILES_TABLE_NAME": f"{prefix}-user-file-uploads",
+        "S3_USER_FILES_BUCKET_NAME": f"{prefix}-user-file-uploads-{account}",
+        # Runtime-direct mode reads `GET /messages` in-process, standing in for
+        # app-api, so the in-process reader needs app-api's flags too. Only the
+        # *read* is affected: the `source_provenance` frame comes from the
+        # deployed Runtime, so a deployment with the feature genuinely off fails
+        # the frame assertion first and this cannot mask it. `setdefault`, so an
+        # operator who exports it wins.
+        "SOURCE_PROVENANCE_ENABLED": "true",
     }
     for k, v in env.items():
         os.environ.setdefault(k, v)
+
+
+def eval_user_credentials(prefix: Optional[str], region: str) -> Tuple[str, str]:
+    """The eval user's username and password from the SSM parameter ``seed_eval_user.py`` writes.
+
+    The same account the eval harness signs in as, so the nightly dev track
+    needs no second test user with a permanent password. Never logged.
+    """
+    if not prefix:
+        raise SystemExit("--auth eval-user needs --prefix (the deployment whose eval user to sign in as)")
+    import boto3
+    from seed_eval_user import credentials_parameter, read_credentials
+
+    creds = read_credentials(boto3.client("ssm", region_name=region), prefix)
+    if not creds:
+        raise SystemExit(f"no eval user credentials at {credentials_parameter(prefix)}; run scripts/seed_eval_user.py first")
+    return str(creds["username"]), str(creds["password"])
 
 
 async def build_transport(args: argparse.Namespace) -> Transport:
@@ -1300,12 +1755,16 @@ async def build_transport(args: argparse.Namespace) -> Transport:
         return RuntimeTransport(args.user_id, args.prefix, args.region, args.invocations_url)
     if not args.base_url:
         raise SystemExit("--base-url is required unless --auth headless-grant")
-    t = AppApiTransport(args.base_url, label=args.base_url)
-    if args.auth == "cognito":
-        user = os.environ.get("SMOKE_USERNAME")
-        pw = os.environ.get("SMOKE_PASSWORD")
+    user, pw = "", ""
+    if args.auth == "eval-user":
+        user, pw = eval_user_credentials(args.prefix, args.region)
+    elif args.auth == "cognito":
+        user = os.environ.get("SMOKE_USERNAME") or ""
+        pw = os.environ.get("SMOKE_PASSWORD") or ""
         if not user or not pw:
             raise SystemExit("--auth cognito reads SMOKE_USERNAME / SMOKE_PASSWORD from the environment")
+    t = AppApiTransport(args.base_url, label=args.base_url)
+    if args.auth in ("cognito", "eval-user"):
         await t.login_cognito(user, pw, args.cognito_domain or "")
     else:
         await t.ensure_anonymous_ok()
@@ -1332,10 +1791,118 @@ def _print_report(results: List[RowResult], ctx: Context, label: str) -> None:
     print()
 
 
+# ============================================================
+# Publishing to the release ledger (docs/specs/release-ledger.md §5.2)
+# ============================================================
+
+
+def _git_commit() -> Optional[str]:
+    if os.environ.get("GITHUB_SHA"):
+        return os.environ["GITHUB_SHA"]
+    import subprocess
+
+    try:
+        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=os.path.dirname(os.path.abspath(__file__)),
+                             capture_output=True, text=True, timeout=10, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() or None
+
+
+def _health_version(base_url: Optional[str]) -> Optional[str]:
+    """app-api's ``/health`` version: only the label of the image-tag fallback, never the build."""
+    if not base_url:
+        return None
+    try:
+        body = httpx.get(f"{base_url.rstrip('/')}/health", timeout=10).json()
+    except Exception:  # noqa: BLE001 — metadata only
+        return None
+    return str(body["version"]) if isinstance(body, dict) and body.get("version") else None
+
+
+@dataclass
+class PublishPlan:
+    """What ``--publish`` read before the first turn, so a deploy during the run cannot move it."""
+
+    started_at: str
+    image_tag: Optional[str] = None
+    app_version: Optional[str] = None
+
+
+async def _session_calls(prefix: str, region: str, session_ids: List[str]) -> Dict[str, Any]:
+    from apis.shared.config.runtime_environment import derived_environment_manifest
+    from apis.shared.evals.calls import fetch_session_calls
+    from apis.shared.storage.dynamodb_storage import DynamoDBStorage
+
+    name = "DYNAMODB_SESSIONS_METADATA_TABLE_NAME"
+    entry = next(v for v in derived_environment_manifest() if v.name == name)
+    os.environ.setdefault(name, entry.derive(prefix, None) or "")
+    os.environ.setdefault("AWS_DEFAULT_REGION", region)
+    try:
+        return await fetch_session_calls(session_ids, DynamoDBStorage())
+    except Exception as exc:  # noqa: BLE001 — falls back to the image tag
+        logger.info("cost rows unavailable: %s", exc)
+        return {}
+
+
+async def publish_smoke(
+    args: argparse.Namespace, plan: PublishPlan, ctx: Context, results: List[RowResult], label: str, user_id: str
+) -> bool:
+    """Write the run as one ``LEDGER#SMOKE`` row. Best-effort: prints and returns ``False`` on any failure."""
+    from apis.shared.costs import ledger_publish as lp
+
+    # Rows are stored a moment after each stream closes; the last turn's may still be in flight.
+    await asyncio.sleep(3.0)
+    found = await _session_calls(args.prefix, args.region, list(ctx.created_sessions))
+    calls = [c for sid in ctx.created_sessions for c in found.get(sid, ())]
+    served = lp.served_build(calls, image_tag=plan.image_tag, app_version=plan.app_version)
+    if served is None:
+        print("ledger: not published (no C# row carries a build and the Runtime's image tag was unreadable)",
+              file=sys.stderr)
+        return False
+    if served.source == lp.BUILD_FROM_COST_ROWS and plan.image_tag and plan.image_tag != served.build:
+        print(f"ledger: the Runtime's image tag at run start was {plan.image_tag}; the turns ran on {served.build}",
+              file=sys.stderr)
+    try:
+        row = lp.smoke_ledger_row(
+            started_at=plan.started_at,
+            finished_at=lp.now_iso(),
+            target="_".join(label.split()),
+            results=[{"row": r.row, "status": r.status, "data": r.data} for r in results],
+            served=served,
+            first_token_ms=ctx.first_token_ms,
+            model_id=args.model_id,
+            git_commit=_git_commit(),
+            shared_session_calls=found.get(ctx.shared_session, ()) if ctx.shared_session else (),
+            call_rows=calls,
+        )
+        lp.assert_content_free(row, lp.SMOKE_ROW_FIELDS, forbidden=[*ctx.created_sessions, user_id])
+    except lp.PublishError as exc:
+        print(f"ledger: not published ({exc})", file=sys.stderr)
+        return False
+    if not lp.put_ledger_row(row, prefix=args.prefix, region=args.region):
+        print("ledger: publish failed; see the log line above. The run's result stands.", file=sys.stderr)
+        return False
+    print(f"ledger: published {lp.describe(row)}")
+    return True
+
+
 async def main_async(args: argparse.Namespace) -> int:
     if _looks_like_prod(args.base_url, args.prefix) and not args.allow_prod:
         print("refusing: target looks like production (pass --allow-prod if you really mean it)", file=sys.stderr)
         return 2
+    if args.publish and not args.prefix:
+        print("setup: --publish needs --prefix (the deployment whose ledger to write)", file=sys.stderr)
+        return 2
+    plan: Optional[PublishPlan] = None
+    if args.publish:
+        from apis.shared.costs import ledger_publish as lp
+
+        plan = PublishPlan(
+            started_at=lp.now_iso(),
+            image_tag=lp.read_runtime_image_tag(args.prefix, args.region),
+            app_version=_health_version(args.base_url),
+        )
     try:
         transport = await build_transport(args)
     except (SystemExit, RuntimeError) as exc:
@@ -1384,6 +1951,10 @@ async def main_async(args: argparse.Namespace) -> int:
         await transport.close()
 
     _print_report(results, ctx, transport.label)
+    published = False
+    if plan is not None:
+        user_id = str(getattr(transport, "user", {}).get("user_id") or args.user_id or "")
+        published = await publish_smoke(args, plan, ctx, results, transport.label, user_id)
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
             json.dump(
@@ -1393,6 +1964,8 @@ async def main_async(args: argparse.Namespace) -> int:
                     "observed": ctx.observed,
                     "firstTokenMs": ctx.first_token_ms,
                     "sessions": ctx.created_sessions,
+                    "startedAt": plan.started_at if plan else None,
+                    "published": published,
                 },
                 fh,
                 indent=2,
@@ -1404,10 +1977,12 @@ async def main_async(args: argparse.Namespace) -> int:
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--base-url", help="app-api origin, e.g. http://127.0.0.1:8000 or https://host/api")
-    p.add_argument("--auth", choices=["none", "cognito", "headless-grant"], default="none")
+    p.add_argument("--auth", choices=["none", "cognito", "eval-user", "headless-grant"], default="none",
+                   help="eval-user: sign in as the seeded eval user, credentials from SSM (needs --prefix)")
     p.add_argument("--cognito-domain", help="Hosted UI origin (for --auth cognito; informational)")
     p.add_argument("--user-id", help="Cognito sub owning the headless grant (for --auth headless-grant)")
-    p.add_argument("--prefix", help="CDK project prefix, e.g. dev-boisestateai-v2 (for --auth headless-grant)")
+    p.add_argument("--prefix", help="CDK project prefix, e.g. dev-boisestateai-v2 "
+                                    "(for --auth headless-grant / eval-user, and --publish)")
     p.add_argument("--region", default=os.environ.get("AWS_REGION", "us-west-2"))
     p.add_argument(
         "--invocations-url",
@@ -1430,6 +2005,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--delete-sessions", help="comma-separated session ids to delete, then exit (no turns)")
     p.add_argument("--json", help="write the report to this path")
     p.add_argument("--allow-prod", action="store_true")
+    p.add_argument("--publish", action="store_true",
+                   help="write the result as a LEDGER#SMOKE row into --prefix's system-cost-rollup table "
+                        "(release-ledger spec §5.2); best-effort, never changes the exit status")
     return p.parse_args(argv)
 
 

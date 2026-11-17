@@ -13,6 +13,10 @@ from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 from apis.shared.timestamps import from_iso, to_iso
+from apis.shared.tools.gateway_connectors import (
+    MAX_DOMAIN_FILTER_ENTRIES,
+    get_connector_spec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +89,7 @@ class GatewayListingMode(str, Enum):
 
     Maps to the `bedrock-agentcore-control` `listingMode` enum (uppercased at
     the AWS boundary by GatewayTargetService). DYNAMIC resolves tools at call
-    time but disables 3LO/OAuth and Gateway semantic search; DEFAULT lists
+    time but disables OAuth and Gateway semantic search; DEFAULT lists
     tools statically and is required for both.
     """
 
@@ -115,15 +119,25 @@ class GatewayOAuthGrantType(str, Enum):
     """OAuth grant the Gateway uses when calling an OAUTH-credentialed target.
 
     Maps to the `bedrock-agentcore-control` `oauthCredentialProvider.grantType`
-    enum. AUTHORIZATION_CODE is the on-behalf-of-user (3LO) flow that reuses our
-    existing AgentCore Identity consent path (USER_FEDERATION); CLIENT_CREDENTIALS
-    is machine-to-machine (2LO, no user consent). Only meaningful when
-    credential_type is OAUTH.
+    enum. Only CLIENT_CREDENTIALS (machine-to-machine, no user involved) can be
+    saved — see `SUPPORTED_GATEWAY_OAUTH_GRANT_TYPES` and issue #454.
+
+    AUTHORIZATION_CODE (3LO) and TOKEN_EXCHANGE stay in the enum only so rows
+    saved before #454 still load. 3LO had no consent handling for Gateway tools;
+    TOKEN_EXCHANGE needs a Gateway with JWT inbound auth, and ours uses AWS_IAM.
+    Per-user OAuth tools are registered as MCP External Servers instead. Only
+    meaningful when credential_type is OAUTH.
     """
 
     AUTHORIZATION_CODE = "authorization_code"
     CLIENT_CREDENTIALS = "client_credentials"
     TOKEN_EXCHANGE = "token_exchange"
+
+
+# Grants an admin may save on an OAUTH Gateway target (#454).
+SUPPORTED_GATEWAY_OAUTH_GRANT_TYPES = frozenset(
+    {GatewayOAuthGrantType.CLIENT_CREDENTIALS.value}
+)
 
 
 class ToolStatus(str, Enum):
@@ -373,6 +387,19 @@ class MCPServerConfig(BaseModel):
         default=300, description="Interval between health checks"
     )
 
+    # MCP form elicitation (docs/specs/mcp-elicitation.md)
+    elicitation_enabled: bool = Field(
+        default=False,
+        description=(
+            "If true, and MCP_ELICITATION_ENABLED is on, this server is told the "
+            "client supports form elicitation (2026-07-28 connections only), so "
+            "it may ask the user for input partway through a tool call. A server "
+            "may then list tools it otherwise hides, such as GitHub's "
+            "delete_repository; with a non-empty `tools` list those still reach "
+            "the model only once an admin adds them."
+        ),
+    )
+
     model_config = {"use_enum_values": True}
 
     @field_validator("custom_headers", mode="before")
@@ -397,6 +424,8 @@ class MCPServerConfig(BaseModel):
             "tools": [entry.to_dict() for entry in self.tools],
             "healthCheckEnabled": self.health_check_enabled,
             "healthCheckIntervalSeconds": self.health_check_interval_seconds,
+            # Written only while on, so every existing row reads back unchanged.
+            **({"elicitationEnabled": True} if self.elicitation_enabled else {}),
         }
 
     @classmethod
@@ -415,11 +444,43 @@ class MCPServerConfig(BaseModel):
             tools=_parse_mcp_tools(data.get("tools", [])),
             health_check_enabled=data.get("healthCheckEnabled", False),
             health_check_interval_seconds=data.get("healthCheckIntervalSeconds", 300),
+            elicitation_enabled=bool(data.get("elicitationEnabled", False)),
         )
 
     def approval_required_names(self) -> set[str]:
         """Return the names of tools flagged as requiring user approval."""
         return {entry.name for entry in self.tools if entry.needs_approval}
+
+
+_DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+
+
+def _normalize_domains(domains: List[str], field_name: str) -> List[str]:
+    """Lowercase, trim and de-duplicate a domain filter list, order-preserving.
+
+    Rejects anything that is not a bare host name. The connector matches a
+    root domain against its subdomains, so `https://example.com/docs` is not
+    a narrower filter, it is a typo that would otherwise match nothing — and a
+    silently empty allow list returns no results for every search.
+    """
+    seen: Set[str] = set()
+    cleaned: List[str] = []
+    for raw in domains:
+        domain = (raw or "").strip().lower().rstrip(".")
+        if not domain or domain in seen:
+            continue
+        if not _DOMAIN_RE.match(domain):
+            raise ValueError(
+                f"{field_name}: '{raw}' is not a bare domain (e.g. 'example.com' "
+                "— no scheme, path or port)"
+            )
+        seen.add(domain)
+        cleaned.append(domain)
+    if len(cleaned) > MAX_DOMAIN_FILTER_ENTRIES:
+        raise ValueError(
+            f"{field_name} holds at most {MAX_DOMAIN_FILTER_ENTRIES} domains"
+        )
+    return cleaned
 
 
 class MCPGatewayConfig(BaseModel):
@@ -435,6 +496,11 @@ class MCPGatewayConfig(BaseModel):
     `target_id` and `gateway_arn` are AWS-assigned identifiers stamped onto the
     config by the admin route after the Gateway target is created; they are the
     catalog↔AWS link that lets update/delete reconcile the live target.
+
+    Setting `connector_id` registers a built-in AgentCore connector (e.g. Web
+    Search) instead of an external server: no endpoint, the Gateway's own role
+    as the credential, and a tool list fixed by the connector. See
+    `apis.shared.tools.gateway_connectors`.
     """
 
     # Gateway target identity
@@ -442,7 +508,31 @@ class MCPGatewayConfig(BaseModel):
         ..., description="Gateway target name (unique within the gateway)"
     )
     endpoint_url: str = Field(
-        ..., description="External MCP server endpoint the Gateway calls"
+        "",
+        description="External MCP server endpoint the Gateway calls "
+        "(empty for a connector target)",
+    )
+
+    # Built-in connector target (mutually exclusive with endpoint_url)
+    connector_id: Optional[str] = Field(
+        None,
+        description="Built-in AgentCore connector to register instead of an "
+        "external endpoint (e.g. 'web-search')",
+    )
+    connector_version: Optional[str] = Field(
+        None,
+        description="Pinned connector version; defaults to the platform's "
+        "pinned version for the connector",
+    )
+    domain_include: List[str] = Field(
+        default_factory=list,
+        description="Target-level domain allow list (web-search). When set, "
+        "every search is restricted to these domains; hidden from the agent.",
+    )
+    domain_exclude: List[str] = Field(
+        default_factory=list,
+        description="Target-level domain block list (web-search). Results from "
+        "these domains are dropped on every search; hidden from the agent.",
     )
     listing_mode: GatewayListingMode = Field(
         default=GatewayListingMode.DEFAULT,
@@ -484,9 +574,10 @@ class MCPGatewayConfig(BaseModel):
         description="OAuth scopes requested for OAUTH credential type",
     )
     grant_type: GatewayOAuthGrantType = Field(
-        default=GatewayOAuthGrantType.AUTHORIZATION_CODE,
-        description="OAuth grant for OAUTH credential type (3LO vs 2LO); "
-        "ignored for other credential types",
+        default=GatewayOAuthGrantType.CLIENT_CREDENTIALS,
+        description="OAuth grant for OAUTH credential type. Only "
+        "client_credentials can be saved; the others load from older rows. "
+        "Ignored for other credential types",
     )
     custom_parameters: Optional[Dict[str, str]] = Field(
         None,
@@ -513,6 +604,11 @@ class MCPGatewayConfig(BaseModel):
 
     model_config = {"use_enum_values": True}
 
+    @property
+    def is_connector(self) -> bool:
+        """True for a built-in AgentCore connector target."""
+        return bool(self.connector_id)
+
     @model_validator(mode="after")
     def _validate_credentials(self) -> "MCPGatewayConfig":
         """Enforce the credential/listing-mode co-gating rules.
@@ -521,6 +617,14 @@ class MCPGatewayConfig(BaseModel):
         the listing-mode co-gating gotcha in issue #419. GATEWAY_IAM_ROLE uses
         the gateway's execution role and takes no provider ARN.
         """
+        if self.connector_id:
+            return self._normalize_connector()
+        if not self.endpoint_url:
+            raise ValueError("endpoint_url is required unless connector_id is set")
+        if self.domain_include or self.domain_exclude:
+            raise ValueError(
+                "domain_include / domain_exclude apply only to a connector target"
+            )
         if self.credential_type == GatewayCredentialType.OAUTH:
             if not self.credential_provider_arn:
                 raise ValueError(
@@ -551,9 +655,52 @@ class MCPGatewayConfig(BaseModel):
                 )
         return self
 
+    def _normalize_connector(self) -> "MCPGatewayConfig":
+        """Validate a connector target and fill in what the connector fixes.
+
+        A connector has exactly one shape, so the fields an external target
+        asks the admin for are either rejected (a value there would be
+        silently ignored by AWS, which is worse) or set here: the credential is
+        always the gateway role, listing is DEFAULT (semantic search needs it),
+        the version is pinned, and the tool list is the connector's own tool —
+        keeping any per-tool flags the admin set on it, because that list is
+        what expands a bare catalog id into `gateway_<target>___<tool>`.
+        """
+        spec = get_connector_spec(self.connector_id)
+        if self.endpoint_url:
+            raise ValueError("A connector target takes no endpoint_url")
+        if self.credential_provider_arn or self.lambda_function_name or self.aws_service:
+            raise ValueError(
+                "A connector target signs with the gateway execution role; "
+                "credential_provider_arn, aws_service and lambda_function_name "
+                "must be unset"
+            )
+        if not spec.supports_domain_filter and (self.domain_include or self.domain_exclude):
+            raise ValueError(
+                f"Connector '{spec.connector_id}' does not support domain filters"
+            )
+        self.domain_include = _normalize_domains(self.domain_include, "domain_include")
+        self.domain_exclude = _normalize_domains(self.domain_exclude, "domain_exclude")
+
+        self.credential_type = GatewayCredentialType.GATEWAY_IAM_ROLE.value
+        self.listing_mode = GatewayListingMode.DEFAULT.value
+        self.connector_version = self.connector_version or spec.version
+
+        unknown = [e.name for e in self.tools if e.name != spec.tool_name]
+        if unknown:
+            raise ValueError(
+                f"Connector '{spec.connector_id}' exposes only '{spec.tool_name}'; "
+                f"unknown tools: {', '.join(unknown)}"
+            )
+        if not self.tools:
+            self.tools = [
+                MCPToolEntry(name=spec.tool_name, description=spec.tool_description)
+            ]
+        return self
+
     def to_dict(self) -> dict:
         """Convert to dictionary for DynamoDB storage."""
-        return {
+        item = {
             "targetName": self.target_name,
             "endpointUrl": self.endpoint_url,
             "listingMode": self.listing_mode
@@ -575,6 +722,14 @@ class MCPGatewayConfig(BaseModel):
             "targetId": self.target_id,
             "gatewayArn": self.gateway_arn,
         }
+        # Only on connector rows, so every external-server row stays
+        # byte-identical to what it was before connectors existed.
+        if self.connector_id:
+            item["connectorId"] = self.connector_id
+            item["connectorVersion"] = self.connector_version
+            item["domainInclude"] = list(self.domain_include)
+            item["domainExclude"] = list(self.domain_exclude)
+        return item
 
     @classmethod
     def from_dict(cls, data: dict) -> "MCPGatewayConfig":
@@ -582,6 +737,10 @@ class MCPGatewayConfig(BaseModel):
         return cls(
             target_name=data.get("targetName", ""),
             endpoint_url=data.get("endpointUrl", ""),
+            connector_id=data.get("connectorId"),
+            connector_version=data.get("connectorVersion"),
+            domain_include=data.get("domainInclude") or [],
+            domain_exclude=data.get("domainExclude") or [],
             listing_mode=data.get("listingMode", GatewayListingMode.DEFAULT),
             credential_type=data.get(
                 "credentialType", GatewayCredentialType.NONE
@@ -591,6 +750,8 @@ class MCPGatewayConfig(BaseModel):
             aws_region=data.get("awsRegion"),
             lambda_function_name=data.get("lambdaFunctionName"),
             oauth_scopes=data.get("oauthScopes") or [],
+            # A row with no grantType was registered when authorization_code was
+            # the default, so read it as that rather than the current default.
             grant_type=data.get(
                 "grantType", GatewayOAuthGrantType.AUTHORIZATION_CODE
             ),
@@ -926,6 +1087,18 @@ class ToolDefinition(BaseModel):
         ),
     )
 
+    voice_available: bool = Field(
+        default=False,
+        description=(
+            "If true, the tool loads in voice mode (#625). Off by default: Nova 2 "
+            "Sonic goes quiet for the rest of a voice session when a tool takes "
+            "longer than about a second, and a tool whose result is something to "
+            "look at (a chart, a document) does nothing for a listener. Voice drops "
+            "every tool without this flag, whatever enabled it (the picker, an "
+            "Agent binding or an admin pin)."
+        ),
+    )
+
     @model_validator(mode="after")
     def _normalize_always_on(self) -> "ToolDefinition":
         """An always-on (or system) tool is necessarily on by default.
@@ -1042,6 +1215,7 @@ class ToolDefinition(BaseModel):
             "alwaysOn": self.always_on,
             "system": self.system,
             "hidden": self.hidden,
+            "voiceAvailable": self.voice_available,
             "createdAt": to_iso(self.created_at) if self.created_at else None,
             "updatedAt": to_iso(self.updated_at) if self.updated_at else None,
             "createdBy": self.created_by,
@@ -1118,6 +1292,9 @@ class ToolDefinition(BaseModel):
             # visible tool (backward compatible).
             system=item.get("system", False),
             hidden=item.get("hidden", False),
+            # Absent on every row written before voice availability shipped
+            # (#625): those tools stay out of voice until an admin opts them in.
+            voice_available=item.get("voiceAvailable", False),
             mcp_config=mcp_config,
             a2a_config=a2a_config,
             mcp_gateway_config=mcp_gateway_config,
@@ -1249,6 +1426,12 @@ class UserToolAccess(BaseModel):
         ),
     )
 
+    voice_available: bool = Field(
+        default=False,
+        alias="voiceAvailable",
+        description="The tool loads in voice mode (#625); display only for the SPA.",
+    )
+
     # Current user state
     user_enabled: Optional[bool] = Field(
         None,
@@ -1334,6 +1517,7 @@ class MCPServerConfigRequest(BaseModel):
     health_check_interval_seconds: int = Field(
         default=300, alias="healthCheckIntervalSeconds"
     )
+    elicitation_enabled: bool = Field(default=False, alias="elicitationEnabled")
 
     model_config = {"populate_by_name": True, "use_enum_values": True}
 
@@ -1355,6 +1539,7 @@ class MCPServerConfigRequest(BaseModel):
             tools=[entry.to_model() for entry in self.tools],
             health_check_enabled=self.health_check_enabled,
             health_check_interval_seconds=self.health_check_interval_seconds,
+            elicitation_enabled=self.elicitation_enabled,
         )
 
 
@@ -1367,7 +1552,11 @@ class MCPGatewayConfigRequest(BaseModel):
     """
 
     target_name: str = Field(..., alias="targetName")
-    endpoint_url: str = Field(..., alias="endpointUrl")
+    endpoint_url: str = Field("", alias="endpointUrl")
+    connector_id: Optional[str] = Field(None, alias="connectorId")
+    connector_version: Optional[str] = Field(None, alias="connectorVersion")
+    domain_include: List[str] = Field(default_factory=list, alias="domainInclude")
+    domain_exclude: List[str] = Field(default_factory=list, alias="domainExclude")
     listing_mode: GatewayListingMode = Field(
         default=GatewayListingMode.DEFAULT, alias="listingMode"
     )
@@ -1382,7 +1571,7 @@ class MCPGatewayConfigRequest(BaseModel):
     lambda_function_name: Optional[str] = Field(None, alias="lambdaFunctionName")
     oauth_scopes: List[str] = Field(default_factory=list, alias="oauthScopes")
     grant_type: GatewayOAuthGrantType = Field(
-        default=GatewayOAuthGrantType.AUTHORIZATION_CODE, alias="grantType"
+        default=GatewayOAuthGrantType.CLIENT_CREDENTIALS, alias="grantType"
     )
     custom_parameters: Optional[Dict[str, str]] = Field(
         None, alias="customParameters"
@@ -1392,10 +1581,32 @@ class MCPGatewayConfigRequest(BaseModel):
     model_config = {"populate_by_name": True, "use_enum_values": True}
 
     def to_model(self) -> MCPGatewayConfig:
-        """Convert to MCPGatewayConfig model (runs the co-gating validator)."""
+        """Convert to MCPGatewayConfig model (runs the co-gating validator).
+
+        Also the one place a saved grant type is checked: rows written before
+        #454 may hold a grant that can no longer be saved, and they must keep
+        loading, so the check lives on the request rather than the model.
+
+        Raises:
+            ValueError: An OAUTH target with a grant other than
+                client_credentials.
+        """
+        if (
+            self.credential_type == GatewayCredentialType.OAUTH.value
+            and self.grant_type not in SUPPORTED_GATEWAY_OAUTH_GRANT_TYPES
+        ):
+            raise ValueError(
+                f"Gateway OAuth grant type '{self.grant_type}' is not supported; "
+                "use 'client_credentials'. For a tool that acts as the signed-in "
+                "user, register it as an MCP External Server instead."
+            )
         return MCPGatewayConfig(
             target_name=self.target_name,
             endpoint_url=self.endpoint_url,
+            connector_id=self.connector_id or None,
+            connector_version=self.connector_version or None,
+            domain_include=self.domain_include,
+            domain_exclude=self.domain_exclude,
             listing_mode=self.listing_mode,
             credential_type=self.credential_type,
             credential_provider_arn=self.credential_provider_arn,
@@ -1458,6 +1669,7 @@ class ToolCreateRequest(BaseModel):
     is_public: bool = Field(default=False, alias="isPublic")
     enabled_by_default: bool = Field(default=False, alias="enabledByDefault")
     always_on: bool = Field(default=False, alias="alwaysOn")
+    voice_available: bool = Field(default=False, alias="voiceAvailable")
 
     # External tool configurations (optional based on protocol)
     mcp_config: Optional[MCPServerConfigRequest] = Field(None, alias="mcpConfig")
@@ -1495,6 +1707,8 @@ class ToolUpdateRequest(BaseModel):
     # That partial-update semantic is load-bearing for backward compatibility
     # (docs/specs/admin-always-on-tools.md §10.1) — do not "simplify" it.
     always_on: Optional[bool] = Field(None, alias="alwaysOn")
+    # Same partial-update contract as `always_on`: absent leaves it alone (#625).
+    voice_available: Optional[bool] = Field(None, alias="voiceAvailable")
 
     # External tool configurations (optional based on protocol)
     mcp_config: Optional[MCPServerConfigRequest] = Field(None, alias="mcpConfig")
@@ -1562,6 +1776,7 @@ class MCPServerConfigResponse(BaseModel):
     health_check_interval_seconds: int = Field(
         default=300, alias="healthCheckIntervalSeconds"
     )
+    elicitation_enabled: bool = Field(default=False, alias="elicitationEnabled")
 
     model_config = {"populate_by_name": True}
 
@@ -1583,6 +1798,7 @@ class MCPServerConfigResponse(BaseModel):
             tools=[MCPToolEntryPayload.from_model(entry) for entry in config.tools],
             health_check_enabled=config.health_check_enabled,
             health_check_interval_seconds=config.health_check_interval_seconds,
+            elicitation_enabled=config.elicitation_enabled,
         )
 
 
@@ -1595,6 +1811,10 @@ class MCPGatewayConfigResponse(BaseModel):
 
     target_name: str = Field(..., alias="targetName")
     endpoint_url: str = Field(..., alias="endpointUrl")
+    connector_id: Optional[str] = Field(None, alias="connectorId")
+    connector_version: Optional[str] = Field(None, alias="connectorVersion")
+    domain_include: List[str] = Field(default_factory=list, alias="domainInclude")
+    domain_exclude: List[str] = Field(default_factory=list, alias="domainExclude")
     listing_mode: str = Field(..., alias="listingMode")
     credential_type: str = Field(..., alias="credentialType")
     credential_provider_arn: Optional[str] = Field(
@@ -1620,6 +1840,10 @@ class MCPGatewayConfigResponse(BaseModel):
         return cls(
             target_name=config.target_name,
             endpoint_url=config.endpoint_url,
+            connector_id=config.connector_id,
+            connector_version=config.connector_version,
+            domain_include=list(config.domain_include),
+            domain_exclude=list(config.domain_exclude),
             listing_mode=config.listing_mode
             if isinstance(config.listing_mode, str)
             else config.listing_mode.value,
@@ -1690,6 +1914,7 @@ class AdminToolResponse(BaseModel):
     allowed_app_roles: List[str] = Field(..., alias="allowedAppRoles")
     enabled_by_default: bool = Field(..., alias="enabledByDefault")
     always_on: bool = Field(default=False, alias="alwaysOn")
+    voice_available: bool = Field(default=False, alias="voiceAvailable")
     created_at: str = Field(..., alias="createdAt")
     updated_at: str = Field(..., alias="updatedAt")
     created_by: Optional[str] = Field(None, alias="createdBy")
@@ -1740,6 +1965,7 @@ class AdminToolResponse(BaseModel):
             allowed_app_roles=allowed_roles or tool.allowed_app_roles,
             enabled_by_default=tool.enabled_by_default,
             always_on=tool.always_on,
+            voice_available=tool.voice_available,
             created_at=to_iso(tool.created_at) if tool.created_at else "",
             updated_at=to_iso(tool.updated_at) if tool.updated_at else "",
             created_by=tool.created_by,

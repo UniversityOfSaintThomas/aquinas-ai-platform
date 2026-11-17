@@ -184,7 +184,16 @@ export type CacheStatus =
   | 'partial_miss'
   | 'miss_ttl_expired'
   | 'miss_avoidable'
-  | 'uncached';
+  | 'uncached'
+  /**
+   * The call's usage was never reported, so its cache outcome was not
+   * measured — today only an interrupted turn's cut generation, whose
+   * terminal usage event never arrived. Deliberately not a classification:
+   * the tokens on such a row are an attribution (see `usageEstimated`), and a
+   * plausible-looking `first_write` derived from them would send a cache
+   * investigation after a call nobody measured.
+   */
+  | 'estimated';
 
 /** Prompt-cache prefix hashes for one model call. */
 export interface PrefixFingerprints {
@@ -236,6 +245,8 @@ export interface DocumentReads {
 }
 
 /** One model call within a session's cost anatomy. */
+export type TurnOutcome = 'completed' | 'paused' | 'error' | 'stopped' | 'interrupted';
+
 export interface SessionCallRow {
   timestamp: string;
   messageId?: number | null;
@@ -259,6 +270,15 @@ export interface SessionCallRow {
   cachePrefixGapSeconds?: number | null;
   wastedUsd: number;
   /**
+   * Present when this call's usage was estimated rather than reported by the
+   * provider — an interrupted turn's cut generation. A field → method map
+   * (`projection`, `native_count`, `chars_per_token`, `assumed_first_write`,
+   * …), so the tokens and the cost on this row are never mistaken for a
+   * measurement. Such a row's `cacheStatus` is `estimated` and its
+   * `wastedUsd` is zero by construction.
+   */
+  usageEstimated?: Record<string, string> | null;
+  /**
    * Which Agent ran this call, and whether that changed from the call before it (#756).
    *
    * An `@`-mention hands one turn to a different Agent, which genuinely re-writes the
@@ -268,6 +288,16 @@ export interface SessionCallRow {
    */
   turnAgentId?: string | null;
   agentSwitched?: boolean;
+  /** Which build of inference-api served this call (release-ledger D1). */
+  appVersion?: string | null;
+  build?: string | null;
+  /**
+   * How this call's turn ended (release-ledger §5.1). Absent on rows written
+   * before it shipped and on calls that are not a turn's.
+   */
+  outcome?: TurnOutcome | null;
+  /** True only on the last row of a completed turn whose final call streamed no text. */
+  emptyAnswer?: boolean;
   /**
    * This call ran on a different model than the call before it. A mid-conversation
    * model switch keeps the conversation, and each model has its own cache, so the first
@@ -492,6 +522,16 @@ export interface FingerprintChanges {
 export interface ToolCensusEntry {
   calls: number;
   errors: number;
+  /**
+   * Weight (release-ledger D4), summed over the session. `null` when no row
+   * carried it (written before it shipped), which means "not measured", not 0.
+   * `resultChars` counts text and JSON characters, plus 1,500 per image.
+   */
+  resultChars?: number | null;
+  inputChars?: number | null;
+  /** Strands' measured execution time over the `timedCalls` that reported one. */
+  durationMs?: number | null;
+  timedCalls?: number | null;
 }
 
 /** Which optional signals this session actually has ("not tracked" vs "0"). */

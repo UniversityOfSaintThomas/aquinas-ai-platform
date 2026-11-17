@@ -14,10 +14,10 @@ from agents.main_agent.core import ModelConfig, SystemPromptBuilder, AgentFactor
 from agents.main_agent.session import SessionFactory
 from agents.main_agent.session.hooks import (
     AgentStatusHook,
+    AnalyzeSandboxHook,
     ContextLedgerHook,
     ToolCensusHook,
     DisplayTextHook,
-    McpAppAwaitingSubmissionHook,
     SteeringHook,
     StopHook,
     OAuthConsentHook,
@@ -25,6 +25,7 @@ from agents.main_agent.session.hooks import (
     MCPSessionHealHook,
     ContextAttributionHook,
     PrefixFingerprintHook,
+    WebSearchDefaultsHook,
 )
 from agents.main_agent.tools import (
     create_default_registry,
@@ -76,8 +77,10 @@ class BaseAgent(ABC):
         extra_tools: Optional[List[Any]] = None,
         memory_context: Optional[str] = None,
         text_only_model: bool = False,
-        long_term_memory: bool = True,
+        memory_retrieval: bool = True,
+        memory_extraction: bool = True,
         knowledge_context: Optional[str] = None,
+        client_surface: Optional[str] = None,
     ):
         """
         Initialize base agent with shared infrastructure.
@@ -104,11 +107,10 @@ class BaseAgent(ABC):
             skip_persistence: If True, don't persist messages (for preview sessions)
             text_only_model: The model's catalog row declares TEXT input only, so
                 it sees history with media blocks replaced by text.
-            long_term_memory: False for a conversation with an Agent: the
-                user's long-term memory is neither retrieved into it nor
-                extracted from it (``SessionFactory.create_session_manager``).
-                Follows from ``assistant_id``, already an agent cache key
-                element and on the construction snapshot.
+            memory_retrieval / memory_extraction: the two halves of long-term
+                memory (``SessionFactory.create_session_manager``), set by
+                ``get_agent`` from the effective memory mode. Both are False
+                for a conversation with an Agent.
             knowledge_context: The assistant's whole knowledge base in
                 full-context mode (``apis.shared.assistants.kb_full_context``).
                 Sent at the end of the system prompt, inside the system cache
@@ -156,18 +158,26 @@ class BaseAgent(ABC):
             "mantle_api_mode": mantle_api_mode,
             "mantle_region": mantle_region,
             "text_only_model": text_only_model,
+            # Recorded so a paused turn resumes under the same cache key; the
+            # surface is a key dimension.
+            "client_surface": client_surface,
         }
 
         # Load retry configuration from environment variables
         from agents.main_agent.core.model_config import RetryConfig
         self.model_config.retry_config = RetryConfig.from_env()
 
-        # Initialize system prompt builder
+        # Initialize system prompt builder. `client_surface` selects the
+        # interface section — which controls the agent may name, and which
+        # renderers it may emit. It is threaded into BOTH branches: an assistant
+        # or custom prompt still runs in a terminal, and telling that user to
+        # click a gear icon is wrong regardless of who wrote the instructions.
+        self.client_surface = client_surface
         if system_prompt:
-            self.prompt_builder = SystemPromptBuilder.from_user_prompt(system_prompt)
+            self.prompt_builder = SystemPromptBuilder.from_user_prompt(system_prompt, surface=client_surface)
             self.system_prompt = self.prompt_builder.build(include_date=False)
         else:
-            self.prompt_builder = SystemPromptBuilder()
+            self.prompt_builder = SystemPromptBuilder(surface=client_surface)
             self.system_prompt = self.prompt_builder.build(include_date=True)
 
         # Snapshot the *unbuilt* system_prompt — i.e. the same value the
@@ -226,7 +236,8 @@ class BaseAgent(ABC):
             session_id=session_id,
             user_id=self.user_id,
             caching_enabled=self.model_config.caching_enabled,
-            long_term_memory=long_term_memory,
+            memory_retrieval=memory_retrieval,
+            memory_extraction=memory_extraction,
         )
         # Conversation restore from AgentCore Memory happens in here, so this
         # is a prime suspect for the cold build and has never been timed.
@@ -267,15 +278,21 @@ class BaseAgent(ABC):
         max_tokens truncation: `message`/`files` are ignored and the loop is
         re-entered with an empty prompt so the model continues the truncated
         assistant message already in restored history (assistant-prefill),
-        rather than answering a fresh instruction.
+        rather than answering a fresh instruction. On a model that refuses
+        prefill (Claude 4.6+) the stream coordinator sends a fixed continue
+        turn instead (``apis.shared.models.assistant_prefill``).
         """
 
     def _register_external_mcp_tools(self) -> None:
         """
-        Register external MCP tool IDs with the tool filter.
+        Register external MCP and Gateway tool IDs with the tool filter.
 
-        Queries the tool catalog for tools with protocol='mcp_external'
-        and registers them so they're recognized during filtering.
+        Queries the tool catalog for the enabled tools and registers those
+        with protocol='mcp_external' (external MCP servers) and protocol='mcp'
+        (AgentCore Gateway targets) so they're recognized during filtering.
+        Gateway rows are registered by protocol because their id need not
+        carry the ``gateway_`` prefix the filter otherwise relies on. The same
+        catalog reads serve both, so recognizing Gateway rows adds no lookup.
         """
         if not self.enabled_tools:
             return
@@ -287,6 +304,7 @@ class BaseAgent(ABC):
 
             repository = get_tool_catalog_repository()
             external_tool_ids = []
+            gateway_tool_ids = []
 
             async def check_tools():
                 # A scoped id (`base::tool`) selects one tool of an MCP server;
@@ -305,6 +323,8 @@ class BaseAgent(ABC):
                     tool = await repository.get_tool(base)
                     if tool and tool.protocol == "mcp_external":
                         external_tool_ids.append(base)
+                    elif tool and tool.protocol == "mcp":
+                        gateway_tool_ids.append(base)
                 return external_tool_ids
 
             try:
@@ -323,6 +343,8 @@ class BaseAgent(ABC):
             if tool_ids:
                 self.tool_filter.set_external_mcp_tools(tool_ids)
                 logger.info(f"Registered {len(tool_ids)} external MCP tools: {tool_ids}")
+            if gateway_tool_ids:
+                self.tool_filter.set_gateway_tools(gateway_tool_ids)
 
         except Exception as e:
             logger.warning(f"Could not register external MCP tools: {e}")
@@ -342,8 +364,6 @@ class BaseAgent(ABC):
           OAuth-gated MCP tool is about to run without a cached token
         - AgentStatusHook: Records model/tool boundaries so the UI can say what
           the agent is doing while the turn streams
-        - McpAppAwaitingSubmissionHook: Marks an MCP App's "form shown,
-          nothing written yet" result so the UI does not call it a failure
         - Approval hooks: Gate dangerous operations for user confirmation
 
         Returns:
@@ -391,6 +411,15 @@ class BaseAgent(ABC):
         # for nothing; a healthy call pays one session probe.
         hooks.append(MCPSessionHealHook())
 
+        # AgentCore Web Search returns 10 results (~5.3k tokens) unless asked
+        # for fewer; fill in maxResults=5 when the model leaves it out. Hands
+        # Strands a copy of the tool use, so the model's request in history is
+        # untouched and nothing reaches the prompt. Registered only while on.
+        from apis.shared.feature_flags import web_search_default_max_results_enabled
+
+        if web_search_default_max_results_enabled():
+            hooks.append(WebSearchDefaultsHook())
+
         # Per-turn context-token attribution (system / tools / messages).
         # Best-effort; computes the breakdown on BeforeModelCallEvent and
         # stashes it on the agent for the stream coordinator to surface on the
@@ -398,6 +427,15 @@ class BaseAgent(ABC):
         # of the stable split, so an Agent rebuilt for this session (cache
         # bypass, @-mention, memory binding) adopts it instead of re-counting.
         hooks.append(ContextAttributionHook(session_id=self.session_id))
+
+        # Scopes the analyze_spreadsheet Code Interpreter sandbox to this turn
+        # (#259): BeforeInvocation registers the turn token that lets the tool
+        # reuse one sandbox across its calls, AfterInvocation stops it. Held on
+        # the wrapper so the stream coordinator can release it from its own
+        # `finally` too. Inert unless the tool is used or
+        # ANALYZE_SANDBOX_REUSE_ENABLED=false.
+        self.analyze_sandbox_hook = AnalyzeSandboxHook(self.session_id, self.user_id)
+        hooks.append(self.analyze_sandbox_hook)
 
         # Live narration of what the agent is doing (model call / tool call
         # boundaries) plus Strands-measured per-tool durations. Held on the
@@ -408,13 +446,6 @@ class BaseAgent(ABC):
         self.agent_status_hook = AgentStatusHook()
         hooks.append(self.agent_status_hook)
 
-        # An MCP App write tool that handed the operation to its form returns
-        # `isError: true` on purpose; mark it `awaiting_user_submission` at
-        # intake so the stream and the persisted message both say "waiting
-        # for you" rather than "failed". Only `structuredContent` changes,
-        # which no model formatter sends.
-        hooks.append(McpAppAwaitingSubmissionHook())
-
         # Content-free tool census (tool name → calls/errors per model call).
         # Held on the wrapper so the stream coordinator can read each call's
         # tally at turn end and persist it on that call's cost row for the
@@ -423,6 +454,14 @@ class BaseAgent(ABC):
         # COST_DIAGNOSTICS_ENABLED=false.
         self.tool_census_hook = ToolCensusHook()
         hooks.append(self.tool_census_hook)
+
+        # A call the provider declined (stop reason content_filtered or
+        # guardrail_intervened, no text) gets a platform notice in its message
+        # before Strands appends it, so history and a reload are never blank.
+        # After the model answers only; the coordinator streams the same notice.
+        from agents.main_agent.session.hooks.declined_answer import DeclinedAnswerHook
+
+        hooks.append(DeclinedAnswerHook())
 
         # Per-model-call context ledger: the conversation window's cumulative
         # trim count and the compaction decisions taken since the previous
@@ -447,9 +486,11 @@ class BaseAgent(ABC):
         """Resolve a Strands `selected_tool` to the set of tool names that
         pause for approval.
 
-        Two sources, one gate. An external MCP tool uses the per-tool set
+        Three sources, one gate. An external MCP tool uses the per-tool set
         cached by the integration (mirrors the provider lookup used by the
-        OAuth consent hook). The skill-authoring writes are a fixed set of
+        OAuth consent hook). A Gateway tool uses the set the Gateway
+        integration took from the catalog when it built this agent's Gateway
+        client (#454). The skill-authoring writes are a fixed set of
         built-in names (skill-creator spec D10), composed in here so the
         snapshot, resume route, breadcrumb and SPA card stay the MCP ones.
         Gating a name that was not built this turn is a no-op.
@@ -464,10 +505,17 @@ class BaseAgent(ABC):
         from strands.tools.mcp import MCPAgentTool
 
         integration = get_external_mcp_integration()
+        owner = self
 
         def approval_names_lookup(selected_tool: object) -> set[str]:
             if isinstance(selected_tool, MCPAgentTool):
-                return integration.approval_names_for_client(selected_tool.mcp_client)
+                client = selected_tool.mcp_client
+                # Read per call: the Gateway client is built after the hooks.
+                # Absent on the bare namespaces some tests build the hook from.
+                gateway = getattr(owner, "gateway_integration", None)
+                if gateway is not None and client is gateway.client:
+                    return gateway.approval_names_for_client(client)
+                return integration.approval_names_for_client(client)
             if getattr(selected_tool, "tool_name", None) in SKILL_AUTHORING_APPROVAL_NAMES:
                 return set(SKILL_AUTHORING_APPROVAL_NAMES)
             return set()
@@ -485,7 +533,15 @@ class BaseAgent(ABC):
     def _build_oauth_consent_hook(self) -> OAuthConsentHook:
         """Construct the OAuth consent hook with closures over the MCP
         integration and provider repository so it stays decoupled from them.
+
+        Two kinds of tool are OAuth-gated: an external MCP tool, whose
+        provider is looked up through its ``MCPClient``, and a first-party
+        tool bound to a connector at build time
+        (``agents.local_tools.oauth_binding`` — the Zoom / Google Calendar /
+        GitHub families). Both resolve to a provider id here; everything else
+        resolves to None and the hook stays out of the way.
         """
+        from agents.local_tools.oauth_binding import bound_connector_id
         from agents.main_agent.integrations.external_mcp_client import (
             get_external_mcp_integration,
         )
@@ -494,9 +550,9 @@ class BaseAgent(ABC):
         integration = get_external_mcp_integration()
 
         def provider_lookup(selected_tool: object) -> Optional[str]:
-            if not isinstance(selected_tool, MCPAgentTool):
-                return None
-            return integration.provider_for_client(selected_tool.mcp_client)
+            if isinstance(selected_tool, MCPAgentTool):
+                return integration.provider_for_client(selected_tool.mcp_client)
+            return bound_connector_id(selected_tool)
 
         async def scopes_lookup(provider_id: str) -> List[str]:
             from apis.shared.oauth.provider_repository import get_provider_repository
@@ -537,15 +593,15 @@ class BaseAgent(ABC):
             disconnected_lookup=disconnected_lookup,
         )
 
-    def _expand_gateway_tool_ids(self, gateway_tool_ids: List[str]) -> List[str]:
+    def _resolve_gateway_tools(self, gateway_tool_ids: List[str]):
         """Expand #419 catalog gateway tools into the gateway's runtime per-tool
-        ids (see `expand_gateway_tool_ids`), bridging the async catalog lookup
-        into this sync build path the same way `_register_external_mcp_tools`
-        does.
+        ids and collect their approval flags (see `resolve_gateway_tools`),
+        bridging the async catalog lookup into this sync build path the same
+        way `_register_external_mcp_tools` does.
         """
         from apis.shared.tools.repository import get_tool_catalog_repository
         from agents.main_agent.tools.gateway_integration import (
-            expand_gateway_tool_ids,
+            resolve_gateway_tools,
         )
 
         repo = get_tool_catalog_repository()
@@ -559,13 +615,13 @@ class BaseAgent(ABC):
 
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     return executor.submit(
-                        asyncio.run, expand_gateway_tool_ids(gateway_tool_ids, repo)
+                        asyncio.run, resolve_gateway_tools(gateway_tool_ids, repo)
                     ).result()
             return loop.run_until_complete(
-                expand_gateway_tool_ids(gateway_tool_ids, repo)
+                resolve_gateway_tools(gateway_tool_ids, repo)
             )
         except RuntimeError:
-            return asyncio.run(expand_gateway_tool_ids(gateway_tool_ids, repo))
+            return asyncio.run(resolve_gateway_tools(gateway_tool_ids, repo))
 
     def _build_filtered_tools(self) -> List:
         """
@@ -589,13 +645,16 @@ class BaseAgent(ABC):
         if gateway_tool_ids:
             # #419 catalog tools (`gateway_<id>`) must be expanded to the
             # gateway's runtime per-tool ids (`gateway_<target>___<tool>`)
-            # before the FilteredMCPClient can match them.
-            gateway_tool_ids = self._expand_gateway_tool_ids(gateway_tool_ids)
+            # before the FilteredMCPClient can match them. The same catalog
+            # rows say which of them pause for approval (#454).
+            resolution = self._resolve_gateway_tools(gateway_tool_ids)
             # The JWT-authorized Gateway needs *this user's* access token per
             # invocation — there is no machine-identity fallback. Passed
             # explicitly (never cached globally) so tokens can't cross users.
             gateway_client = self.gateway_integration.get_client(
-                gateway_tool_ids, auth_token=self.auth_token
+                resolution.runtime_ids,
+                auth_token=self.auth_token,
+                approval_names=resolution.approval_names,
             )
             if gateway_client:
                 local_tools = self.gateway_integration.add_to_tool_list(local_tools)

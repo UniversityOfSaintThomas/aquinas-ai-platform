@@ -6,13 +6,16 @@ import {
   signal,
   computed,
   effect,
+  ElementRef,
   OnDestroy,
+  viewChild,
 } from '@angular/core';
 import { firstValueFrom } from 'rxjs';
 import { NgIcon, provideIcons } from '@ng-icons/core';
 import {
   heroArrowDownTray,
   heroArrowPath,
+  heroArrowUpTray,
   heroBookOpen,
   heroCheckCircle,
   heroExclamationTriangle,
@@ -26,6 +29,15 @@ import {
 } from '@ng-icons/heroicons/outline';
 import { Dialog } from '@angular/cdk/dialog';
 import { DocumentService, DocumentUploadError } from '../assistants/services/document.service';
+import {
+  DocumentReplaceService,
+  DocumentReplaceTransport,
+  REPLACE_POLL_LIMIT_MS,
+  fileTooLargeMessage,
+  formatFileLimit,
+  fileExtension,
+  orderReplacementsAdjacent,
+} from '../assistants/services/document-replace.service';
 import {
   Document,
   DocumentStatus,
@@ -69,6 +81,8 @@ import {
   UpgradeStatus,
 } from './kb-upgrade.service';
 import { parseIso } from '../utils/date';
+import { FEATURES } from '../services/features';
+import { KnowledgeModeLineComponent } from './knowledge-mode-line.component';
 
 /**
  * The reusable "Knowledge base" authoring section — device upload, web-crawl
@@ -88,12 +102,15 @@ import { parseIso } from '../utils/date';
 @Component({
   selector: 'app-knowledge-base-section',
   templateUrl: './knowledge-base-section.component.html',
+  // Block, so a parent's space-y gap (a margin on this element) takes effect.
+  host: { class: 'block' },
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [NgIcon, SyncPolicyControlComponent, SpinnerComponent],
+  imports: [NgIcon, SyncPolicyControlComponent, SpinnerComponent, KnowledgeModeLineComponent],
   providers: [
     provideIcons({
       heroArrowDownTray,
       heroArrowPath,
+      heroArrowUpTray,
       heroBookOpen,
       heroCheckCircle,
       heroExclamationTriangle,
@@ -117,6 +134,8 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
   private readonly dialog = inject(Dialog);
   private readonly toast = inject(ToastService);
   private readonly kbUpgrade = inject(KbUpgradeService);
+  protected readonly replace = inject(DocumentReplaceService);
+  protected readonly features = inject(FEATURES);
 
   // ── Inputs ────────────────────────────────────────────────────────────
 
@@ -150,6 +169,29 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
 
   readonly mode = computed<'create' | 'edit'>(() => (this.id() ? 'edit' : 'create'));
 
+  /**
+   * The knowledge-base mode line ("Sent to the model whole" / "Searched"), for
+   * editors of a saved Agent while `features.knowledgeBaseMode` is on. The
+   * endpoint is owner/editor only, so a viewer never asks.
+   */
+  readonly showKnowledgeMode = computed(
+    () =>
+      this.features.knowledgeBaseMode &&
+      this.mode() === 'edit' &&
+      this.permissionResolved() &&
+      this.userPermission() !== 'viewer',
+  );
+
+  /** The effective id (a draft minted mid-session included), for the mode line. */
+  protected readonly entityIdForMode = computed(() => this.id());
+
+  /** Changes when a document is added, removed or changes status, so the line re-reads. */
+  readonly knowledgeModeKey = computed(() =>
+    this.uploadedDocuments()
+      .map((d) => `${d.documentId}:${d.status}`)
+      .join('|'),
+  );
+
   readonly uploadedDocuments = signal<Document[]>([]);
   readonly isLoadingDocuments = signal<boolean>(false);
   readonly currentUpload = signal<{
@@ -159,6 +201,23 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
     error?: string;
   } | null>(null);
   readonly pollingDocuments = signal<Set<string>>(new Set());
+  /**
+   * The loop that owns each document's poll. A replace takes over a poll a
+   * reload started, and only the owner may clear the document's polling entry.
+   */
+  private readonly pollOwners = new Map<string, symbol>();
+
+  /** The list as rendered: a replacement in flight or failed sits right after its original. */
+  readonly displayedDocuments = computed(() =>
+    orderReplacementsAdjacent(this.uploadedDocuments(), this.replace.replacementLinks()),
+  );
+  /** One replace (app-wide) or upload at a time — they share the single progress slot. */
+  readonly replaceDisabled = computed(
+    () => this.replace.inFlight() || this.currentUpload()?.status === 'uploading',
+  );
+  private readonly replaceInput = viewChild<ElementRef<HTMLInputElement>>('replaceInput');
+  /** The document the replace picker was opened for. */
+  private replaceTarget: Document | null = null;
 
   /** Connectors the user can import documents from, surfaced as buttons. */
   readonly fileSources = signal<FileSourceConnector[]>([]);
@@ -271,6 +330,27 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
 
   /** Managed KBs carry a cap; a legacy KB returns `cap: null` (uncapped). */
   readonly kbHasCap = computed(() => (this.kbUsage()?.cap ?? null) !== null);
+
+  /**
+   * The knowledge base's per-file limit, from the same documents-list read
+   * (`kbUsage.maxFileBytes`). `null` until read — a draft with no record yet —
+   * in which case the server's 413 says the number instead.
+   */
+  readonly maxFileBytes = computed(() => this.kbUsage()?.maxFileBytes ?? null);
+
+  /** "50 MB" for the dropzone copy, or `null` when the limit isn't known yet. */
+  readonly maxFileSizeLabel = computed(() => {
+    const limit = this.maxFileBytes();
+    return limit === null ? null : formatFileLimit(limit);
+  });
+
+  /** The dropzone's format line, with the size only once the API has said it. */
+  readonly dropzoneHint = computed(() => {
+    const label = this.maxFileSizeLabel();
+    const types = 'PDF, DOCX, TXT, MD, and other document types';
+    // A no-break space keeps "50 MB" on one line, as the old copy's &nbsp; did.
+    return label ? `${types} up to ${label.replace(' ', '\u00a0')}` : types;
+  });
 
   /** Show the bar only for an existing record whose usage we have resolved. */
   // The bar visualises stored bytes against a cap — both of which exist only for
@@ -772,14 +852,15 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
       return;
     }
 
-    // Validate file size (10MB max)
-    const maxSizeBytes = 10 * 1024 * 1024; // 10MB
-    if (file.size > maxSizeBytes) {
+    // The knowledge base's per-file limit, from the API. Unknown (a draft with no
+    // record yet) leaves it to the server, whose 413 carries the same sentence.
+    const maxFileBytes = this.maxFileBytes();
+    if (maxFileBytes !== null && file.size > maxFileBytes) {
       this.currentUpload.set({
         file,
         progress: 0,
         status: 'error',
-        error: `File size exceeds 10MB limit. File size: ${this.formatBytes(file.size)}`,
+        error: fileTooLargeMessage(maxFileBytes, file.size),
       });
       input.value = '';
       return;
@@ -1022,7 +1103,9 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
         if (
           PROCESSING_STATUSES.includes(doc.status) &&
           !this.isDocumentStale(doc) &&
-          !this.pollingDocuments().has(doc.documentId)
+          !this.pollingDocuments().has(doc.documentId) &&
+          // A replacement in flight is polled by the replace itself.
+          !this.replace.isBusy(doc.documentId)
         ) {
           this.startPollingDocument(doc.documentId, recordId);
         }
@@ -1133,8 +1216,9 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
           if (this.isDocumentStale(doc)) {
             continue;
           }
-          // Only start polling if not already polling
-          if (!this.pollingDocuments().has(doc.documentId)) {
+          // Only start polling if not already polling, and leave a replacement
+          // in flight to the replace's own poll.
+          if (!this.pollingDocuments().has(doc.documentId) && !this.replace.isBusy(doc.documentId)) {
             this.startPollingDocument(doc.documentId, recordId);
           }
         }
@@ -1185,19 +1269,34 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
   }
 
   async deleteDocument(documentId: string): Promise<void> {
+    if (!this.id() || !this.uploadedDocuments().some((doc) => doc.documentId === documentId)) {
+      return;
+    }
+    try {
+      await this.removeDocument(documentId);
+      this.replace.forget(documentId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to delete document.';
+      this.toast.error(message);
+    }
+  }
+
+  /**
+   * Delete a document, optimistically. Restores the row and rethrows on failure;
+   * the caller decides what to tell the user. Shared by the Delete button and the
+   * replace flow's removal of the old version.
+   */
+  private async removeDocument(documentId: string): Promise<void> {
     const recordId = this.id();
     if (!recordId) {
-      return;
+      throw new Error('Failed to delete document.');
     }
 
     // Optimistic UI: drop the row immediately so the click feels instant
     // instead of waiting on the DELETE + full document-list reload. Soft-delete
     // is idempotent and almost always succeeds; on the rare failure we restore
-    // the row and toast.
+    // the row.
     const previousDocs = this.uploadedDocuments();
-    if (!previousDocs.some((doc) => doc.documentId === documentId)) {
-      return;
-    }
     this.uploadedDocuments.update((docs) => docs.filter((doc) => doc.documentId !== documentId));
     // Drop from the polling set too so the row's spinner indicator doesn't
     // briefly reappear on the next poll tick before the GET 404s.
@@ -1217,9 +1316,124 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
       }
     } catch (error) {
       this.uploadedDocuments.set(previousDocs);
-      const message = error instanceof Error ? error.message : 'Failed to delete document.';
-      this.toast.error(message);
+      throw error;
     }
+  }
+
+  // ── Replace with a newer version ────────────────────────────────────────
+
+  /**
+   * Whether a row offers Replace: a settled device upload. Imported and web
+   * documents are kept fresh by their source, and a device upload over one would
+   * drop its sync link, so they never offer it.
+   */
+  canReplace(doc: Document): boolean {
+    return (doc.status === 'complete' || doc.status === 'failed') && !doc.sourceConnectorId;
+  }
+
+  /** Open the replace picker for a document, limited to the original's file type. */
+  startReplace(doc: Document): void {
+    if (this.replaceDisabled()) {
+      return;
+    }
+    this.replaceTarget = doc;
+    const input = this.replaceInput()?.nativeElement;
+    if (!input) {
+      return;
+    }
+    // Set imperatively: a bound [accept] would not update before this synchronous click.
+    input.accept = fileExtension(doc.filename);
+    input.value = '';
+    input.click();
+  }
+
+  async onReplaceFilePicked(event: Event): Promise<void> {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    const target = this.replaceTarget;
+    this.replaceTarget = null;
+    const recordId = this.id();
+    if (!target || !file || !recordId) {
+      return;
+    }
+    await this.replace.replace(target, file, this.replaceTransport(recordId), this.maxFileBytes());
+  }
+
+  private replaceTransport(recordId: string): DocumentReplaceTransport {
+    return {
+      requestUploadUrl: (file) =>
+        this.documentService.requestUploadUrl(recordId, file, { suppressErrorToast: true }),
+      uploadToS3: async (uploadUrl, file) => {
+        this.currentUpload.set({ file, progress: 0, status: 'uploading' });
+        try {
+          await this.documentService.uploadToS3(uploadUrl, file, (progress) => {
+            this.currentUpload.update((current) => (current ? { ...current, progress } : current));
+          });
+        } catch (error) {
+          this.currentUpload.set({
+            file,
+            progress: this.currentUpload()?.progress || 0,
+            status: 'error',
+            error: error instanceof Error ? error.message : 'Upload failed',
+          });
+          throw error;
+        }
+        this.currentUpload.set({ file, progress: 100, status: 'complete' });
+        setTimeout(() => {
+          if (this.currentUpload()?.file === file) {
+            this.currentUpload.set(null);
+          }
+        }, 2000);
+      },
+      reportUploadFailure: (documentId, message, details) =>
+        this.documentService.reportUploadFailure(recordId, documentId, message, details),
+      refresh: () => this.loadDocuments(),
+      waitForTerminal: async (documentId) => {
+        // Claim the poll first so the reload below doesn't start a second one,
+        // and take it over from any poll a reload started during the upload:
+        // that loop stops quietly and can no longer cancel this one.
+        const token = Symbol(documentId);
+        this.pollOwners.set(documentId, token);
+        const owned = () => this.pollOwners.get(documentId) === token;
+        this.pollingDocuments.update((set) => new Set(set).add(documentId));
+        try {
+          await this.loadDocuments();
+          return await this.documentService.pollDocumentStatus(
+            recordId,
+            documentId,
+            (document) => {
+              this.uploadedDocuments.update((docs) =>
+                docs.map((doc) => (doc.documentId === documentId ? document : doc)),
+              );
+            },
+            REPLACE_POLL_LIMIT_MS,
+            undefined,
+            undefined,
+            () => !owned() || !this.pollingDocuments().has(documentId),
+          );
+        } catch (error) {
+          if (
+            error instanceof DocumentUploadError &&
+            ['POLL_TIMEOUT', 'POLL_CANCELLED', 'DOCUMENT_NOT_FOUND'].includes(error.code)
+          ) {
+            return null;
+          }
+          throw error;
+        } finally {
+          if (owned()) {
+            this.pollOwners.delete(documentId);
+            this.pollingDocuments.update((set) => {
+              const next = new Set(set);
+              next.delete(documentId);
+              return next;
+            });
+          }
+          await this.loadDocuments();
+        }
+      },
+      deleteDocument: (documentId) => this.removeDocument(documentId),
+    };
   }
 
   /**
@@ -1552,6 +1766,10 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
 
   async startPollingDocument(documentId: string, recordId: string): Promise<void> {
     // Add to polling set
+    const token = Symbol(documentId);
+    this.pollOwners.set(documentId, token);
+    // A replace taking over this document's poll stops this loop without a trace.
+    const superseded = () => this.pollOwners.get(documentId) !== token;
     this.pollingDocuments.update((set) => new Set(set).add(documentId));
 
     try {
@@ -1571,12 +1789,16 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
         // real cancellation instead of a display-only flag. Before it, deleting a
         // document mid-upload left the loop asking about a row that no longer
         // existed until its 404 tolerance ran out — five "Not found" dialogs.
-        () => !this.pollingDocuments().has(documentId),
+        () => superseded() || !this.pollingDocuments().has(documentId),
       );
 
       // Polling completed - reload full list to ensure consistency
       await this.loadDocuments();
     } catch (error) {
+      if (superseded()) {
+        // Taken over: the new owner keeps the row up to date.
+        return;
+      }
       // Handle document/record deletion gracefully
       if (
         error instanceof DocumentUploadError &&
@@ -1594,12 +1816,15 @@ export class KnowledgeBaseSectionComponent implements OnDestroy {
         await this.loadDocuments();
       }
     } finally {
-      // Remove from polling set
-      this.pollingDocuments.update((set) => {
-        const newSet = new Set(set);
-        newSet.delete(documentId);
-        return newSet;
-      });
+      // Remove from polling set, unless another poll now owns the document
+      if (!superseded()) {
+        this.pollOwners.delete(documentId);
+        this.pollingDocuments.update((set) => {
+          const newSet = new Set(set);
+          newSet.delete(documentId);
+          return newSet;
+        });
+      }
     }
   }
 

@@ -64,6 +64,7 @@ DOCLING_SUPPORTED_EXTENSIONS = {
     ".odt",
     ".txt",
     ".md",
+    ".sql",
     ".rtf",
     ".markdown",
     ".csv",
@@ -167,6 +168,10 @@ async def process_with_docling(
 
     logger.info(f"Docling processor initialized...starting to process document...")
 
+    # SQL is plain text. Browsers label it application/sql or nothing, so route it by extension.
+    if filename and filename.lower().endswith(".sql"):
+        mime_type = "text/plain"
+
     # Normalize text encoding if it's a text format
     if mime_type in TEXT_BASED_MIME_TYPES:
         file_bytes = _ensure_utf8_bytes(file_bytes, mime_type)
@@ -250,6 +255,10 @@ async def process_with_docling(
             tmp_file.write(file_bytes)
             tmp_file.flush()
             tmp_file_path = tmp_file.name
+            # Close our handle before the converter reopens the file by path and
+            # before the unlink below; Windows refuses both while it is open.
+            # The context manager's own close() is then a no-op.
+            tmp_file.close()
 
             if mime_type == "application/pdf" or tmp_file_path.lower().endswith(".pdf"):
                 logger.info(f"Using PDF specific options...")

@@ -49,6 +49,7 @@ from apis.shared.tools.mcp_session import (
     is_tool_provider,
     reset_crashed_session,
     revive_provider_session,
+    server_error_outcome_unknown,
     session_is_active,
 )
 
@@ -144,7 +145,7 @@ def _structured_content(result: Any) -> Any:
     """The tool's `structuredContent`, or None when it returned none."""
     if isinstance(result, dict):
         return result.get("structuredContent")
-    return getattr(result, "structuredContent", None)
+    return getattr(result, "structured_content", None)
 
 
 def _is_error(result: Any) -> bool:
@@ -239,12 +240,17 @@ def _active_session(client: Any):
                             )
 
 
-def _resolve_client(agent: Any, tool_name: str):
-    """The MCP client that surfaced `tool_name`.
+def _resolve_client(agent: Any, tool_name: str, user_id: Optional[str] = None):
+    """The MCP client that surfaced `tool_name` for `user_id`.
 
     Primary source is the `UIToolCatalog` (recorded when the agent's MCP
     client ran `tools/list` during build). Lazy import keeps the agent
     layer off inference-api's cold-start path when MCP Apps is disabled.
+
+    `user_id` is load-bearing: the catalog is process-global, and a client
+    carrying one user's credential is recorded under that user. Resolving
+    without it would only see shared clients; resolving by name alone used
+    to return whichever user's client was recorded last.
     """
     from agents.main_agent.integrations.mcp_apps import (
         get_ui_tool_catalog,
@@ -254,8 +260,8 @@ def _resolve_client(agent: Any, tool_name: str):
     if not is_mcp_apps_host_enabled():
         return None, None
     catalog = get_ui_tool_catalog()
-    ui_metadata = catalog.get(tool_name)
-    client = catalog.get_client(tool_name)
+    ui_metadata = catalog.get(tool_name, user_id)
+    client = catalog.get_client(tool_name, user_id)
     return ui_metadata, client
 
 
@@ -485,7 +491,7 @@ def _refresh_ui_resource(user_id: str, session_id: str, tool_use_id: str) -> Non
     # between turns Strands has already stopped the client's session — the
     # same reason an app-initiated call needs this wrapper.
     with _active_session(client):
-        payload = fetch_ui_resource(producing_tool, tool_use_id)
+        payload = fetch_ui_resource(producing_tool, tool_use_id, user_id)
     if not payload or not payload.get("html"):
         return
 
@@ -556,7 +562,7 @@ async def dispatch_app_tool_call(
     one) for the JSON response app-api relays to the iframe. Raises `AppToolCallError`
     for visibility / unknown-tool / dispatch failures.
     """
-    ui_metadata, client = _resolve_client(agent, tool_name)
+    ui_metadata, client = _resolve_client(agent, tool_name, user_id)
 
     # The catalog only holds tools a connected server listed with `_meta.ui`
     # and that survived the connector's tool filter. A miss is usually a
@@ -609,8 +615,13 @@ async def dispatch_app_tool_call(
         # thread rather than on the event loop.
         with _active_session(client):
             result = client.call_tool_sync(synth_id, tool_name, args)
-            # Read before the context resets a crashed session.
-            return result, _is_error(result) and not session_is_active(client)
+            # Read before the context resets a crashed session. A 5xx on a
+            # session that stayed up is the same unknown outcome (mcp 2.x
+            # keeps the session; 1.x tore it down).
+            outcome_unknown = (
+                _is_error(result) and not session_is_active(client)
+            ) or server_error_outcome_unknown(result)
+            return result, outcome_unknown
 
     try:
         result, connection_lost = await asyncio.to_thread(_invoke)
@@ -629,12 +640,12 @@ async def dispatch_app_tool_call(
     is_error = _is_error(result)
     status = "error" if is_error else "success"
     if connection_lost:
-        # The session ended while the request was out, so the server may
-        # well have acted on it: GitHub created the issue, then answered
-        # 503. "Failed" would invite a retry and a duplicate; say what we
-        # actually know.
+        # The session ended while the request was out, or the server
+        # answered it with a 5xx, so the server may well have acted on it:
+        # GitHub created the issue, then answered 503. "Failed" would invite
+        # a retry and a duplicate; say what we actually know.
         logger.warning(
-            "app tools/call lost its MCP connection mid-call; outcome unknown "
+            "app tools/call lost its connection or got a 5xx; outcome unknown "
             "(tool=%s session=%s): %s",
             scrub_log(tool_name),
             scrub_log(session_id),

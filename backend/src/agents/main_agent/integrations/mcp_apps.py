@@ -41,13 +41,25 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlsplit
 from urllib.request import Request, urlopen
 
-import mcp.types as mcp_types
 from mcp.client.session import ClientSession
+from mcp.shared.exceptions import MCPError
+from mcp.types import (
+    METHOD_NOT_FOUND,
+    REQUEST_TIMEOUT,
+    DiscoverResult,
+    ElicitationCapability,
+    FormElicitationCapability,
+)
 from strands.tools.mcp import MCPClient
 from strands.types import PaginatedList
 
 from agents.main_agent.config.constants import Defaults, EnvVars
-from agents.main_agent.integrations.mcp_session_end import ReleasesCallsOnSessionEnd
+from agents.main_agent.integrations.mcp_transport import (
+    forget_legacy_server,
+    is_known_legacy_server,
+    remember_legacy_server,
+)
+from apis.shared.tools.mcp_session import server_error_outcome_unknown
 from apis.shared.tools.models import ToolUIMetadata
 
 logger = logging.getLogger(__name__)
@@ -104,11 +116,34 @@ class UIToolCatalog:
     `resources/read`. The client's session stays alive for the agent's
     lifetime (Strands holds MCP clients as tool providers), so it is still
     active when a tool result arrives mid-stream.
+
+    Entries are partitioned by the client's OWNER. A client that carries one
+    user's credential (forwarded OIDC token, OAuth token, exchanged token)
+    is stamped with ``owner_user_id`` by the integration that built it, and
+    its entries are only ever returned for that same user. A client with no
+    owner (SigV4 Gateway, static API key, unauthenticated) is shared and
+    recorded under ``None``. Keying by tool name alone let two users of one
+    process overwrite each other's entry, so an app-initiated ``tools/call``
+    for user A could run on user B's client — with B's credential.
+
+    Lookup for a user tries that user's own entry, then the shared one. It
+    never returns another user's entry; a lookup with no user sees only
+    shared entries.
     """
 
     def __init__(self) -> None:
-        self._by_tool_name: dict[str, ToolUIMetadata] = {}
-        self._client_by_tool_name: dict[str, Any] = {}
+        self._by_key: dict[Tuple[Optional[str], str], ToolUIMetadata] = {}
+        self._client_by_key: dict[Tuple[Optional[str], str], Any] = {}
+
+    @staticmethod
+    def _owner_of(client: Optional[Any]) -> Optional[str]:
+        owner = getattr(client, "owner_user_id", None) if client is not None else None
+        return owner if isinstance(owner, str) and owner else None
+
+    def _keys_for(self, tool_name: str, user_id: Optional[str]):
+        if user_id:
+            yield (user_id, tool_name)
+        yield (None, tool_name)
 
     def record(
         self,
@@ -116,27 +151,48 @@ class UIToolCatalog:
         ui_metadata: ToolUIMetadata,
         client: Optional[Any] = None,
     ) -> None:
-        self._by_tool_name[tool_name] = ui_metadata
+        key = (self._owner_of(client), tool_name)
+        self._by_key[key] = ui_metadata
         if client is not None:
-            self._client_by_tool_name[tool_name] = client
+            self._client_by_key[key] = client
 
-    def get(self, tool_name: str) -> Optional[ToolUIMetadata]:
-        return self._by_tool_name.get(tool_name)
+    def get(
+        self, tool_name: str, user_id: Optional[str] = None
+    ) -> Optional[ToolUIMetadata]:
+        for key in self._keys_for(tool_name, user_id):
+            found = self._by_key.get(key)
+            if found is not None:
+                return found
+        return None
 
-    def get_client(self, tool_name: str) -> Optional[Any]:
-        """The MCP client that surfaced `tool_name`, or None.
+    def get_client(self, tool_name: str, user_id: Optional[str] = None) -> Optional[Any]:
+        """The MCP client that surfaced `tool_name` for `user_id`, or None.
 
         Used by `fetch_ui_resource` to issue `resources/read` against the
-        same server the tool came from (spec MUST: never inline).
+        same server the tool came from (spec MUST: never inline), and by
+        app-initiated `tools/call` dispatch. Returns the user's own client,
+        else a shared one — never a client owned by a different user.
         """
-        return self._client_by_tool_name.get(tool_name)
+        for key in self._keys_for(tool_name, user_id):
+            if key in self._by_key:
+                # Pair the client with the metadata entry that matched, so a
+                # user's own metadata is never served with a shared client.
+                return self._client_by_key.get(key)
+        return None
+
+    def forget_user(self, user_id: str) -> None:
+        """Drop every entry owned by `user_id` (their clients were torn down)."""
+        for key in [k for k in self._by_key if k[0] == user_id]:
+            self._by_key.pop(key, None)
+            self._client_by_key.pop(key, None)
 
     def snapshot(self) -> dict[str, ToolUIMetadata]:
-        return dict(self._by_tool_name)
+        """Tool name -> metadata across all owners (diagnostics/tests only)."""
+        return {name: meta for (_owner, name), meta in self._by_key.items()}
 
     def clear(self) -> None:
-        self._by_tool_name.clear()
-        self._client_by_tool_name.clear()
+        self._by_key.clear()
+        self._client_by_key.clear()
 
 
 _ui_tool_catalog: Optional[UIToolCatalog] = None
@@ -292,7 +348,7 @@ def _extract_html_content(result: Any) -> Tuple[Optional[str], str]:
         text = getattr(item, "text", None)
         if not isinstance(text, str):
             continue
-        mime = getattr(item, "mimeType", None) or ""
+        mime = getattr(item, "mime_type", None) or ""
         if mime == MCP_APPS_UI_MIME_TYPE:
             return text, mime
         if html_fallback is None and mime.startswith("text/html"):
@@ -484,14 +540,17 @@ def _resolve_server_identity(
 ) -> Tuple[str, str]:
     """Resolve `(serverName, icon)` for a tool's `ui_resource` event.
 
-    Name: server-advertised `serverInfo` (`title` > `name`, captured off
-    `initialize`) → `ui://` authority. Icon: `serverInfo.icons` (spec) → the
+    Name: server-advertised `serverInfo` (`title` > `name`, the session's
+    `server_info`) → `ui://` authority. Icon: `serverInfo.icons` (spec) → the
     server's served-manifest icon (Claude parity, pre-warmed cache keyed by the
     client's `server_url`) → "" (frontend glyph). Wholly best-effort.
     """
+    # `server_info` is None until the session negotiates, and on a
+    # 2026-07-28 connection it is the discover result's optional stamp, so a
+    # server may legitimately not name itself.
     info = getattr(
         getattr(client, "_background_thread_session", None),
-        "_mcp_apps_server_info",
+        "server_info",
         None,
     )
     name = getattr(info, "title", None) or getattr(info, "name", None) or ""
@@ -506,7 +565,7 @@ def _resolve_server_identity(
 
 
 def fetch_ui_resource(
-    tool_name: str, tool_use_id: str
+    tool_name: str, tool_use_id: str, user_id: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
     """Fetch a tool's MCP App UI resource and build the `ui_resource` payload.
 
@@ -521,16 +580,19 @@ def fetch_ui_resource(
     false: returns None on flag-off, non-UI tool, unknown hosting client,
     inactive session, fetch error, or a body with no inline HTML. Never
     raises into the stream.
+
+    `user_id` selects that user's own client for a per-user server (see
+    `UIToolCatalog`); without it only shared clients are visible.
     """
     if not is_mcp_apps_host_enabled():
         return None
 
     catalog = get_ui_tool_catalog()
-    ui_metadata = catalog.get(tool_name)
+    ui_metadata = catalog.get(tool_name, user_id)
     if ui_metadata is None or not ui_metadata.resource_uri:
         return None
 
-    client = catalog.get_client(tool_name)
+    client = catalog.get_client(tool_name, user_id)
     if client is None:
         logger.warning(
             "MCP Apps: tool %s has resourceUri %s but no hosting client "
@@ -590,7 +652,7 @@ def fetch_ui_resource(
 
 
 def build_ui_app_header(
-    tool_name: str, tool_use_id: str
+    tool_name: str, tool_use_id: str, user_id: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
     """Build a metadata-only `ui_resource` (empty `html`) WITHOUT `resources/read`.
 
@@ -599,7 +661,7 @@ def build_ui_app_header(
     show in the plain tool rail before its frame mounts. This builds the same
     event shape with everything that's known *instantly* at the tool's
     `content_block_start` — `resourceUri` + `serverName` + `icon` (from the
-    catalog + captured `serverInfo`) + tool-level `csp`/`permissions` — and an
+    catalog + the session's `server_info`) + tool-level `csp`/`permissions` — and an
     EMPTY `html`. Emitting it first lets the host promote the App frame's
     HEADER (icon + server + tool + shimmer) immediately; the full
     `fetch_ui_resource` payload follows and, last-write-wins on the frontend,
@@ -613,7 +675,7 @@ def build_ui_app_header(
     if not is_mcp_apps_host_enabled():
         return None
     catalog = get_ui_tool_catalog()
-    ui_metadata = catalog.get(tool_name)
+    ui_metadata = catalog.get(tool_name, user_id)
     if ui_metadata is None or not ui_metadata.resource_uri:
         return None
 
@@ -623,7 +685,7 @@ def build_ui_app_header(
         raw["permissions"] if isinstance(raw.get("permissions"), dict) else {}
     )
     server_name, icon = _resolve_server_identity(
-        catalog.get_client(tool_name), ui_metadata.resource_uri
+        catalog.get_client(tool_name, user_id), ui_metadata.resource_uri
     )
     return {
         "type": "ui_resource",
@@ -647,65 +709,111 @@ def build_ui_app_header(
 # =============================================================================
 
 
-class _UIExtensionClientSession(ClientSession):
-    """`ClientSession` that advertises the MCP Apps UI extension on `initialize`.
+def _rejection_is_era_evidence(exc: MCPError) -> bool:
+    """Whether a rejected `server/discover` says the server is legacy-only.
 
-    Drop-in for the SDK `ClientSession` — identical constructor, identical
-    behavior, except that the outbound `InitializeRequest` gets
-    `capabilities.extensions["io.modelcontextprotocol/ui"]` added when the
-    host flag is enabled. We augment in `send_request` rather than reimplement
-    `initialize()` so we inherit whatever capabilities the SDK computes
-    (sampling/elicitation/roots/tasks) and stay robust to SDK changes.
+    A timeout or a 5xx says the server is struggling, not which protocol it
+    speaks: GitHub answering one probe 503 must not drop it to the legacy
+    protocol (and its awaiting-submission marker) for an hour.
+    """
+    if exc.error.code == REQUEST_TIMEOUT:
+        return False
+    return not server_error_outcome_unknown(
+        {"status": "error", "content": [{"text": exc.error.message}]}
+    )
+
+
+#: The first protocol version whose elicitation is the stateless multi-round-trip
+#: shape (SEP-2322). ISO dates, so they compare as strings.
+ELICITATION_MIN_PROTOCOL_VERSION = "2026-07-28"
+
+
+class _UIExtensionClientSession(ClientSession):
+    """`ClientSession` that advertises the MCP Apps UI extension.
+
+    Drop-in for the SDK `ClientSession`: identical constructor and behavior,
+    except for two things.
+
+    **The UI extension.** `extensions["io.modelcontextprotocol/ui"]` is added
+    when the host flag is enabled. mcp 2.x builds the client capabilities from
+    `extensions` itself (`ClientSession._build_capabilities`), for the legacy
+    `initialize` handshake and for the per-request `_meta` envelope a
+    2026-07-28 connection carries instead. So adding the key here reaches
+    both kinds of server. Any `extensions` the caller passes (Strands' tasks
+    extension) are kept, so their `result_claims` still have an entry.
+
+    **No repeat probe of a legacy server.** Strands negotiates with mcp 2.x's
+    `negotiate_auto`, which sends `server/discover` first and falls back to
+    `initialize` when that is rejected: one wasted round trip per connect to a
+    pre-2026-07-28 server. When the read stream comes from `mcp_transport` it
+    names the server (`server_url`). A rejected probe followed by a successful
+    handshake records the server as legacy, and while that verdict is fresh
+    `send_discover` refuses locally (METHOD_NOT_FOUND), so `negotiate_auto`
+    goes straight to `initialize`. Not gated on the host flag: it changes
+    nothing a server can see except the missing probe.
+
+    **Form elicitation only, and only on 2026-07-28.** The SDK advertises
+    elicitation whenever a callback is set, and then always both `form` and
+    `url`. A client built with `elicitation_callback` (an opted-in server, see
+    `mcp_elicitation.py`) advertises `form` alone, and only on a connection
+    speaking 2026-07-28 or later, where a request is the stateless
+    `InputRequiredResult` that a pause and replay can serve. A legacy handshake
+    advertises nothing, exactly as without a callback. Without a callback the
+    SDK's own ad is returned unchanged.
+
+    The server's identity (`serverInfo`: name/title/icons) for the App header
+    is the session's own `server_info`, read by `_resolve_server_identity`.
     """
 
-    #: `serverInfo` (`Implementation`) captured off this session's
-    #: `initialize` result — the App header's source of truth for the server's
-    #: display name + icon (SEP-1865 header parity with Claude). Neither the
-    #: MCP SDK `ClientSession` nor Strands' `MCPClient` retains it (Strands
-    #: keeps only `instructions`), so we stash it here and `fetch_ui_resource`
-    #: reads it back via the client's `_background_thread_session`. None until
-    #: `initialize` returns.
-    _mcp_apps_server_info: Optional[Any] = None
+    def __init__(
+        self,
+        read_stream: Any = None,
+        *args: Any,
+        extensions: Optional[Dict[str, Dict[str, Any]]] = None,
+        **kwargs: Any,
+    ) -> None:
+        if is_mcp_apps_host_enabled():
+            extensions = dict(extensions or {})
+            extensions.setdefault(
+                MCP_APPS_UI_EXTENSION_KEY, dict(MCP_APPS_UI_CAPABILITY)
+            )
+        self._mcp_server_url: Optional[str] = getattr(read_stream, "server_url", None)
+        self._discover_rejected = False
+        super().__init__(read_stream, *args, extensions=extensions, **kwargs)
 
-    async def send_request(self, request: Any, *args: Any, **kwargs: Any) -> Any:
-        is_initialize = isinstance(
-            getattr(request, "root", None), mcp_types.InitializeRequest
+    def _build_capabilities(self, version: str) -> Any:
+        capabilities = super()._build_capabilities(version)
+        if capabilities.elicitation is None:
+            return capabilities
+        elicitation = (
+            ElicitationCapability(form=FormElicitationCapability())
+            if version >= ELICITATION_MIN_PROTOCOL_VERSION
+            else None
         )
-        if is_mcp_apps_host_enabled() and is_initialize:
-            try:
-                root = request.root
-                caps = root.params.capabilities
-                caps_data = caps.model_dump(by_alias=True, exclude_none=True)
-                extensions = dict(caps_data.get("extensions") or {})
-                extensions.setdefault(
-                    MCP_APPS_UI_EXTENSION_KEY, dict(MCP_APPS_UI_CAPABILITY)
-                )
-                caps_data["extensions"] = extensions
-                # `ClientCapabilities` is `extra="allow"`, so the extra
-                # `extensions` key round-trips through model_dump and onto
-                # the JSON-RPC wire in BaseSession.send_request.
-                root.params.capabilities = mcp_types.ClientCapabilities(
-                    **caps_data
-                )
-            except Exception:
-                # Advertising the extension must never break a connection;
-                # a server that never sees it simply won't return MCP Apps.
-                logger.warning(
-                    "failed to advertise MCP Apps UI extension on initialize; "
-                    "continuing without it",
-                    exc_info=True,
-                )
+        return capabilities.model_copy(update={"elicitation": elicitation})
 
-        result = await super().send_request(request, *args, **kwargs)
+    async def send_discover(self, version: str) -> Dict[str, Any]:
+        if is_known_legacy_server(self._mcp_server_url):
+            raise MCPError(
+                code=METHOD_NOT_FOUND,
+                message="server/discover skipped: this server took the legacy handshake",
+            )
+        try:
+            return await super().send_discover(version)
+        except MCPError as exc:
+            self._discover_rejected = _rejection_is_era_evidence(exc)
+            raise
 
-        # Capture the server's `Implementation` (name/title/icons) off the
-        # `initialize` response so the App header can show the server's
-        # identity. Best-effort: a missing/odd `serverInfo` just leaves the
-        # header to fall back to the `ui://` authority + a generic glyph.
-        if is_initialize:
-            self._mcp_apps_server_info = getattr(result, "serverInfo", None)
-
+    async def initialize(self) -> Any:
+        result = await super().initialize()
+        if self._discover_rejected:
+            remember_legacy_server(self._mcp_server_url)
         return result
+
+    def adopt(self, result: Any) -> None:
+        super().adopt(result)
+        if isinstance(result, DiscoverResult):
+            forget_legacy_server(self._mcp_server_url)
 
 
 def ensure_ui_extension_session_patch() -> None:
@@ -780,7 +888,7 @@ def _is_transient_connect_error(exc: BaseException) -> bool:
     return False
 
 
-class UICapableMCPClient(ReleasesCallsOnSessionEnd, MCPClient):
+class UICapableMCPClient(MCPClient):
     """`MCPClient` that records `_meta.ui` and hides app-only tools.
 
     Used for external MCP servers. Construction installs the `initialize`
@@ -799,6 +907,14 @@ class UICapableMCPClient(ReleasesCallsOnSessionEnd, MCPClient):
         self, *args: Any, server_url: Optional[str] = None, **kwargs: Any
     ) -> None:
         self.server_url = server_url
+        # True when this client was built with an elicitation callback (an
+        # opted-in server with MCP_ELICITATION_ENABLED on); the elicitation
+        # middleware handles only this client's tools.
+        self.elicitation_enabled: bool = kwargs.get("elicitation_callback") is not None
+        # Set by the integration that built this client when it carries one
+        # user's credential; partitions this client's `UIToolCatalog` entries
+        # to that user. None = shared client (see `UIToolCatalog`).
+        self.owner_user_id: Optional[str] = None
         ensure_ui_extension_session_patch()
         super().__init__(*args, **kwargs)
 

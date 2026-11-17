@@ -10,6 +10,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 KNOWN_BINDING_KINDS = ("knowledge_base", "tool", "skill")
 BindingKind = Literal["knowledge_base", "tool", "skill"]
 
+# How strictly an Agent grounds answers in its knowledge base (#112). ``balanced`` is
+# today's behavior and adds nothing to the prompt.
+ResponseStrictness = Literal["strict", "balanced", "flexible"]
+
 # Agent Marketplace Phase 1 (D2): the listing lifecycle. The transition table and the
 # sparse-index key derivation live in ``assistants.listing`` — this is only the wire type.
 # ``withdrawal_requested`` is a *live* state: the author has asked to pull the listing and an
@@ -318,6 +322,31 @@ class AgentVersion(BaseModel):
     bindings: Optional[List[AgentBinding]] = Field(
         None, description="Uniform primitive bindings (D3) as reviewed; absent ≠ empty (see class docstring)"
     )
+    response_strictness: ResponseStrictness = Field(
+        "balanced",
+        alias="responseStrictness",
+        description=(
+            "Knowledge-base grounding mode (#112) as reviewed. A version cut before the "
+            "field existed reads as ``balanced``, which is what every Agent ran then."
+        ),
+    )
+    voice_enabled: bool = Field(
+        False,
+        alias="voiceEnabled",
+        description=(
+            "Whether people can talk to the Agent in voice mode (#625), as reviewed. A "
+            "version cut before the field existed reads as ``False``: voice did not run "
+            "Agents then, so turning it on for a published Agent goes through review."
+        ),
+    )
+    voice_instructions_only: bool = Field(
+        True,
+        alias="voiceInstructionsOnly",
+        description=(
+            "In voice mode, use the Agent's instructions without the built-in voice "
+            "guidelines (#625), as reviewed."
+        ),
+    )
     category: Optional[str] = Field(
         None, description="Category id the reviewer approved this into; absent when the Agent carried no listing"
     )
@@ -410,6 +439,24 @@ class Assistant(BaseModel):
         description="Whether source documents may be downloaded from citations (#111); only meaningful when showCitations is True",
     )
 
+    response_strictness: ResponseStrictness = Field(
+        "balanced",
+        alias="responseStrictness",
+        description="How strictly answers stay within the knowledge base (#112)",
+    )
+
+    # Voice mode (#625). Off on every existing row (no backfill): an author opts an Agent
+    # in. ``voice_instructions_only`` leaves out the built-in voice guidelines, which can
+    # fight a role-play persona, so it defaults on.
+    voice_enabled: bool = Field(
+        False, alias="voiceEnabled", description="Whether people can talk to this Agent in voice mode (#625)"
+    )
+    voice_instructions_only: bool = Field(
+        True,
+        alias="voiceInstructionsOnly",
+        description="In voice mode, use only the Agent's instructions, without the built-in voice guidelines (#625)",
+    )
+
     # Agent Marketplace Phase 1: additive, optional, absent on every existing row. There
     # is no backfill — an absent ``listing`` IS the D3 default and means "never submitted".
     tagline: Optional[str] = Field(
@@ -462,6 +509,13 @@ class CreateAssistantRequest(BaseModel):
     allow_document_download: bool = Field(
         True, alias="allowDocumentDownload", description="Allow source-document download from citations (#111)"
     )
+    response_strictness: ResponseStrictness = Field(
+        "balanced", alias="responseStrictness", description="Knowledge-base grounding mode (#112)"
+    )
+    voice_enabled: bool = Field(False, alias="voiceEnabled", description="Available in voice mode (#625)")
+    voice_instructions_only: bool = Field(
+        True, alias="voiceInstructionsOnly", description="Voice uses only the Agent's instructions (#625)"
+    )
 
 
 class UpdateAssistantRequest(BaseModel):
@@ -488,6 +542,15 @@ class UpdateAssistantRequest(BaseModel):
     show_citations: Optional[bool] = Field(None, alias="showCitations", description="Stream/persist source citations (#111)")
     allow_document_download: Optional[bool] = Field(
         None, alias="allowDocumentDownload", description="Allow source-document download from citations (#111)"
+    )
+    response_strictness: Optional[ResponseStrictness] = Field(
+        None, alias="responseStrictness", description="Knowledge-base grounding mode (#112); None = unchanged"
+    )
+    voice_enabled: Optional[bool] = Field(
+        None, alias="voiceEnabled", description="Available in voice mode (#625); None = unchanged"
+    )
+    voice_instructions_only: Optional[bool] = Field(
+        None, alias="voiceInstructionsOnly", description="Voice uses only the Agent's instructions (#625); None = unchanged"
     )
 
 
@@ -517,6 +580,13 @@ class AssistantResponse(BaseModel):
     show_citations: bool = Field(True, alias="showCitations", description="Whether source citations are shown (#111)")
     allow_document_download: bool = Field(
         True, alias="allowDocumentDownload", description="Whether source documents may be downloaded from citations (#111)"
+    )
+    response_strictness: ResponseStrictness = Field(
+        "balanced", alias="responseStrictness", description="Knowledge-base grounding mode (#112)"
+    )
+    voice_enabled: bool = Field(False, alias="voiceEnabled", description="Available in voice mode (#625)")
+    voice_instructions_only: bool = Field(
+        True, alias="voiceInstructionsOnly", description="Voice uses only the Agent's instructions (#625)"
     )
 
     # Share metadata (only present for shared assistants)
@@ -623,6 +693,33 @@ class AgentRunnabilityResponse(BaseModel):
         default_factory=list, description="What the viewer cannot reach; empty when ready"
     )
 
+class AgentBoundSkill(BaseModel):
+    """One of an Agent's bound skills that will run for the requesting user.
+
+    Served by ``GET /agents/{id}/skills`` for the composer's ``/`` menu in an Agent
+    conversation. Carries the id (the menu keys rows by it), the display fields, and the
+    runtime's activation ``slug`` — the token the menu writes into the message and the
+    name the model reads in ``<available_skills>``. The slug is the backend's, never
+    re-derived client-side (``UserSkillResponse.slug`` says why).
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    skill_id: str = Field(..., alias="skillId")
+    display_name: str = Field(..., alias="displayName")
+    description: str
+    slug: str
+
+
+class AgentSkillsResponse(BaseModel):
+    """The Agent's bound skills resolved for the requesting user, in binding order."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    agent_id: str = Field(..., alias="agentId")
+    skills: List[AgentBoundSkill] = Field(default_factory=list)
+
+
 class AgentResponse(BaseModel):
     """Agent read-shape (D3) — the projection served by the ``/agents/*`` surface.
 
@@ -663,6 +760,13 @@ class AgentResponse(BaseModel):
     show_citations: bool = Field(True, alias="showCitations", description="Whether source citations are shown (#111)")
     allow_document_download: bool = Field(
         True, alias="allowDocumentDownload", description="Whether source documents may be downloaded from citations (#111)"
+    )
+    response_strictness: ResponseStrictness = Field(
+        "balanced", alias="responseStrictness", description="Knowledge-base grounding mode (#112)"
+    )
+    voice_enabled: bool = Field(False, alias="voiceEnabled", description="Available in voice mode (#625)")
+    voice_instructions_only: bool = Field(
+        True, alias="voiceInstructionsOnly", description="Voice uses only the Agent's instructions (#625)"
     )
 
     # Marketplace Phase 1. All three are ``None`` on an agent that has never been
@@ -770,7 +874,20 @@ class BindableListResponse(BaseModel):
 # may edit everything the store *renders*; an admin may never edit what the agent *does*
 # — that would make the reviewer responsible for behavior they did not write and cannot
 # test, and would silently break an Agent its author still maintains.
-BEHAVIOR_FIELDS = ("instructions", "bindings", "modelConfig", "model_settings", "starters", "visibility")
+BEHAVIOR_FIELDS = (
+    "instructions",
+    "bindings",
+    "modelConfig",
+    "model_settings",
+    "starters",
+    "visibility",
+    "responseStrictness",
+    "response_strictness",
+    "voiceEnabled",
+    "voice_enabled",
+    "voiceInstructionsOnly",
+    "voice_instructions_only",
+)
 
 # Presentation fields an admin may edit on someone else's listing (D13).
 ADMIN_EDITABLE_FIELDS = ("name", "tagline", "iconKey", "category", "publisherId")

@@ -1,0 +1,240 @@
+"""The ``HANDOFF#`` row and its states (``docs/specs/agent-handoffs-and-consults.md`` §4.1–§4.3).
+
+A handoff lives on its **source** session. Its states::
+
+    open ─┬─▶ running ⇄ needs_input
+          │      │  ╲       │
+          │      ▼   ▼      ▼
+          │    stopped ──▶ done      (stopped follows the target's next turn; done is frozen)
+          └─▶ dismissed
+
+``abandoned`` is never stored: an ``open`` row older than ``ABANDON_AFTER`` reads as abandoned,
+so no sweep job is needed.
+
+Status writes after acceptance happen after the target's ``done`` block (PR-0.2), which is why a
+``needs_input`` row can go straight to ``done`` or ``stopped``: the intermediate ``running`` is
+live state in the SPA, not a write. Once ``done``, the target conversation is the user's own and
+the row stops following it.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Dict, FrozenSet, List, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from apis.shared.sessions.models import PendingInterrupt
+
+HandoffKind = Literal["mention", "suggested", "send_back"]
+WaitingKind = Literal["oauth_consent", "tool_approval", "user_question", "browser_login"]
+HandoffStatus = Literal["open", "running", "needs_input", "done", "stopped", "dismissed"]
+EffectiveHandoffStatus = Literal["open", "running", "needs_input", "done", "stopped", "dismissed", "abandoned"]
+
+ABANDON_AFTER = timedelta(hours=24)
+#: What the user typed for the Agent, minus the mention.
+HANDOFF_REQUEST_MAX_CHARS = 20_000
+#: Display-only text on the row (titles, the live status line on replay).
+HANDOFF_DISPLAY_MAX_CHARS = 240
+
+#: Allowed moves, by the status being left. ``needs_input`` and ``stopped`` may rewrite
+#: themselves (a second pause with a new ``waitingOn``); ``running`` may not, because the move
+#: into it from ``open`` is acceptance and must happen once (``HandoffStore.accept``).
+TRANSITIONS: Dict[str, FrozenSet[str]] = {
+    "open": frozenset({"running", "dismissed"}),
+    "running": frozenset({"needs_input", "done", "stopped"}),
+    "needs_input": frozenset({"running", "needs_input", "done", "stopped"}),
+    "stopped": frozenset({"running", "needs_input", "done", "stopped"}),
+    "done": frozenset(),
+    "dismissed": frozenset(),
+}
+
+
+def sources_of(status: str) -> FrozenSet[str]:
+    """Every status a row may be in for a move to ``status`` to be allowed."""
+    return frozenset(src for src, targets in TRANSITIONS.items() if status in targets)
+
+
+class WaitingOn(BaseModel):
+    """What a ``needs_input`` handoff is waiting on: the interrupt kind and its display name.
+
+    ``name`` is the provider for a consent, the tool for an approval, the question's header for
+    ``ask_user_question``, and empty for a browser sign-in. Never request or conversation text.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    kind: WaitingKind
+    name: str = ""
+
+
+class RelayedPrompt(BaseModel):
+    """One prompt a paused target is waiting on, as its source thread relays it (§4.3, PR-0.3c).
+
+    A subset of the target's ``PendingInterrupt`` breadcrumb, in its wire names, so the SPA renders
+    it with the prompt it already has for that kind. Left out: the triggering message id (a target
+    message the source never shows) and a browser sign-in's session ref (the live view is the
+    target's screen; the relay only links there).
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    interrupt_id: str = Field(..., alias="interruptId")
+    kind: Literal["oauth", "tool_approval", "user_question", "browser_login"]
+    provider_id: Optional[str] = Field(None, alias="providerId")
+    tool_use_id: Optional[str] = Field(None, alias="toolUseId")
+    tool_name: Optional[str] = Field(None, alias="toolName")
+    tool_input: Optional[str] = Field(None, alias="toolInput", description="JSON-encoded, as on the breadcrumb")
+    message: Optional[str] = None
+    questions: Optional[str] = Field(None, description="JSON-encoded, as on the breadcrumb")
+
+    @classmethod
+    def from_interrupt(cls, interrupt: PendingInterrupt) -> "RelayedPrompt":
+        return cls(
+            interrupt_id=interrupt.interrupt_id,
+            kind=interrupt.kind,
+            provider_id=interrupt.provider_id,
+            tool_use_id=interrupt.tool_use_id,
+            tool_name=interrupt.tool_name,
+            tool_input=interrupt.tool_input,
+            message=interrupt.message,
+            questions=interrupt.questions,
+        )
+
+
+class TurnsCovered(BaseModel):
+    """The source turns an excerpt covers, counted over the whole conversation."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    first: int
+    last: int
+    of: int
+    omitted: int = 0
+
+
+class Handoff(BaseModel):
+    """One ``HANDOFF#<handoffId>`` row, keyed under its owner (``PK=USER#<userId>``)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    handoff_id: str = Field(..., alias="handoffId")
+    user_id: str = Field(..., alias="userId")
+    session_id: str = Field(..., alias="sessionId", description="The source conversation")
+    kind: HandoffKind
+    status: HandoffStatus = "open"
+    agent_id: str = Field(..., alias="agentId")
+    agent_name: str = Field("", alias="agentName")
+    request: str = ""
+    source_title: str = Field("", alias="sourceTitle", description="The title the wrapper names, fixed at create")
+    source_message_index: int = Field(
+        -1, alias="sourceMessageIndex", description="Index of the message the handoff row sits after; -1 for none"
+    )
+    excerpt_hash: Optional[str] = Field(None, alias="excerptHash")
+    excerpt_tokens: int = Field(0, alias="excerptTokens")
+    brief_hash: Optional[str] = Field(
+        None, alias="briefHash", description="Hash of the model-written brief, when one was written (spec §4.5.1)"
+    )
+    brief_tokens: Optional[int] = Field(None, alias="briefTokens")
+    brief_cache_status: Optional[str] = Field(
+        None, alias="briefCacheStatus", description="The brief call's cacheStatus on the source: hit, partial_miss or miss"
+    )
+    turns_covered: Optional[TurnsCovered] = Field(None, alias="turnsCovered")
+    source_project_id: Optional[str] = Field(
+        None,
+        alias="sourceProjectId",
+        description="Set when the source is a Shared Project task: no file crosses out of one (§4.9)",
+    )
+    created_at: str = Field(..., alias="createdAt")
+    updated_at: str = Field(..., alias="updatedAt")
+    target_session_id: Optional[str] = Field(None, alias="targetSessionId")
+    context_edited: Optional[bool] = Field(None, alias="contextEdited")
+    context_removed: Optional[bool] = Field(None, alias="contextRemoved")
+    status_line: Optional[str] = Field(None, alias="statusLine")
+    waiting_on: Optional[WaitingOn] = Field(None, alias="waitingOn")
+    stopped_reason: Optional[str] = Field(None, alias="stoppedReason")
+
+    def effective_status(self, now: Optional[datetime] = None) -> EffectiveHandoffStatus:
+        """The status as read: an ``open`` row past ``ABANDON_AFTER`` is ``abandoned``."""
+        if self.status != "open":
+            return self.status
+        try:
+            created = datetime.fromisoformat(self.created_at)
+        except ValueError:
+            return self.status
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if (now or datetime.now(timezone.utc)) - created >= ABANDON_AFTER:
+            return "abandoned"
+        return self.status
+
+
+class HandoffView(BaseModel):
+    """A row as the SPA reads it: the stored status with ``abandoned`` derived, and no storage-only fields.
+
+    Shared by app-api's ``GET /sessions/{id}/handoffs/{handoffId}`` and the ``handoffs`` replay on
+    ``GET /sessions/{id}/messages``, so the SPA parses one shape.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    handoff_id: str = Field(..., alias="handoffId")
+    session_id: str = Field(..., alias="sessionId")
+    kind: str
+    status: EffectiveHandoffStatus
+    agent_id: str = Field(..., alias="agentId")
+    agent_name: str = Field(..., alias="agentName")
+    request: str
+    source_message_index: int = Field(..., alias="sourceMessageIndex")
+    excerpt_tokens: int = Field(..., alias="excerptTokens")
+    turns_covered: Optional[TurnsCovered] = Field(None, alias="turnsCovered")
+    created_at: str = Field(..., alias="createdAt")
+    updated_at: str = Field(..., alias="updatedAt")
+    target_session_id: Optional[str] = Field(None, alias="targetSessionId")
+    status_line: Optional[str] = Field(None, alias="statusLine")
+    waiting_on: Optional[WaitingOn] = Field(None, alias="waitingOn")
+    stopped_reason: Optional[str] = Field(None, alias="stoppedReason")
+    relayed_prompts: Optional[List[RelayedPrompt]] = Field(
+        None,
+        alias="relayedPrompts",
+        description="A needs_input handoff's prompts, read from its target's breadcrumbs (apis.shared.handoff.relay)",
+    )
+
+    @classmethod
+    def from_row(cls, row: Handoff) -> "HandoffView":
+        return cls(
+            handoff_id=row.handoff_id,
+            session_id=row.session_id,
+            kind=row.kind,
+            status=row.effective_status(),
+            agent_id=row.agent_id,
+            agent_name=row.agent_name,
+            request=row.request,
+            source_message_index=row.source_message_index,
+            excerpt_tokens=row.excerpt_tokens,
+            turns_covered=row.turns_covered,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+            target_session_id=row.target_session_id,
+            status_line=row.status_line,
+            waiting_on=row.waiting_on,
+            stopped_reason=row.stopped_reason,
+        )
+
+
+__all__ = [
+    "ABANDON_AFTER",
+    "EffectiveHandoffStatus",
+    "HANDOFF_DISPLAY_MAX_CHARS",
+    "HANDOFF_REQUEST_MAX_CHARS",
+    "Handoff",
+    "HandoffView",
+    "HandoffKind",
+    "HandoffStatus",
+    "RelayedPrompt",
+    "TRANSITIONS",
+    "TurnsCovered",
+    "WaitingKind",
+    "WaitingOn",
+    "sources_of",
+]

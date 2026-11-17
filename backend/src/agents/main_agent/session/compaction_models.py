@@ -61,6 +61,15 @@ class CompactionState:
     # model id + agent id of the last turn; a change means the cached prefix
     # is already invalid, so a pending cut can ride the same re-write.
     last_prefix_key: Optional[str] = None
+    # Absolute message index from which the history ahead of a replayed
+    # reasoning block is unchanged since the block was produced: the history
+    # length at the head of the last turn that rewrote the prefix (a cut
+    # applied, an anchor advance, a document offload, a model or agent
+    # switch). Haiku 5.5 / Opus 5.5 bill only those blocks
+    # (``model_config.REASONING_REPLAY_BOUND``), so the cut's calibration
+    # prices the older ones at 0. Estimates only; nothing reads it to change
+    # a message. ``None`` (and legacy rows): nothing rewritten yet.
+    reasoning_live_from: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for DynamoDB storage."""
@@ -78,6 +87,7 @@ class CompactionState:
             "pendingHardCeiling": self.pending_hard_ceiling,
             "pendingSince": self.pending_since,
             "lastPrefixKey": self.last_prefix_key,
+            "reasoningLiveFrom": self.reasoning_live_from,
         }
 
     @classmethod
@@ -109,6 +119,9 @@ class CompactionState:
             ),
             pending_since=data.get("pendingSince"),
             last_prefix_key=data.get("lastPrefixKey"),
+            reasoning_live_from=(
+                int(data["reasoningLiveFrom"]) if data.get("reasoningLiveFrom") is not None else None
+            ),
         )
 
 
@@ -184,6 +197,9 @@ class CompactionConfig:
     # Paid-when-free scheduling (spec §3.5). Only meaningful with the
     # model-relative policy on; legacy mode always applies immediately.
     deferred_apply_enabled: bool = Defaults.COMPACTION_DEFERRED_APPLY_ENABLED
+    # Token bound on the protected tail (spec §3.2). A rollout switch: off
+    # keeps the last ``protected_turns`` turns whole whatever their size.
+    tail_token_bound_enabled: bool = Defaults.COMPACTION_TAIL_TOKEN_BOUND_ENABLED
 
     @classmethod
     def from_env(cls) -> "CompactionConfig":
@@ -205,4 +221,5 @@ class CompactionConfig:
             summary_model_id=os.environ.get(EnvVars.COMPACTION_SUMMARY_MODEL_ID, "").strip() or Defaults.COMPACTION_SUMMARY_MODEL_ID,
             summary_extract_enabled=compaction_summary_extract_enabled(),
             deferred_apply_enabled=_env_flag_default_on(EnvVars.COMPACTION_DEFERRED_APPLY_ENABLED),
+            tail_token_bound_enabled=_env_flag_default_on(EnvVars.COMPACTION_TAIL_TOKEN_BOUND_ENABLED),
         )

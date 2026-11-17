@@ -29,7 +29,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from apis.shared.auth.dependencies import get_current_user_from_session
 from apis.shared.auth.models import User
-from apis.shared.feature_flags import session_prewarm_enabled
+from apis.shared.feature_flags import session_fork_enabled, session_prewarm_enabled
+from apis.shared.observability.emf import emit_chat_stream_upstream_dropped
 from apis.shared.harness.runner import (
     apply_runtime_session_header,
     build_invocations_url,
@@ -46,6 +47,14 @@ def _inference_api_url() -> str:
 # Long enough to cover a full agent turn (model + tool calls), bounded so a
 # wedged upstream eventually surfaces.
 _PROXY_TIMEOUT_SECONDS = 300.0
+
+# Longest gap between bytes from the Runtime. The Runtime sends nothing while
+# the model is silent (Opus 5.5 thinks with no output by default), so this
+# must outlast the Runtime's own model read timeout (`RETRY_READ_TIMEOUT`,
+# 600s) by enough for its explained timeout error to arrive. Shorter, and the
+# proxy would cut the stream first and the user would lose the connection
+# instead (`test_read_timeout_budget.py`). Connect, write and pool keep 300s.
+_PROXY_READ_TIMEOUT_SECONDS = 660.0
 
 # SSE keepalive cadence. Two hops in front of this response cut an idle
 # connection at 60s — CloudFront's `OriginReadTimeout` and the ALB's
@@ -169,7 +178,9 @@ def _build_upstream_client() -> httpx.AsyncClient:
     monkey-patch the global `httpx.AsyncClient` symbol — which would also
     intercept any test-side httpx clients running in the same process.
     """
-    return httpx.AsyncClient(timeout=httpx.Timeout(_PROXY_TIMEOUT_SECONDS))
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(_PROXY_TIMEOUT_SECONDS, read=_PROXY_READ_TIMEOUT_SECONDS)
+    )
 
 
 async def chat_stream(
@@ -216,15 +227,30 @@ async def chat_stream(
     # otherwise relays verbatim. Read-only and best-effort: a body that isn't
     # JSON, or carries no session_id, simply goes unpinned rather than failing
     # the turn — schema validation still belongs to inference-api.
+    #
+    # A fork pins to the conversation its family started from instead
+    # (`affinity_session_id`, rewind/fork spec §7): its first turn starts from
+    # the parent's live history, which exists only in the parent's container,
+    # and later turns stay there so they never fall back to a stored copy that
+    # lacks the long-term-memory context the cached prefix was written with.
+    # Client-supplied and safe to be: the hash includes the user, so a body can
+    # only choose among that user's own containers, and the Runtime checks the
+    # fork relation on the session row before it uses anything it finds there.
     session_id: Optional[str] = None
+    affinity_id: Optional[str] = None
     try:
         parsed = json.loads(body)
         if isinstance(parsed, dict):
             raw = parsed.get("session_id")
             session_id = raw if isinstance(raw, str) and raw else None
+            pinned = parsed.get("affinity_session_id")
+            affinity_id = pinned if isinstance(pinned, str) and pinned else None
     except (ValueError, TypeError):
         logger.debug("chat proxy: body is not JSON; skipping runtime-session pinning")
-    apply_runtime_session_header(headers, session_id, current_user.user_id)
+    if affinity_id is not None and session_id is not None and session_fork_enabled():
+        apply_runtime_session_header(headers, affinity_id, current_user.user_id)
+    else:
+        apply_runtime_session_header(headers, session_id, current_user.user_id)
 
     # Forward OAuth2CallbackUrl when the SPA supplies it. Inference-api's
     # AgentCoreContextMiddleware reads this header to scope the on-tool
@@ -327,6 +353,7 @@ async def chat_stream(
             # goes uncovered — acceptable, since a frame is written upstream in
             # one go, and this is never worse than sending nothing at all.
             at_frame_boundary = True
+            last_chunk_at = time.monotonic()
             try:
                 while True:
                     if pending is None:
@@ -335,6 +362,29 @@ async def chat_stream(
                         chunk = await asyncio.wait_for(
                             asyncio.shield(pending), timeout=_SSE_KEEPALIVE_SECONDS
                         )
+                    except httpx.TransportError as exc:
+                        # The Runtime stream broke mid-turn: our read timeout,
+                        # or the connection closed under us. Counted
+                        # (`ChatStreamUpstreamDropped`, alarmed) and re-raised,
+                        # so the browser sees the same dropped connection as
+                        # before. A browser disconnect cancels this generator
+                        # instead, so it never lands here.
+                        pending = None
+                        silent_seconds = time.monotonic() - last_chunk_at
+                        logger.warning(
+                            "Runtime stream dropped mid-turn after %.0fs of silence "
+                            "(session %s): %s: %s",
+                            silent_seconds,
+                            session_id,
+                            type(exc).__name__,
+                            exc,
+                        )
+                        emit_chat_stream_upstream_dropped(
+                            reason=type(exc).__name__,
+                            silent_seconds=silent_seconds,
+                            session_id=session_id,
+                        )
+                        raise
                     except asyncio.TimeoutError:
                         if at_frame_boundary:
                             yield _SSE_KEEPALIVE_FRAME
@@ -347,6 +397,7 @@ async def chat_stream(
                         pending = None
                         return
                     pending = None  # consumed — safe to read the next one
+                    last_chunk_at = time.monotonic()
                     yield chunk
                     at_frame_boundary = chunk.endswith(b"\n\n")
             finally:
@@ -424,6 +475,9 @@ class PrewarmRequest(BaseModel):
     """The conversation to warm: the id the SPA will send its first turn with."""
 
     session_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    # A fork's turns run in its root conversation's microVM (see the chat
+    # proxy), so that is the one to warm.
+    affinity_session_id: Optional[str] = Field(None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
 
 
 class _PrewarmLedger:
@@ -528,10 +582,11 @@ async def chat_prewarm(
     if not runtime_session_affinity_enabled():
         return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content={"status": "skipped"})
 
-    outcome = _prewarm_ledger.admit(current_user.user_id, body.session_id, time.monotonic())
+    warm_id = body.affinity_session_id if body.affinity_session_id and session_fork_enabled() else body.session_id
+    outcome = _prewarm_ledger.admit(current_user.user_id, warm_id, time.monotonic())
     if outcome == "accepted":
         task = asyncio.create_task(
-            _forward_prewarm(body.session_id, current_user.user_id, current_user.raw_token)
+            _forward_prewarm(warm_id, current_user.user_id, current_user.raw_token)
         )
         _prewarm_tasks.add(task)
         task.add_done_callback(_prewarm_tasks.discard)

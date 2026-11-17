@@ -22,6 +22,11 @@ class ErrorCode(str, Enum):
     INTERNAL_ERROR = "internal_error"
     SERVICE_UNAVAILABLE = "service_unavailable"
     TIMEOUT = "timeout"
+    # The model provider (Bedrock, OpenAI, Gemini) failed on its side and the
+    # automatic retries were spent. Distinct from SERVICE_UNAVAILABLE, which
+    # is this platform's own outage: the SPA labels the fault as the
+    # provider's on this code and offers "Try again".
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
 
     # Agent-specific errors
     AGENT_ERROR = "agent_error"
@@ -176,6 +181,122 @@ def is_service_unavailable_error(error_lower: str) -> bool:
     return any(marker in error_lower for marker in _SERVICE_UNAVAILABLE_MARKERS)
 
 
+# Who runs a model, by `ModelProvider` value: (service the user can name, the
+# company whose side the fault is on). Bedrock Mantle and the Responses API
+# are both Amazon Bedrock surfaces, so an outage there is AWS's too.
+_PROVIDER_SERVICES: Dict[str, tuple] = {
+    "bedrock": ("Amazon Bedrock", "AWS"),
+    "bedrock-responses": ("Amazon Bedrock", "AWS"),
+    "mantle": ("Amazon Bedrock", "AWS"),
+    "openai": ("OpenAI", "OpenAI"),
+    "gemini": ("Google Gemini", "Google"),
+}
+
+
+def provider_unavailable_message(
+    model_name: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> str:
+    """The reply a user gets when the model provider failed and retries ran out.
+
+    The one copy for this case: the force-stop classifier in the agent's
+    stream_processor and ``build_conversational_error_event`` both produce it,
+    and the stream coordinator rebuilds it with the turn's model and provider
+    once it knows them.
+
+    It names the model and the service that runs it, says the fault is the
+    provider's and not this app's or the user's, and leaves the raw provider
+    error out: that text ("reached max retries: 1") read as if nothing had
+    been retried, and it stays in the logs and the event's ``detail``. The
+    copy says "this app" rather than a product name because other
+    organizations deploy this stack under their own.
+
+    Keeps the leading "⚠️": the coordinator passes a message with it through
+    unwrapped instead of adding a second generic header.
+
+    Args:
+        model_name: Display name of the turn's model, if known.
+        provider: The model's ``ModelProvider`` value, if known.
+    """
+    subject = model_name.strip() if model_name and model_name.strip() else "This model"
+    service = _PROVIDER_SERVICES.get((provider or "").lower())
+    if service:
+        name, owner = service
+        what_failed = (
+            f"{name}, the {owner} service that runs this model, returned a "
+            f"service error. This is a problem on {owner}'s side"
+        )
+    else:
+        what_failed = (
+            "The service that runs this model returned a service error. "
+            "This is a problem on the provider's side"
+        )
+    return (
+        f"⚠️ **{subject} isn't responding right now**\n\n"
+        f"{what_failed}, not with this app or your message. It was already "
+        "retried automatically.\n\n"
+        "Send your message again in a moment, or switch models if it keeps "
+        "happening."
+    )
+
+
+# The two wordings of a Bedrock read timeout (`RETRY_READ_TIMEOUT`). botocore
+# raises its own `ReadTimeoutError` ("Read timeout on endpoint URL: ...") when
+# the response never opens. Once the stream is open, botocore's `EventStream`
+# iterates the raw urllib3 stream unwrapped, so the error is urllib3's
+# ("AWSHTTPSConnectionPool(host=...): Read timed out."). The mid-stream form is
+# the one prod hits: Opus 5.5 thinks with `display: "omitted"` by default, which
+# sends no bytes while it reasons, and a long think on a large document ran
+# past the old 120s timeout about 5 times a day in prod in 2026-10.
+# It reached users as the raw "Agent force-stopped: ...: Read timed out."
+_BEFORE_STREAM_READ_TIMEOUT_MARKER = "read timeout on endpoint url"
+_MID_STREAM_READ_TIMEOUT_MARKER = "read timed out"
+
+
+def model_read_timeout_phase(error_lower: str) -> Optional[str]:
+    """Which kind of model read timeout a lowercased error string is, if any.
+
+    Returns ``"before_stream"`` (botocore's wording: the response never
+    opened), ``"mid_stream"`` (urllib3's: the stream opened, then went
+    silent), or ``None`` for anything else.
+
+    Args:
+        error_lower: The error text, ALREADY lowercased by the caller.
+    """
+    if _BEFORE_STREAM_READ_TIMEOUT_MARKER in error_lower:
+        return "before_stream"
+    if _MID_STREAM_READ_TIMEOUT_MARKER in error_lower:
+        return "mid_stream"
+    return None
+
+
+def is_model_read_timeout_error(error_lower: str) -> bool:
+    """Whether a lowercased error string is a model read timeout.
+
+    Args:
+        error_lower: The error text, ALREADY lowercased by the caller.
+    """
+    return model_read_timeout_phase(error_lower) is not None
+
+
+def model_read_timeout_message(raw: str) -> str:
+    """User-facing copy for a model read timeout.
+
+    Never retried (``TransientModelRetryStrategy`` excludes read timeouts:
+    a retry would sit through the same silence, bill the input again and
+    outlast app-api's proxy), so the copy does not claim a retry happened.
+    """
+    return (
+        "⚠️ The model didn't send anything for several minutes, so I stopped "
+        "waiting for it.\n\n"
+        f"> {raw}\n\n"
+        "This can happen when it is working through a very large request, "
+        "such as a long document or a request for everything at once, before "
+        "it starts writing. Send your message again, or ask for one part at a "
+        "time."
+    )
+
+
 # Bedrock's wording when a model rejects a content block it has no modality
 # for. Measured 2026-10-06 against `zai.glm-5` (a TEXT-only Converse model):
 # "This model doesn't support documents." for pdf and txt document blocks, and
@@ -298,7 +419,10 @@ Please wait a moment and try again."""
         # Not rendered as a chat bubble — the frontend shows a compact
         # inline "response length limit reached" notice + Continue button
         # off the stream_error signal. Kept concise for logs / payload.
-        message = "Response length limit reached."
+        message = (
+            "The answer was cut off at the model's output limit. "
+            "Continue picks up where it stopped."
+        )
 
     elif code == ErrorCode.STREAM_ERROR:
         if "accessdenied" in error_lower or "access denied" in error_lower:
@@ -349,13 +473,11 @@ Please try again."""
     # temporary. Reaching this point means the automatic retries were already
     # spent (see TransientModelRetryStrategy), so the copy says so.
     if is_service_unavailable_error(error_lower):
-        message = (
-            "⚠️ The model service is temporarily unavailable.\n\n"
-            f"> {error_str}\n\n"
-            "This is a problem on the AI provider's side, not with your "
-            "request — I already retried it a few times. Send your message "
-            "again in a moment, or switch models if it keeps happening."
-        )
+        message = provider_unavailable_message()
+        recoverable = True
+
+    if is_model_read_timeout_error(error_lower):
+        message = model_read_timeout_message(error_str)
         recoverable = True
 
     if "duplicate document name" in error_lower or "can't contain duplicate document" in error_lower:
@@ -376,6 +498,12 @@ Please try again."""
         message = unsupported
         recoverable = False
 
+    # Only while the outage copy survived the more specific checks above: a
+    # message they replaced is not a provider outage, and must not get the
+    # client's "Try again" row.
+    if message == provider_unavailable_message():
+        code = ErrorCode.PROVIDER_UNAVAILABLE
+
     metadata: Dict[str, Any] = {}
     if session_id:
         metadata["session_id"] = session_id
@@ -383,6 +511,8 @@ Please try again."""
         # Machine-readable hint so the frontend can offer a "Continue"
         # affordance without parsing the human-readable message.
         metadata["error_kind"] = "max_tokens"
+    if code == ErrorCode.PROVIDER_UNAVAILABLE:
+        metadata["error_kind"] = "provider_unavailable"
 
     return ConversationalErrorEvent(
         code=code,
