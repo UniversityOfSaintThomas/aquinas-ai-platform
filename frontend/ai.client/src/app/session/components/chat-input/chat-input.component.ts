@@ -34,8 +34,11 @@ import { ModelDropdownComponent } from '../../../components/model-dropdown/model
 import { AnnouncementBannerComponent } from '../../../components/announcement-banner/announcement-banner.component';
 import { QuotaWarningBannerComponent } from '../../../components/quota-warning-banner/quota-warning-banner.component';
 import { AgentNoticeBannerComponent } from '../agent-notice-banner/agent-notice-banner.component';
+import { ProjectFileReadinessComponent } from '../project-file-readiness/project-file-readiness.component';
 import { TooltipDirective } from '../../../components/tooltip';
 import { FileCardComponent } from '../../../components/file-card';
+import { ComposerAttachmentsComponent } from '../attachment-card/composer-attachments.component';
+import { ComposerFolderCardComponent } from '../attachment-card/composer-folder-card.component';
 import { StorageQuotaBannerComponent } from '../../../components/storage-quota-banner';
 import { SpinnerComponent } from '../../../components/spinner/spinner.component';
 import {
@@ -43,11 +46,15 @@ import {
   FileMetadata,
   PendingUpload,
   ALLOWED_EXTENSIONS,
+  AttachmentLimitsService,
   maxFileSizeFor,
-  MAX_FILES_PER_MESSAGE,
   formatBytes,
   resolveMimeTypeFor,
+  isPermanentUploadRefusal,
+  inlineBudgetOverflow,
+  type BudgetedAttachment,
 } from '../../../services/file-upload';
+import { InlineBudgetNoticeComponent } from './inline-budget-notice.component';
 import { FileSourceService } from '../../../assistants/services/file-source.service';
 import { FileSourceConnector, ImportFileRef } from '../../../assistants/models/file-source.model';
 import {
@@ -61,7 +68,6 @@ import {
   FolderAttachmentError,
   FolderAttachmentService,
   FolderRefreshService,
-  MAX_FOLDERS_PER_MESSAGE,
   isSettledStatus,
 } from '../../../services/folder-attachments';
 import { UserConnectorsService } from '../../../settings/connectors/services/user-connectors.service';
@@ -103,6 +109,7 @@ import {
 } from '../../../services/skill/skill-command.service';
 import { SkillCommandMenuComponent } from './skill-command-menu.component';
 import { SteeringService } from '../../services/chat/steering.service';
+import { ChatStateService } from '../../services/chat/chat-state.service';
 import { ComposerDraftService } from '../../services/session/composer-draft.service';
 import { SessionPrewarmService } from '../../services/session/session-prewarm.service';
 import {
@@ -113,6 +120,8 @@ import {
   StoredFolder,
 } from '../../services/session/composer-draft-storage.service';
 import { ComposerHandoffService } from './composer-handoff.service';
+import { IncognitoToggleComponent } from './incognito-toggle.component';
+import { IncognitoChatService } from '../../services/incognito';
 import { ComposerSegment, findHighlightRanges, toSegments } from './composer-highlights';
 
 // Must stay in sync with the min-height/max-height classes on the textarea in
@@ -212,6 +221,12 @@ interface Message {
    * message text, so it is always exactly what the thread will show.
    */
   invokedSkillIds?: string[];
+  /**
+   * How many characters of `content` were pasted rather than typed. A count only, sent so
+   * the turn's cost row can tell a large paste from context the server added
+   * (docs/one-pagers/idle-return-context.md). Absent when nothing was pasted.
+   */
+  pastedChars?: number;
 }
 
 /**
@@ -245,6 +260,8 @@ interface QueuedMessage {
   storedFolders?: StoredFolder[];
   mentionAgentId?: string;
   invokedSkillIds?: string[];
+  /** Characters of `content` that were pasted, counted when it was queued. */
+  pastedChars?: number;
   /**
    * True once the backend has confirmed this entry is armed against the
    * running turn, so it may land at the agent's next tool boundary rather than
@@ -272,7 +289,7 @@ interface MentionToken {
  * The composer holds restored attachments as `FileMetadata` — the card's own
  * server-side shape — so the template binds them directly instead of mapping
  * on every change detection pass. Only the four display fields are stored;
- * `s3Uri`, `createdAt` and `status` come back from the reconcile, and nothing
+ * `createdAt` and `status` come back from the reconcile, and nothing
  * reads them before it lands.
  */
 function toStoredAttachment(file: FileMetadata): StoredAttachment {
@@ -292,7 +309,6 @@ function toFileMetadata(attachment: StoredAttachment, sessionId: string): FileMe
     mimeType: attachment.mimeType,
     sizeBytes: attachment.sizeBytes,
     sessionId,
-    s3Uri: '',
     status: 'ready',
     createdAt: '',
   };
@@ -321,9 +337,16 @@ function dedupeAttachments(attachments: StoredAttachment[]): StoredAttachment[] 
   });
 }
 
+/**
+ * Shown in a project conversation whose harness binds no skills. A member's own
+ * skills are not offered there, so the one place a skill can come from is the
+ * project's Skills page, and the hint names it.
+ */
+export const PROJECT_SKILLS_HINT = "Skills for this project are chosen on its Skills page";
+
 @Component({
   selector: 'app-chat-input',
-  imports: [AgentNoticeBannerComponent, AnnouncementBannerComponent, CdkMenu, CdkMenuItem, CdkMenuTrigger, ComposerAddMenuComponent, ComposerScopePickerComponent, FormsModule, ModelDropdownComponent, NgIcon, QuotaWarningBannerComponent, StorageQuotaBannerComponent, TooltipDirective, FileCardComponent, FolderCardComponent, AgentMentionMenuComponent, SkillCommandMenuComponent, SpinnerComponent],
+  imports: [AgentNoticeBannerComponent, ProjectFileReadinessComponent, AnnouncementBannerComponent, CdkMenu, CdkMenuItem, CdkMenuTrigger, ComposerAddMenuComponent, ComposerScopePickerComponent, FormsModule, ModelDropdownComponent, NgIcon, QuotaWarningBannerComponent, StorageQuotaBannerComponent, TooltipDirective, FileCardComponent, ComposerAttachmentsComponent, ComposerFolderCardComponent, FolderCardComponent, AgentMentionMenuComponent, SkillCommandMenuComponent, SpinnerComponent, IncognitoToggleComponent, InlineBudgetNoticeComponent],
   // `relative` is the anchor the announcement banner floats against — it sits
   // `bottom-full` of this host, above the quota tabs and clear of the composer.
   host: { class: 'relative block' },
@@ -346,13 +369,27 @@ function dedupeAttachments(attachments: StoredAttachment[]): StoredAttachment[] 
 export class ChatInputComponent {
   // Service injection
   private readonly fileUploadService = inject(FileUploadService);
+  /** `GET /files/limits`, read at load; the built-in fallback until it answers. */
+  private readonly attachmentLimits = inject(AttachmentLimitsService);
+  /** Files one message may carry (served; the fallback says 5). */
+  protected readonly maxFilesPerMessage = this.attachmentLimits.filesPerMessage;
+  /** Folders one message may carry, while folder attachments are on. */
+  private readonly maxFoldersPerMessage = computed(() => this.attachmentLimits.limits().folders.perMessage ?? 0);
   private readonly fileSourceService = inject(FileSourceService);
   private readonly folderAttachments = inject(FolderAttachmentService);
   private readonly folderRefresh = inject(FolderRefreshService);
   private readonly features = inject(FEATURES);
+  /** The redesigned attachment cards (`features.attachmentCards`). */
+  protected readonly attachmentCards = this.features.attachmentCards;
   private readonly toastService = inject(ToastService);
   private readonly steering = inject(SteeringService);
+  private readonly chatState = inject(ChatStateService);
   private readonly sessionPrewarm = inject(SessionPrewarmService);
+  /**
+   * Characters pasted into the composer since the last send. Not state the
+   * template reads, so a plain field; reset when the text is emptied or sent.
+   */
+  private pastedChars = 0;
   private readonly composerDraft = inject(ComposerDraftService);
   private readonly draftStorage = inject(ComposerDraftStorageService);
   private readonly toolService = inject(ToolService);
@@ -387,6 +424,8 @@ export class ChatInputComponent {
   // Input: show voice mode toggle (defaults to true). Disabled where voice
   // is not meaningful, e.g. the assistant editor preview.
   readonly showVoiceControl = input<boolean>(true);
+  /** The conversation's Agent, sent with a voice connect so voice runs it (#625). */
+  readonly voiceAgentId = input<string | null>(null);
 
   // Input: show the Dictate (speech-to-text) button (defaults to true). Unlike
   // voice, dictation only fills this composer, so it stays on in the preview
@@ -461,11 +500,27 @@ export class ChatInputComponent {
   readonly showScopePicker = input<boolean>(false);
 
   /**
+   * Offer the incognito switch beside the model picker (#1738). Only the
+   * conversation page's empty state for a plain chat sets it: an Agent chat
+   * or a project task never writes to the user's memory anyway. Shown only
+   * while the account's memory mode is "on".
+   */
+  readonly offerIncognito = input<boolean>(false);
+  private readonly incognitoChat = inject(IncognitoChatService);
+  protected readonly incognitoOffered = computed(
+    () => this.offerIncognito() && !this.compact() && this.incognitoChat.available(),
+  );
+
+  /**
    * The project this conversation runs in, or null. Named in the placeholder:
    * a project task has no launch card, so the empty box is what says where
    * the first message goes.
    */
   readonly project = input<ComposerProject | null>(null);
+  /** The project whose file readiness shows above the composer, while that's switched on. */
+  protected readonly readinessProjectId = computed(() =>
+    this.features.projectFileReadiness ? (this.project()?.projectId ?? null) : null,
+  );
 
   /**
    * Whether `@` hands a turn to another Agent here. Never in a project: a
@@ -590,7 +645,7 @@ export class ChatInputComponent {
   readonly remainingFolderSlots = computed(() => {
     if (!this.features.folderAttachments || !this.allowFolderAttachments()) return 0;
     return Math.min(
-      Math.max(0, MAX_FOLDERS_PER_MESSAGE - this.attachedFolders().length),
+      Math.max(0, this.maxFoldersPerMessage() - this.attachedFolders().length),
       this.remainingFileSlots(),
     );
   });
@@ -638,6 +693,34 @@ export class ChatInputComponent {
     ]),
   ]);
 
+  /**
+   * The attachments this message's combined inline budget will leave out, or
+   * `null` while everything fits. Judged before send, in the order the send
+   * carries them (`attachmentIds`: restored, then this sitting's uploads), with
+   * the first-fit walk the backend runs. An upload still in flight counts, since
+   * it will travel; a failed one and an import without its metadata yet do not.
+   */
+  readonly budgetOverflow = computed(() => {
+    const seen = new Set<string>();
+    const attachments: BudgetedAttachment[] = [];
+    for (const file of this.restoredAttachments()) {
+      if (seen.has(file.uploadId)) continue;
+      seen.add(file.uploadId);
+      attachments.push({ id: file.uploadId, filename: file.filename, mimeType: file.mimeType, sizeBytes: file.sizeBytes });
+    }
+    for (const upload of this.pendingUploads()) {
+      if (upload.status === 'error' || seen.has(upload.uploadId)) continue;
+      seen.add(upload.uploadId);
+      attachments.push({
+        id: upload.uploadId,
+        filename: upload.file.name,
+        mimeType: upload.file.type,
+        sizeBytes: upload.file.size,
+      });
+    }
+    return inlineBudgetOverflow(attachments, this.attachmentLimits.limits());
+  });
+
   // Computed: show file attachments area
   readonly showFileAttachments = computed(
     () =>
@@ -651,7 +734,7 @@ export class ChatInputComponent {
   readonly remainingFileSlots = computed(() =>
     Math.max(
       0,
-      MAX_FILES_PER_MESSAGE -
+      this.maxFilesPerMessage() -
         this.pendingUploads().length -
         this.restoredAttachments().length -
         this.importingAttachments().length -
@@ -880,6 +963,11 @@ export class ChatInputComponent {
           ? "Type / to run one of this project's skills"
           : 'Type / to run one of your skills',
       );
+    } else if (this.showSkillCommands() && this.projectSkillsSettled()) {
+      // A project that binds no skills offers none, the member's own included — a
+      // skill written under Customize never reaches a project on its own. Say where
+      // it does, or the member who just wrote one is left looking for it here.
+      hints.push(PROJECT_SKILLS_HINT);
     }
     return hints;
   });
@@ -1185,17 +1273,40 @@ export class ChatInputComponent {
   });
 
   /**
+   * The conversation runs in a project whose harness dictates the skills. The `/` menu
+   * then speaks for the project: its rows are the project's skills, its empty state says
+   * where those are chosen, and its last row opens the project's Skills page rather than
+   * Customize, which cannot change a project.
+   */
+  readonly projectSkillsLocked = computed(
+    () => this.project() !== null && this.skillCommandService.agentLocked(),
+  );
+
+  /**
+   * The project's skills are locked *and* resolved for this member. An empty command
+   * list before that means "not here yet", not "none", so the empty-state hint and the
+   * menu that carries it wait for this rather than telling a member their project has
+   * no skills while the list is still on its way.
+   */
+  readonly projectSkillsSettled = computed(
+    () => this.projectSkillsLocked() && !this.skillCommandService.resolving(),
+  );
+
+  /**
    * The menu opens only when there is something to offer.
    *
    * `/` is far more common in prose than `@` — dates, fractions, "and/or", paths, URLs —
    * so the token rule below is what does the real work; this only stops an empty menu
-   * appearing for a user who has no skills switched on.
+   * appearing for a user who has no skills switched on. In a project the menu opens
+   * even with no skills bound, because then it has something to say: the empty state
+   * names the Skills page, which is the answer to "where did my skill go?" at the
+   * moment the question is asked.
    */
   readonly isSkillMenuOpen = computed(
     () =>
       this.showSkillCommands() &&
       this.skillToken() !== null &&
-      this.skillCommandService.commands().length > 0,
+      (this.skillCommandService.commands().length > 0 || this.projectSkillsSettled()),
   );
 
   readonly skillQuery = computed(() => this.skillToken()?.query ?? '');
@@ -1246,6 +1357,9 @@ export class ChatInputComponent {
   readonly isSkillMenuVisible = computed(() => this.isSkillMenuOpen() && !this.isMentionMenuOpen());
 
   constructor() {
+    // The composer judges drops against the fallback until this answers.
+    void this.attachmentLimits.load();
+
     // Walk the rotating hints once, then stop for good. The interval is torn
     // down the moment `rotateHints` goes false — the user typed, a turn
     // started, or the pass finished — so nothing ticks behind an idle tab's
@@ -1456,6 +1570,20 @@ export class ChatInputComponent {
       // so the hold is always bounded by an action the user already has.
       // See docs/specs/mid-turn-steering.md ("Paused turns").
       if (this.steering.shouldHoldQueue(this.sessionId())) return;
+      // A turn that ended in an error hands the queue back instead of
+      // sending it. What was typed while a failing turn sat silent ("is this
+      // working?", or the next request) was written against a turn the user
+      // now knows failed, and sending it the instant the error lands starts a
+      // new turn under the failed one's "Please try again" without the user
+      // choosing to. Worse, the first turn after a failure re-sends the failed
+      // turn's attachments, so the failed request quietly runs again with it.
+      // Back in the composer, Enter sends it — one deliberate step.
+      const sessionId = this.sessionId();
+      if (sessionId && untracked(() => this.chatState.stopReasonFor(sessionId)) === 'error') {
+        this.turnInFlight = false;
+        untracked(() => this.returnQueueToComposer());
+        return;
+      }
       const [next, ...rest] = untracked(() => this.queuedMessages());
       if (!next) return;
       // Consume the edge before emitting: the next message waits for the next
@@ -1473,6 +1601,7 @@ export class ChatInputComponent {
         folders: next.folders,
         mentionAgentId: next.mentionAgentId,
         invokedSkillIds: next.invokedSkillIds,
+        pastedChars: next.pastedChars,
       });
     });
 
@@ -1765,6 +1894,7 @@ export class ChatInputComponent {
       storedFolders: folders.length > 0 ? this.folderDraft() : undefined,
       mentionAgentId: this.mentionedAgent()?.agentId,
       invokedSkillIds: this.invokedSkillIds(),
+      pastedChars: this.takePastedChars(content),
     };
     this.queuedMessages.update(queue => [...queue, entry]);
 
@@ -1819,6 +1949,60 @@ export class ChatInputComponent {
     );
   }
 
+  /**
+   * Fold every queued follow-up back into the composer, ahead of what is being
+   * typed, in the order they were written — the same shape a reload restores
+   * them in (`adoptDraft`). Their attachments, folders and `@`-mention come
+   * back with them; a `/` skill command lives in the text, so it already does.
+   *
+   * Armed entries are included: arming only put them in the running turn's
+   * steering inbox, and that inbox was deleted with the turn's lease.
+   */
+  private returnQueueToComposer(): void {
+    const entries = this.queuedMessages();
+    if (entries.length === 0) return;
+    this.queuedMessages.set([]);
+
+    const text = [...entries.map(entry => entry.content), this.userInput()]
+      .map(part => part.trim())
+      .filter(part => !!part)
+      .join('\n\n');
+    this.userInput.set(text);
+    const textarea = this.messageInput()?.nativeElement;
+    if (textarea) textarea.value = text;
+    this.sizeTextareaTo(text);
+
+    const sessionId = this.sessionId() ?? '';
+    const files = entries
+      .flatMap(entry => entry.attachments ?? [])
+      .map(attachment => toFileMetadata(attachment, sessionId));
+    if (files.length > 0) {
+      for (const file of files) this.fileUploadService.registerKnownFile(file);
+      this.restoredAttachments.update(current => {
+        const held = new Set(current.map(file => file.uploadId));
+        return [...current, ...files.filter(file => !held.has(file.uploadId))];
+      });
+    }
+
+    const folders = entries.flatMap(entry => entry.storedFolders ?? []);
+    if (folders.length > 0) {
+      this.adoptFolders(dedupeFolders([...this.folderDraft(), ...folders]), sessionId);
+    }
+
+    if (!this.mentionedAgent() && !this.pendingMentionAgentId()) {
+      const mentionAgentId = entries.find(entry => entry.mentionAgentId)?.mentionAgentId;
+      if (mentionAgentId) {
+        this.pendingMentionAgentId.set(mentionAgentId);
+        void this.mentionService.load();
+      }
+    }
+
+    this.toastService.info(
+      'Follow-up not sent',
+      'The last response failed, so what you queued is back in the message box. Press Enter to send it.',
+    );
+  }
+
   /** Drop a pending follow-up before it is sent. */
   removeQueuedMessage(index: number): void {
     const entry = this.queuedMessages()[index];
@@ -1863,6 +2047,7 @@ export class ChatInputComponent {
       folders: folders.length > 0 ? folders : undefined,
       mentionAgentId: this.mentionedAgent()?.agentId,
       invokedSkillIds: this.invokedSkillIds(),
+      pastedChars: this.takePastedChars(content),
     });
 
     // Clear input and pending uploads. The mention clears with them: it belongs to the
@@ -1969,7 +2154,7 @@ export class ChatInputComponent {
       await this.voiceChatService.disconnect();
     } else {
       try {
-        await this.voiceChatService.connect(this.sessionId() || undefined);
+        await this.voiceChatService.connect(this.sessionId() || undefined, this.voiceAgentId());
       } catch (err) {
         this.toastService.error('Voice Error', describeAudioError(err, 'Failed to start voice'));
       }
@@ -2209,6 +2394,24 @@ export class ChatInputComponent {
     }
   }
 
+  /**
+   * Count what the user pastes. Only the length is kept — never the text — and
+   * the composer's own handling of the paste is untouched.
+   */
+  onTextareaPaste(event: ClipboardEvent): void {
+    this.pastedChars += event.clipboardData?.getData('text/plain').length ?? 0;
+  }
+
+  /**
+   * The paste count for a send of `content`, and reset it. Capped at the sent
+   * text's length: a paste the user then trimmed must not outgrow the message.
+   */
+  private takePastedChars(content: string): number | undefined {
+    const count = Math.min(this.pastedChars, content.length);
+    this.pastedChars = 0;
+    return count > 0 ? count : undefined;
+  }
+
   onTextareaInput(event: Event) {
     // First keystroke or paste in an existing conversation: start its Runtime
     // microVM while the user finishes typing (session prewarm). A no-op unless
@@ -2216,6 +2419,8 @@ export class ChatInputComponent {
     this.sessionPrewarm.noteTyping();
     this.settleHints();
     const textarea = event.target as HTMLTextAreaElement;
+    // Text cleared by hand: whatever was pasted into it is gone too.
+    if (!textarea.value) this.pastedChars = 0;
     this.userInput.set(textarea.value);
     this.dropStaleMention(textarea.value);
     this.autoResize(textarea);
@@ -2439,6 +2644,11 @@ export class ChatInputComponent {
   /** The menu's last row: Customize → Skills, which is where turning one on belongs. */
   onSkillBrowseAll(): void {
     this.closeSkillMenu();
+    const project = this.project();
+    if (project && this.skillCommandService.agentLocked()) {
+      void this.router.navigate(['/projects', project.projectId, 'skills']);
+      return;
+    }
     void this.router.navigate(['/customize/skills']);
   }
 
@@ -2714,12 +2924,14 @@ export class ChatInputComponent {
       return;
     }
 
-    // Check file count limit
-    const currentCount = this.pendingUploads().length;
-    if (currentCount + newFiles.length > MAX_FILES_PER_MESSAGE) {
+    // Check file count limit. Counts what `remainingFileSlots` counts
+    // (restored, importing and folder attachments too), so a drop and the
+    // composer's other add paths refuse the same sixth attachment.
+    const remaining = this.remainingFileSlots();
+    if (newFiles.length > remaining) {
       this.toastService.warning(
         'File Limit',
-        `Maximum ${MAX_FILES_PER_MESSAGE} files per message. You have ${currentCount} already attached.`
+        `Maximum ${this.maxFilesPerMessage()} files per message. You can add ${remaining} more.`
       );
       return;
     }
@@ -2745,11 +2957,11 @@ export class ChatInputComponent {
     for (const file of newFiles) {
       // Check file size (pptx and, behind the flag, large documents have
       // their own caps — see maxFileSizeFor)
-      const sizeLimit = maxFileSizeFor(file, this.features);
+      const sizeLimit = maxFileSizeFor(file, this.attachmentLimits.limits());
       if (file.size > sizeLimit) {
         this.toastService.error(
           'File Too Large',
-          `${file.name} exceeds maximum size of ${formatBytes(sizeLimit)}.`
+          `${file.name} is ${formatBytes(file.size)}. The maximum for this file type is ${formatBytes(sizeLimit)}.`
         );
         continue;
       }
@@ -2816,7 +3028,7 @@ export class ChatInputComponent {
     if (this.remainingFolderSlots() <= 0) {
       this.toastService.warning(
         'Folder limit',
-        `A message can carry ${MAX_FOLDERS_PER_MESSAGE} folders, and each counts as one of its ${MAX_FILES_PER_MESSAGE} attachments.`,
+        `A message can carry ${this.maxFoldersPerMessage()} folders, and each counts as one of its ${this.maxFilesPerMessage()} attachments.`,
       );
       return;
     }
@@ -3004,7 +3216,7 @@ export class ChatInputComponent {
     if (files.length > remaining) {
       this.toastService.warning(
         'File Limit',
-        `Maximum ${MAX_FILES_PER_MESSAGE} files per message. You can add ${remaining} more.`,
+        `Maximum ${this.maxFilesPerMessage()} files per message. You can add ${remaining} more.`,
       );
       return;
     }
@@ -3039,7 +3251,7 @@ export class ChatInputComponent {
       // Still wanted? A card removed mid-flight has nothing to report to.
       if (!this.importRequests.has(uploadId)) return;
       const message = err instanceof Error ? err.message : 'Could not add the file';
-      this.upsertImporting({ ...pending, status: 'error', error: message });
+      this.upsertImporting({ ...pending, status: 'error', error: message, permanent: isPermanentUploadRefusal(err) });
       return;
     }
 

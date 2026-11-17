@@ -65,7 +65,7 @@ CONTENT_BEARING: FrozenSet[str] = frozenset({
     # FILE# upload rows
     "filename",                       # user-chosen
     "s3Key",                          # embeds the filename
-    "s3Uri",
+    "s3Uri",                          # no longer written; rows from before keep it
     "digest.abstract",                # model-generated abstract of the document
     "digest.sections",                # heading text lifted from the document
 })
@@ -160,9 +160,31 @@ CALL_ROW_PROJECTION: Tuple[str, ...] = (
     "cacheGapSeconds",
     "cachePrefixGapSeconds",
     "wastedUsd",
+    # Present only when this call's usage was estimated rather than reported
+    # (an interrupted turn's cut generation): a field -> method map, closed
+    # vocabulary, no content. Without it a reader cannot tell a measured row
+    # from an estimated one, which is the whole point of writing it.
+    "usageEstimated",
     "agentSwitched",
     "modelSwitched",
+    "rewound",
+    "rewindEpoch",
+    "forkedFrom",
+    "forkSeeded",
     "turnAgentId",
+    # Which build of inference-api wrote the row: a version string and a
+    # content hash (docs/specs/release-ledger.md D1). No content.
+    "appVersion",
+    "build",
+    # How the call's turn ended (completed / paused / error / stopped /
+    # interrupted) and, on a completed turn's last row, `emptyAnswer: true`
+    # when its final call streamed no text (release-ledger spec §5.1). A
+    # closed vocabulary and a boolean, no content.
+    "outcome",
+    "emptyAnswer",
+    # Set on a call that is not a turn (a handoff brief): a closed vocabulary,
+    # no content. Absent on every turn's rows.
+    "callKind",
     "prefixFingerprints",
     "contextWindow",
     "toolCalls",            # per-call census, optional (PR-3)
@@ -186,6 +208,51 @@ CALL_ROW_PROJECTION: Tuple[str, ...] = (
     "documentSliceTokens",
     "documentMime",
     "documentReads",
+    # The turn's wall time, on its last row only: what tells one turn's calls
+    # from the next (release-ledger spec §5.1). A number.
+    "turnDurationMs",
+    # How the turn's attachments were delivered (``attachment_plan``): per file
+    # a mode, a class, a reason code, a token estimate and an upload id.
+    "attachmentPlan",
+    # Characters of the user's message the composer counted as pasted, on the
+    # turn's last row only. A number, never the text.
+    "pastedChars",
+)
+
+#: C# rows as the release ledger reads them (``apis.shared.sessions.ledger_rollups``):
+#: what the backfill scans and the only attributes ``ledger_updates`` reads, so a
+#: backfilled range and a live one add up the same way. ``sessionId`` and
+#: ``messageId`` are read only to tell a voice or api-converse call from a chat
+#: one, and are never written to a ledger row.
+LEDGER_ROW_PROJECTION: Tuple[str, ...] = (
+    "sessionId",
+    "messageId",
+    "timestamp",
+    "appVersion",
+    "build",
+    "callKind",
+    "modelInfo.modelId",
+    "modelInfo.pricingSnapshot.inputPricePerMtok",
+    "tokenUsage",
+    "cost",
+    "cacheStatus",
+    "wastedUsd",
+    "usageEstimated",
+    "agentSwitched",
+    "modelSwitched",
+    "turnAgentId",
+    "projectId",
+    "outcome",
+    "emptyAnswer",
+    "turnDurationMs",
+    "latency.timeToFirstToken",
+    "toolCalls",
+    "compactionEvents",
+    "hasDocuments",
+    "documentDigests",
+    "documentTokens",
+    "documentReads",
+    "ledgered",
 )
 
 #: FILE# rows for the session profile's attachment summary.
@@ -223,11 +290,20 @@ FEEDBACK_ROW_PROJECTION: Tuple[str, ...] = (
     "updatedAt",
 )
 
+#: SRCV# provenance rows as the release ledger's quality join reads them
+#: (``apis.shared.costs.ledger_provenance``): the session to join on, when, and
+#: each claim's verdict state. Never the claim's quote, value or filename,
+#: which carry the user's document; ``claims.state`` is requested per list
+#: index (``claims[i].state``) so nothing else of a claim leaves DynamoDB.
+PROVENANCE_STATE_PROJECTION: Tuple[str, ...] = ("sessionId", "createdAt", "claims.state")
+
 ALL_PROJECTIONS: Dict[str, Tuple[str, ...]] = {
     "SESSION_ROW_PROJECTION": SESSION_ROW_PROJECTION,
     "CALL_ROW_PROJECTION": CALL_ROW_PROJECTION,
+    "LEDGER_ROW_PROJECTION": LEDGER_ROW_PROJECTION,
     "FILE_ROW_PROJECTION": FILE_ROW_PROJECTION,
     "FEEDBACK_ROW_PROJECTION": FEEDBACK_ROW_PROJECTION,
+    "PROVENANCE_STATE_PROJECTION": PROVENANCE_STATE_PROJECTION,
 }
 
 

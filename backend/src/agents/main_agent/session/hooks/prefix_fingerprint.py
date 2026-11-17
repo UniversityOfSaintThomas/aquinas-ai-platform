@@ -11,7 +11,10 @@ On every ``BeforeModelCallEvent`` the hook computes:
 
 - ``toolConfigHash``: canonical JSON of the tool specs the model will see, in
   registration order (order-sensitive on purpose — order flips are a real
-  cache-buster).
+  cache-buster). Only the keys a formatter sends are hashed
+  (``model_facing_tool_specs``). An MCP tool's ``outputSchema`` and
+  ``annotations`` sit on the registered spec but never reach the request, so
+  hashing them would rotate the hash with no cache miss behind it.
 - ``systemPromptHash``: the effective system prompt. Fires after plugin
   injection (e.g. AgentSkills' ``<available_skills>`` block lands on
   ``BeforeInvocationEvent``), so nondeterministic skill ordering is visible
@@ -32,6 +35,7 @@ from typing import Any, Dict, List, Optional
 
 from strands.hooks import BeforeModelCallEvent, HookProvider, HookRegistry
 
+from apis.shared.models.tool_specs import model_facing_tool_specs
 from apis.shared.observability import fingerprint_canonical_json, fingerprint_text
 
 logger = logging.getLogger(__name__)
@@ -64,6 +68,29 @@ def get_prefix_fingerprint(agent: Any, index: Optional[int] = None) -> Optional[
     return None
 
 
+def compute_prefix_fingerprint(tool_specs: Any, system_prompt: Any, messages: List[Any]) -> Dict[str, Any]:
+    """The three prefix hashes for one model call's request, plus its message count.
+
+    The hook's computation, callable without a hook: a handoff brief (agent-handoffs-and-consults.md
+    §4.5.1) calls the model directly, runs no hooks, and records the same hashes so its ``C#`` row
+    can prove it reused the source turn's cache.
+    """
+    # System prompt may be a plain string or structured content blocks
+    # (SystemContentBlock list, used to place cache points).
+    if isinstance(system_prompt, str) or system_prompt is None:
+        system_hash = fingerprint_text(system_prompt)
+    else:
+        system_hash = fingerprint_canonical_json(system_prompt)
+    return {
+        "toolConfigHash": fingerprint_canonical_json(model_facing_tool_specs(tool_specs)),
+        "systemPromptHash": system_hash,
+        # History *prefix*: everything except the newest message. For
+        # a cache hit this must equal the previous call's full history.
+        "historyHash": fingerprint_canonical_json(messages[:-1]),
+        "messageCount": len(messages),
+    }
+
+
 class PrefixFingerprintHook(HookProvider):
     """Compute toolConfig / system-prompt / history hashes per model call."""
 
@@ -74,25 +101,11 @@ class PrefixFingerprintHook(HookProvider):
         try:
             agent = event.agent
 
-            tool_specs = agent.tool_registry.get_all_tool_specs()
-            system_prompt = getattr(agent, "system_prompt", None)
-            messages = list(getattr(agent, "messages", None) or [])
-
-            # System prompt may be a plain string or structured content blocks
-            # (SystemContentBlock list, used to place cache points).
-            if isinstance(system_prompt, str) or system_prompt is None:
-                system_hash = fingerprint_text(system_prompt)
-            else:
-                system_hash = fingerprint_canonical_json(system_prompt)
-
-            fingerprint = {
-                "toolConfigHash": fingerprint_canonical_json(tool_specs),
-                "systemPromptHash": system_hash,
-                # History *prefix*: everything except the newest message. For
-                # a cache hit this must equal the previous call's full history.
-                "historyHash": fingerprint_canonical_json(messages[:-1]),
-                "messageCount": len(messages),
-            }
+            fingerprint = compute_prefix_fingerprint(
+                agent.tool_registry.get_all_tool_specs(),
+                getattr(agent, "system_prompt", None),
+                list(getattr(agent, "messages", None) or []),
+            )
 
             fingerprints = getattr(agent, _FINGERPRINTS_ATTR, None)
             if fingerprints is None:

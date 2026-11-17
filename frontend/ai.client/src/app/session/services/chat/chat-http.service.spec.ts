@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { SessionAffinityService } from '../session/session-affinity.service';
 import { TestBed } from '@angular/core/testing';
 import { provideHttpClient } from '@angular/common/http';
 import { HttpTestingController, provideHttpClientTesting } from '@angular/common/http/testing';
@@ -12,13 +13,18 @@ import { ChatStateService } from './chat-state.service';
 import { MessageMapService } from '../session/message-map.service';
 import { ErrorService } from '../../../services/error/error.service';
 import { TurnTimingService } from './turn-timing.service';
+import { QuotaStatusService } from '../../../services/quota/quota-status.service';
+import { HandoffBriefService } from '../handoff/handoff-brief.service';
 
 describe('ChatHttpService', () => {
   let service: ChatHttpService;
   let httpMock: HttpTestingController;
   let chatStateService: any;
+  const handoffBrief = { isRunning: vi.fn().mockReturnValue(false), preempt: vi.fn().mockResolvedValue(undefined) };
 
   beforeEach(() => {
+    handoffBrief.isRunning.mockReset().mockReturnValue(false);
+    handoffBrief.preempt.mockReset().mockResolvedValue(undefined);
     TestBed.resetTestingModule();
     TestBed.configureTestingModule({
       providers: [
@@ -35,6 +41,8 @@ describe('ChatHttpService', () => {
         { provide: ChatStateService, useValue: { abortRequest: vi.fn(), setChatLoading: vi.fn(), setLastTurnInterrupted: vi.fn(), seedSessionAggregates: vi.fn(), createAbortController: vi.fn().mockReturnValue(new AbortController()), releaseAbortController: vi.fn(), streamingSessionIds: vi.fn().mockReturnValue([]) } },
         { provide: MessageMapService, useValue: { endStreaming: vi.fn() } },
         { provide: ErrorService, useValue: { handleHttpError: vi.fn(), addError: vi.fn() } },
+        { provide: QuotaStatusService, useValue: { reload: vi.fn() } },
+        { provide: HandoffBriefService, useValue: handoffBrief },
       ],
     });
     service = TestBed.inject(ChatHttpService);
@@ -49,6 +57,47 @@ describe('ChatHttpService', () => {
 
   it('should be created', () => {
     expect(service).toBeTruthy();
+  });
+
+  describe('a send while a handoff brief holds the lease', () => {
+    const streamResponse = () =>
+      new Response('event: done\ndata: {"type":"done"}\n\n', {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      });
+
+    it('stops the brief and waits for it to close before the turn goes out', async () => {
+      let releaseBrief!: () => void;
+      handoffBrief.isRunning.mockReturnValue(true);
+      handoffBrief.preempt.mockReturnValue(new Promise<void>((resolve) => (releaseBrief = resolve)));
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => streamResponse());
+
+      const sent = service.sendChatRequest({ session_id: 's1', message: 'next question' });
+      await Promise.resolve();
+
+      expect(handoffBrief.preempt).toHaveBeenCalledWith('s1');
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(chatStateService.createAbortController).not.toHaveBeenCalled();
+
+      releaseBrief();
+      await sent;
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(String(fetchSpy.mock.calls[0][0])).toBe('http://localhost:8000/chat/stream');
+      // Never the Stop path: no user_stopped interrupt, no interrupted chip.
+      expect(chatStateService.setLastTurnInterrupted).not.toHaveBeenCalled();
+      vi.restoreAllMocks();
+    });
+
+    it('adds nothing to a send with no brief in flight', async () => {
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => streamResponse());
+
+      await service.sendChatRequest({ session_id: 's1', message: 'hello' });
+
+      expect(handoffBrief.preempt).not.toHaveBeenCalled();
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      vi.restoreAllMocks();
+    });
   });
 
   it('should generate title', async () => {
@@ -168,6 +217,23 @@ describe('ChatHttpService', () => {
     vi.restoreAllMocks();
   });
 
+  it('re-reads the quota status when a turn ends, finished or stopped', async () => {
+    const quotaStatus = TestBed.inject(QuotaStatusService) as unknown as { reload: ReturnType<typeof vi.fn> };
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('event: done\ndata: {}\n\n', {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      }),
+    );
+    await service.sendChatRequest({ session_id: 's1', message: 'hi' });
+    expect(quotaStatus.reload).toHaveBeenCalledTimes(1);
+
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+    service.cancelChatRequest('s1');
+    expect(quotaStatus.reload).toHaveBeenCalledTimes(2);
+    vi.restoreAllMocks();
+  });
+
   it('sends the sign-in panel frame height on the chat request', async () => {
     // The backend sizes the browser sign-in handover from it (spec D3a); the
     // turn that asks for a sign-in can be any request, so every one carries it.
@@ -191,6 +257,23 @@ describe('ChatHttpService', () => {
     });
     // The caller's object is left as it was.
     expect(request).toEqual({ session_id: 's1', message: 'hi' });
+    vi.restoreAllMocks();
+  });
+
+  it("pins a fork's turn to its root conversation", async () => {
+    // Rewind/fork spec §7: a fork's turns run in the microVM where its root's
+    // live history (the cached prefix) is; app-api pins on this field.
+    TestBed.inject(SessionAffinityService).record('fork-1', 'root-1');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response('event: done\ndata: {}\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+    );
+
+    await service.sendChatRequest({ session_id: 'fork-1', message: 'hi' });
+    await service.sendChatRequest({ session_id: 'root-1', message: 'hi' });
+
+    const bodies = fetchSpy.mock.calls.map(([, init]) => JSON.parse(String((init as RequestInit).body)));
+    expect(bodies[0].affinity_session_id).toBe('root-1');
+    expect(bodies[1].affinity_session_id).toBeUndefined();
     vi.restoreAllMocks();
   });
 

@@ -9,7 +9,7 @@
 #   • Backend  — Python 3.13 (managed by uv) + uv 0.7.12, pytest, ruff, mypy, black
 #   • Frontend — Node.js 22 LTS + npm 11.2.0 + Angular CLI (project-local), Vitest
 #   • E2E      — Playwright 1.59.x runtime libs for chromium (browsers installed at runtime)
-#   • Infra    — AWS CDK 2.1128.0 (global) + project-local aws-cdk-lib via npm ci
+#   • Infra    — AWS CDK 2.1146.1 (global) + project-local aws-cdk-lib via npm ci
 #   • Cloud    — AWS CLI v2.34.40 (PGP-verified) + Docker CLI 29.4.3 (static)
 #
 # Reproducibility posture (matches existing backend/Dockerfile.* conventions):
@@ -106,7 +106,7 @@ ARG PYTHON_VERSION=3.13
 # AWS CDK CLI — global install. Pinned to match
 # infrastructure/package.json devDependencies.aws-cdk so cdk synth/deploy
 # behaves identically to a fresh `npm ci` in infrastructure/.
-ARG CDK_VERSION=2.1128.0
+ARG CDK_VERSION=2.1146.1
 
 # Non-root developer user. UID/GID 1000 matches the default first user on
 # most Linux desktops, so bind-mounted files retain correct ownership.
@@ -149,6 +149,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Pass 2 — Playwright 1.59.x runtime libs and fonts for chromium on
 #          Ubuntu 24.04, sourced from microsoft/playwright nativeDeps.ts
 #          (ubuntu24.04-x64 chromium + tools).
+#
+# No OS keyring is installed. `aps-tui` finds none here and keeps its
+# credentials in its own passphrase-encrypted file instead
+# (tui/src/aps_tui/credential_file.py), so the container needs no D-Bus
+# session bus, gnome-keyring daemon or per-start unlock script.
 # -----------------------------------------------------------------------------
 RUN set -eux; \
     apt-get update; \
@@ -367,6 +372,7 @@ RUN set -eux; \
       echo 'fi'; \
       echo 'export PS1="\\[\\033[01;32m\\]\\u@devcontainer\\[\\033[00m\\]:\\[\\033[01;34m\\]\\w\\[\\033[00m\\]\\$ "'; \
     } >> "/home/${USERNAME}/.bashrc"
+
 
 # -----------------------------------------------------------------------------
 # Image labels

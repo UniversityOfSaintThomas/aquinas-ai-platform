@@ -14,6 +14,7 @@ import { SyncPolicyService } from '../../assistants/services/sync-policy.service
 import { UserConnectorsService } from '../../settings/connectors/services/user-connectors.service';
 import { OAuthConsentService } from '../../services/oauth-consent/oauth-consent.service';
 import { ToastService } from '../../services/toast/toast.service';
+import { BackgroundTaskService } from '../../services/background-tasks/background-task.service';
 import { WebSourceDialogComponent } from '../../assistants/components/web-source-dialog.component';
 import { FileSourceBrowserDialogComponent } from '../../assistants/components/file-source-browser-dialog.component';
 import { ExtractedContentDialogComponent } from '../../assistants/components/extracted-content-dialog.component';
@@ -66,7 +67,7 @@ describe('ProjectFilesComponent', () => {
     acknowledgeCompletion: vi.fn(),
     startUserConsent: vi.fn(),
   };
-  const toast = { success: vi.fn(), error: vi.fn() };
+  const toast = { success: vi.fn(), error: vi.fn(), warning: vi.fn(), info: vi.fn() };
 
   beforeEach(() => {
     TestBed.resetTestingModule();
@@ -177,14 +178,43 @@ describe('ProjectFilesComponent', () => {
     expect(el.querySelector('[role=status]')?.textContent).toContain('Upload failed');
   });
 
-  it('refuses a file over the limit before asking the server', async () => {
+  it('refuses a file over the API’s limit before asking the server', async () => {
+    api.files.mockReturnValue(of({
+      documents: [doc('a')], nextToken: null, canEdit: true,
+      kbUsage: { engine: 'managed', storedBytes: 0, reservedBytes: 0, cap: 100 * 1024 * 1024, elevated: false, maxFileBytes: 50 * 1024 * 1024 },
+    }));
     const { fixture, el, component } = await render();
     const big = new File(['x'], 'huge.pdf');
-    Object.defineProperty(big, 'size', { value: 11 * 1024 * 1024 });
+    Object.defineProperty(big, 'size', { value: 51 * 1024 * 1024 });
     await pick(component, [big]);
     fixture.detectChanges();
     expect(api.fileUploadUrl).not.toHaveBeenCalled();
-    expect(el.textContent).toContain('Files can be up to 10 MB');
+    expect(el.textContent).toContain('Files can be up to 50 MB. This one is 51 MB.');
+  });
+
+  it('sends a file the old 10 MB limit refused when the API allows it', async () => {
+    api.files.mockReturnValue(of({
+      documents: [doc('a')], nextToken: null, canEdit: true,
+      kbUsage: { engine: 'managed', storedBytes: 0, reservedBytes: 0, cap: 100 * 1024 * 1024, elevated: false, maxFileBytes: 50 * 1024 * 1024 },
+    }));
+    api.fileUploadUrl.mockReturnValue(throwError(() => new HttpErrorResponse({ status: 503 })));
+    const { component } = await render();
+    const file = new File(['x'], 'report.pdf');
+    Object.defineProperty(file, 'size', { value: 30 * 1024 * 1024 });
+    await pick(component, [file]);
+    expect(api.fileUploadUrl).toHaveBeenCalled();
+  });
+
+  it('shows the server’s sentence when it refuses a file over the limit', async () => {
+    api.fileUploadUrl.mockReturnValue(
+      throwError(() => new HttpErrorResponse({ status: 413, error: { detail: 'Files can be up to 50 MB. This one is 60 MB.' } })),
+    );
+    const { fixture, el, component } = await render();
+    const big = new File(['x'], 'huge.pdf');
+    Object.defineProperty(big, 'size', { value: 60 * 1024 * 1024 });
+    await pick(component, [big]);
+    fixture.detectChanges();
+    expect(el.textContent).toContain('Files can be up to 50 MB. This one is 60 MB.');
   });
 
   it('shows the API’s sentence when the upload is refused (archived)', async () => {
@@ -219,6 +249,66 @@ describe('ProjectFilesComponent', () => {
     expect(el.textContent).toContain('Ready');
     expect(api.file).toHaveBeenCalledTimes(2);
     expect(api.file).toHaveBeenCalledWith('prj_1', 'p');
+  });
+
+  describe('a file that takes a while', () => {
+    let visibility: DocumentVisibilityState;
+
+    beforeEach(() => {
+      visibility = 'visible';
+      vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => visibility);
+    });
+
+    const setVisibility = (next: DocumentVisibilityState) => {
+      visibility = next;
+      document.dispatchEvent(new Event('visibilitychange'));
+    };
+
+    const mount = async () => {
+      const fixture = TestBed.createComponent(ProjectFilesComponent);
+      fixture.componentRef.setInput('project', PROJECT);
+      fixture.detectChanges();
+      await vi.advanceTimersByTimeAsync(0);
+      fixture.detectChanges();
+      return { fixture, el: fixture.nativeElement as HTMLElement };
+    };
+
+    it('is still polled after five minutes, and shows Ready when it gets there', async () => {
+      // Prod, 2026-11-03: a new project's first files waited ~14 minutes for their
+      // knowledge base, and the page stopped polling at 5, stuck on "Setting up".
+      vi.useFakeTimers();
+      api.files.mockReturnValue(of({ documents: [doc('p', { status: 'provisioning' })], nextToken: null, canEdit: true }));
+      let ready = false;
+      api.file.mockImplementation(() => of(doc('p', { status: ready ? 'complete' : 'provisioning' })));
+      const { fixture, el } = await mount();
+      expect(el.textContent).toContain('Setting up');
+
+      await vi.advanceTimersByTimeAsync(14 * 60 * 1000);
+      ready = true;
+      await vi.advanceTimersByTimeAsync(10_000);
+      fixture.detectChanges();
+      expect(el.textContent).toContain('Ready');
+    });
+
+    it('asks nothing while the tab is hidden, and resumes when it is back', async () => {
+      vi.useFakeTimers();
+      api.files.mockReturnValue(of({ documents: [doc('p', { status: 'provisioning' })], nextToken: null, canEdit: true }));
+      api.file.mockReturnValue(of(doc('p', { status: 'provisioning' })));
+      const { fixture, el } = await mount();
+
+      setVisibility('hidden');
+      api.file.mockClear();
+      // Long enough for the poll to run out entirely while nobody is looking.
+      await vi.advanceTimersByTimeAsync(30 * 60 * 1000);
+      expect(api.file).not.toHaveBeenCalled();
+
+      api.file.mockReturnValue(of(doc('p', { status: 'complete' })));
+      setVisibility('visible');
+      await vi.advanceTimersByTimeAsync(1000);
+      fixture.detectChanges();
+      expect(api.file).toHaveBeenCalledWith('prj_1', 'p');
+      expect(el.textContent).toContain('Ready');
+    });
   });
 
   it('deletes after confirmation', async () => {
@@ -505,5 +595,179 @@ describe('ProjectFilesComponent', () => {
     expect(formatBytes(0)).toBe('0 B');
     expect(formatBytes(2048)).toBe('2 KB');
     expect(formatBytes(10 * 1024 * 1024)).toBe('10 MB');
+  });
+
+  // ---- replace with a newer version ----
+
+  describe('replacing a file', () => {
+    const replaceButton = (el: HTMLElement, name: string) =>
+      el.querySelector<HTMLButtonElement>(`button[aria-label="Replace ${name}"]`);
+    const rows = (el: HTMLElement) => Array.from(el.querySelectorAll('li')).map(li => li.textContent ?? '');
+    const v2 = () => new File(['v2!'], 'A-v2.PDF', { type: 'application/pdf' });
+
+    function pickReplacement(component: any, target: ProjectDocument, file: File): Promise<void> {
+      component.startReplace(target);
+      return component.onReplacePicked({ target: { files: [file], value: 'x' } } as unknown as Event);
+    }
+
+    beforeEach(() => {
+      api.fileUploadUrl.mockReturnValue(of({ documentId: 'new', uploadUrl: 'https://s3/put', expiresIn: 60, notice: NOTICE }));
+      api.deleteFile.mockReturnValue(of(undefined));
+      api.reportFileUploadFailure.mockReturnValue(of(undefined));
+      documents.uploadToS3.mockResolvedValue(undefined);
+    });
+
+    it('offers Replace to editors on settled uploaded files only', async () => {
+      api.file.mockReturnValue(of(doc('c', { status: 'chunking' })));
+      api.files.mockReturnValue(of({
+        documents: [
+          doc('a'),
+          doc('f', { status: 'failed' }),
+          doc('c', { status: 'chunking' }),
+          drive,
+          doc('w', { filename: 'Catalog', sourceConnectorId: 'web', sourceFileId: 'https://x.edu/' }),
+        ],
+        nextToken: null,
+        canEdit: true,
+      }));
+      const { el } = await render();
+      expect(replaceButton(el, 'a.pdf')).not.toBeNull();
+      expect(replaceButton(el, 'f.pdf')).not.toBeNull();
+      expect(replaceButton(el, 'c.pdf')).toBeNull();
+      expect(replaceButton(el, 'Roster')).toBeNull();
+      expect(replaceButton(el, 'Catalog')).toBeNull();
+      expect(el.querySelector('select[aria-label="Auto-sync schedule for Roster"]')).not.toBeNull();
+    });
+
+    it('hides Replace from viewers', async () => {
+      api.files.mockReturnValue(of({ documents: [doc('a')], nextToken: null, canEdit: false }));
+      const { el } = await render({ ...PROJECT, role: 'viewer' });
+      expect(replaceButton(el, 'a.pdf')).toBeNull();
+    });
+
+    it('uploads under the original name and deletes the original once the new one is ready', async () => {
+      const { fixture, el, component } = await render();
+      vi.useFakeTimers();
+      api.file.mockReturnValue(of(doc('new', { filename: 'a.pdf', status: 'complete' })));
+      const file = v2();
+
+      const running = pickReplacement(component, doc('a'), file);
+      await vi.advanceTimersByTimeAsync(1000);
+      await running;
+      fixture.detectChanges();
+
+      expect(api.fileUploadUrl).toHaveBeenCalledWith('prj_1', { filename: 'a.pdf', contentType: 'application/pdf', sizeBytes: file.size });
+      expect(documents.uploadToS3.mock.calls[0][1].name).toBe('a.pdf');
+      expect(api.deleteFile).toHaveBeenCalledWith('prj_1', 'a');
+      expect(api.deleteFile.mock.invocationCallOrder[0]).toBeGreaterThan(api.file.mock.invocationCallOrder[0]);
+      const texts = rows(el);
+      expect(texts).toHaveLength(2);
+      expect(texts.some(t => t.includes('a.pdf'))).toBe(true);
+      expect(texts.some(t => t.includes('b.pdf'))).toBe(true);
+      expect(toast.success).toHaveBeenCalled();
+    });
+
+    it('still deletes the original when a reload during the upload sees the new file', async () => {
+      const { component } = await render();
+      vi.useFakeTimers();
+      let finishUpload!: () => void;
+      documents.uploadToS3.mockReturnValue(new Promise<void>(resolve => (finishUpload = resolve)));
+
+      const running = pickReplacement(component, doc('a'), v2());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(documents.uploadToS3).toHaveBeenCalled();
+
+      // A crawl-watcher tick mid-upload lists the new file while it is still uploading.
+      api.files.mockReturnValue(of({
+        documents: [doc('a'), doc('b'), doc('new', { filename: 'a.pdf', status: 'uploading' })],
+        nextToken: null,
+        canEdit: true,
+      }));
+      api.file.mockReturnValue(of(doc('new', { filename: 'a.pdf', status: 'uploading' })));
+      await component.load('prj_1', null);
+      // A poll that got in before the replace knew the new id: the replace takes it over.
+      void component.poll('new');
+      await vi.advanceTimersByTimeAsync(0);
+
+      api.file.mockReturnValue(of(doc('new', { filename: 'a.pdf', status: 'complete' })));
+      finishUpload();
+      await vi.advanceTimersByTimeAsync(1000);
+      await running;
+
+      expect(api.deleteFile).toHaveBeenCalledWith('prj_1', 'a');
+      expect(toast.success).toHaveBeenCalled();
+      expect(toast.warning).not.toHaveBeenCalled();
+    });
+
+    it('keeps the original when the new version fails, with the failed row right after it', async () => {
+      const { fixture, el, component } = await render();
+      vi.useFakeTimers();
+      api.file.mockReturnValue(of(doc('new', { filename: 'a.pdf', status: 'failed', errorMessage: 'Parse error' })));
+
+      const running = pickReplacement(component, doc('a'), v2());
+      await vi.advanceTimersByTimeAsync(1000);
+      await running;
+      fixture.detectChanges();
+
+      expect(api.deleteFile).not.toHaveBeenCalled();
+      expect(toast.error).toHaveBeenCalledTimes(1);
+      const texts = rows(el);
+      expect(texts).toHaveLength(3);
+      expect(texts[0]).toContain('a.pdf');
+      expect(texts[0]).not.toContain('Parse error');
+      expect(texts[1]).toContain('Parse error');
+      expect(texts[1]).toContain('New version of the file above');
+      expect(texts[2]).toContain('b.pdf');
+    });
+
+    it('asks before removing the original when the byte cap has no room', async () => {
+      api.fileUploadUrl.mockReturnValue(throwError(() => new HttpErrorResponse({ status: 413, error: { detail: 'over cap' } })));
+      dialog.open.mockReturnValue({ closed: of(false) });
+      const { component } = await render();
+
+      await pickReplacement(component, doc('a'), v2());
+
+      expect(dialog.open).toHaveBeenCalledTimes(1);
+      expect(dialog.open.mock.calls[0][1].data.destructive).toBe(true);
+      expect(dialog.open.mock.calls[0][1].data.message).toContain('over cap');
+      expect(api.deleteFile).not.toHaveBeenCalled();
+      expect(documents.uploadToS3).not.toHaveBeenCalled();
+    });
+
+    it('refuses a file of a different type without asking the server', async () => {
+      const { component } = await render();
+      await pickReplacement(component, doc('a'), new File(['x'], 'a.docx'));
+      expect(api.fileUploadUrl).not.toHaveBeenCalled();
+      expect(toast.error).toHaveBeenCalledTimes(1);
+    });
+
+    it('warns to keep the tab open while replacing, and clears the warning after', async () => {
+      const { fixture, el, component } = await render();
+      const tasks = TestBed.inject(BackgroundTaskService);
+      let finishUpload!: () => void;
+      documents.uploadToS3.mockReturnValue(new Promise<void>(resolve => (finishUpload = resolve)));
+      api.file.mockReturnValue(of(doc('new', { filename: 'a.pdf', status: 'complete' })));
+      const unloadAllowed = () => window.dispatchEvent(new Event('beforeunload', { cancelable: true }));
+
+      const running = pickReplacement(component, doc('a'), v2());
+      await vi.waitFor(() => expect(documents.uploadToS3).toHaveBeenCalled());
+      fixture.detectChanges();
+
+      expect(tasks.tasks()).toHaveLength(1);
+      expect(replaceButton(el, 'a.pdf')?.disabled).toBe(true);
+      expect(replaceButton(el, 'b.pdf')?.disabled).toBe(true);
+      expect(el.querySelector<HTMLButtonElement>('button[aria-label="Delete a.pdf"]')?.disabled).toBe(true);
+      expect(el.textContent).toContain('Replacing…');
+      expect(unloadAllowed()).toBe(false);
+
+      vi.useFakeTimers();
+      finishUpload();
+      await vi.advanceTimersByTimeAsync(1000);
+      await running;
+      fixture.detectChanges();
+      expect(tasks.tasks()).toHaveLength(0);
+      expect(unloadAllowed()).toBe(true);
+      expect(el.textContent).not.toContain('Replacing…');
+    });
   });
 });

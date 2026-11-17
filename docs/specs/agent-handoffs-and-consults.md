@@ -26,6 +26,22 @@ in the background (§4.3, "Relayed prompts"). The prompt still belongs to the ta
 platform from the pending interrupt, not by a model, and it never enters the source's model history. Separately, a
 delivery can now carry **artifact references** as well as text, so a result that is an artifact (a rubric, a
 report) can come back as itself rather than as a paragraph about it (§4.8, "Artifacts on a delivery").
+**Amendment (2026-10-22): a model-written brief, from the source's own prompt cache.** The context card is no longer
+the conversation's tail copied verbatim. When the review sheet opens, the **source conversation's own model** writes a
+brief aimed at the request: what is being asked and why, the background that matters, decisions and constraints so
+far, files and artifacts in play, and open questions. It writes it **from the source's cached prefix**: the request
+is the source's last turn, byte for byte, with one instruction appended. So the history it reads is billed at the
+cache-read rate (0.1× on our models) rather than re-sent, and nothing is written back to the source (§4.5). The
+deterministic excerpt stays as the fallback. PR-0.1, PR-0.2 and PR-0.3 (merged) use the excerpt;
+this changes what fills the card, not how a handoff is sent or accepted.
+**Amendment (2026-11-08): files by reference, the linked workspace.** Linked conversations now share files as
+well as text and artifacts. A file stays in the conversation that made it, and the receiving conversation gets a
+**reference row** in the user-files table that points at it. That row is read-only, counts against no quota and
+never deletes bytes. The existing file tools read it with no change, and the model sees one `<file …/>` line in
+the wrapper. Files go out on the review sheet and come back on a delivery, and in both directions the user chooses
+what crosses. No bytes are copied, and none enter a prompt. Strands' Swarm `SharedContext` was considered and is
+not used, because it lasts one in-process run and is written into every prompt. The design keeps the shape of
+Strands' sandbox instead: the workspace is an environment, and sharing it is a deliberate choice (§4.9).
 **Targets branch:** `develop`
 **Related:**
 - `docs/specs/agent-marketplace.md` §D11 — the 2026-09-14 revision that made a mention *bind* (#1115)
@@ -36,6 +52,7 @@ report) can come back as itself rather than as a paragraph about it (§4.8, "Art
 - `docs/specs/ask-user-question.md` — the model for a constant, kill-switched tool spec in `toolConfig`
 - `docs/specs/scheduled-agent-runs.md` — the headless run entrypoint (F1) and the unread dot
 - `CLAUDE.md` — prompt-cache contract, token cost tenet, "one session can be served by more than one agent"
+- `docs/specs/session-workspace-tools.md` — the user-files table as the file substrate, user-scoped reads and session-scoped writes, which §4.9 builds on
 - `docs/specs/multi-agent-patterns.md` — brainstorm: how Agents as Tools, Swarm, Graph, Workflow and A2A map onto this spec's layers, and why Phase 1's plumbing should be built pattern-agnostic
 
 ---
@@ -83,8 +100,8 @@ send-back is a row we can count. **§7 turns those counts into the go/no-go for 
 
 | Phase | What the user gets | New plumbing | Status |
 |---|---|---|---|
-| **0a — Handoff with context** | A mid-thread mention opens a **review sheet** in place. On Send, the Agent's conversation starts **in the background** with a **context card** from this thread; the user stays put | `HANDOFF#` rows, excerpt renderer, `handoff_context` on the request, a no-navigate send | Proposed |
-| **0b — Handoff row + send back** | A row in the original thread tracks the handoff (*running / needs your input / done*) and offers **Bring back result** when it finishes; the new conversation offers "Send to *original conversation*" too, without leaving | Status on `HANDOFF#`; `DELIVERY#` rows and the `deliveries` request field (§4.8) | Proposed |
+| **0a — Handoff with context** | A mid-thread mention opens a **review sheet** in place. On Send, the Agent's conversation starts **in the background** with a **context card** from this thread; the user stays put | `HANDOFF#` rows, excerpt renderer, `handoff_context` on the request, a no-navigate send | In progress: PR-0.1–0.3 built (§11) |
+| **0b — Handoff row + send back** | A row in the original thread tracks the handoff (*running / needs your input / done*) and offers **Bring back result** when it finishes; the new conversation offers "Send to *original conversation*" too, without leaving | Status on `HANDOFF#`; `DELIVERY#` rows and the `deliveries` request field (§4.8); file reference rows in both directions (§4.9) | Proposed |
 | **0c — Suggested handoffs** | The model can offer a chip ("Hand off to Rubric Builder →") without stopping its turn; Start opens the same review sheet | `suggest_handoff` tool, `handoff_suggested` SSE event | Proposed, opt-in |
 | **Gate** | — | — | §7 |
 | **1 — Consult** | A mid-thread mention runs the Agent **in place** and its report comes back automatically | Hidden consult sessions, nested streaming, agent-resolution refactor | Only if the gate passes |
@@ -181,17 +198,18 @@ User-facing copy: "Hand off to *Rubric Builder*", "Handed off to *Rubric Builder
 | Question | Decision |
 |---|---|
 | Unit of work | A **handoff**: a `HANDOFF#<handoffId>` row on the *source* session. `kind` is `mention`, `suggested` or `send_back` |
-| How context moves | A **context card**: a bounded, deterministic **excerpt** attached to the first message of the target conversation |
+| How context moves | A **context card** attached to the first message of the target conversation: a **brief** the source's model writes for this request from the source's cached prefix, or, if that can't run, the bounded deterministic **excerpt** (§4.5) |
 | Review | **Required, in place.** A review sheet opens in the source thread before anything is sent. The full prompt the Agent will receive is one click away |
 | Where the user ends up | **Where they were.** The target conversation starts in the background and appears in the conversation list. The user opens it when they choose |
 | How progress is shown | A **handoff row** in the source thread: a card linking to the target, with its title and a live status line (*running*, *needs your input*, *done*, *stopped*), the existing unread dot, a toast, an entry in the **in-app inbox** (the bell), and a **browser notification** while the page is hidden. Never a model message |
-| Where the excerpt is rendered | **Server-side, once**, by a pure renderer in `apis.shared.handoff`. The SPA never builds it, because Phase 1 needs the same renderer in Python |
+| Where the card is made | The brief: **on the Runtime**, as a non-persisting side call on the source session's own agent (§4.5). The excerpt: **server-side, once**, by a pure renderer in `apis.shared.handoff`. The SPA builds neither |
 | How the model sees a card | Wrapped block **in the user message**; `displayText` = what the user typed; the card renders as a collapsible panel on the bubble |
 | Background execution | **Client-driven.** The SPA runs the target's turn as a second stream. It lives as long as the tab (§4.6) |
 | Model-suggested handoffs | `suggest_handoff` tool, **non-blocking** (returns immediately; the turn continues). Constant spec. No Agent list in the schema |
 | Linking | The target session records `spawnedFrom: {sessionId, handoffId}`. The source's `HANDOFF#` row records `targetSessionId` and `status` |
 | When the target needs the user | Its prompt (consent, approval, question) is **relayed** into the source thread under the handoff row and can be answered there, resuming the target in the background. A browser sign-in links to the target instead. The relay is built from the pending interrupt by the platform, never written by a model, and never enters the source's history (§4.3) |
 | How a result goes back | A **delivery** (§4.8): a persisted `DELIVERY#` row on the receiving conversation, shown as a card on its composer and carried by the user's next send. It can reference artifacts the sending conversation made. It never starts a turn and never enters a running one |
+| How files move | **By reference** (§4.9): a read-only reference row in the receiving conversation, pointing at the file where it was made. Out on the review sheet, back on a delivery, chosen by the user each way. Never copied, never inlined |
 | Flags | Backend `HANDOFFS_ENABLED`, SPA `FEATURES.handoffs` (both default **off** in development); `suggest_handoff` separately gated by `HANDOFF_SUGGESTIONS_ENABLED` |
 
 ### 4.2 Phase 0a — Handoff with context
@@ -201,13 +219,18 @@ User-facing copy: "Hand off to *Rubric Builder*", "Handed off to *Rubric Builder
 1. **Nothing is sent yet.** The SPA calls app-api `POST /sessions/{id}/handoffs` with
    `{kind: "mention", agentId, request}`, using cookie auth (`get_current_user_from_session`). The server checks
    that the user owns the session, then:
-   - renders the excerpt from persisted messages (§4.5)
+   - renders the excerpt from persisted messages (§4.5.2), the card's fallback
    - writes `HANDOFF#<handoffId>` with `status: "open"`
    - returns `{handoffId, excerpt, excerptHash, excerptTokens, turnsCovered, contextBlock, request}`, where
      `contextBlock` is the excerpt already wrapped as the Agent will receive it
 
    It does **not** create the target session. Nothing hides empty sessions from the list, so a row created here
    would leave a blank "New Conversation" behind every cancelled handoff.
+
+   *Amended 2026-10-22:* with `HANDOFF_BRIEF_ENABLED` on, the SPA then asks the Runtime for the **brief** (§4.5): an
+   invocation on the **source** session carrying `handoff_brief: {handoffId}` and the same model, tools and binding
+   a turn there would carry. The brief streams into the context card as it is written. The excerpt from this
+   step is held as the fallback, and shows only if the brief can't be written.
 2. **A review sheet opens above the composer, in the source thread.** It is a labelled region, not a modal: the
    thread stays readable above it, and Esc cancels.
 
@@ -272,7 +295,8 @@ own sentence and could be sent half-edited by accident. A card keeps the request
 context editable as a document, and lets the SPA show "Context from *Course planning*" on the sent bubble without
 parsing the prompt.
 
-**Attachments** in the *source* thread are named in the excerpt, not carried over (§4.5).
+**Attachments** in the *source* thread are named in the card (the brief or the excerpt), and the ones the user
+ticks on the review sheet are carried over by reference: never copied, never inlined (§4.9).
 
 **Cancelled handoffs.** Cancel calls `POST /sessions/{id}/handoffs/{handoffId}/dismiss`, and no session is created.
 If the user navigates away with the sheet open, the handoff stays `open`, and one older than 24h reads as
@@ -385,7 +409,8 @@ sidenav). It isn't tied to projects; handoffs become its second producer.
 - ⚠️ Two changes this needs:
   - **An IAM grant.** inference-api can `UpdateItem` on the projects table but not `PutItem`, and its policy comment
     says it never creates rows there. Add a separate `PutItem` statement limited to inbox rows with a
-    `dynamodb:LeadingKeys` condition (`INBOX#*`), rather than widening the existing one.
+    `dynamodb:LeadingKeys` condition (`INBOX#*`), rather than widening the existing one. *(2026-11-04: already there.
+    Shared Projects 2.5a added exactly this statement, `ProjectsInboxWrite`, for `memory_propose`; see PR-0.3b.)*
   - **The bell's visibility.** The sidenav shows the bell only when `features.projects` is on, because projects were
     its only producer. Show it when `features.projects || features.handoffs`.
 
@@ -594,7 +619,151 @@ brief isn't streamed for chips the user dismisses.
 **Dismiss**. Once started, it becomes that handoff's row (§4.3). Chips replay on reload with the rest of
 `handoffs`. Dismiss is `POST /sessions/{id}/handoffs/{handoffId}/dismiss`.
 
-### 4.5 The excerpt renderer (shared with Phase 1)
+### 4.5 The context card: a brief from the source's cache, the excerpt as fallback
+
+*Rewritten 2026-10-22.* The card is a **brief** written for the request by the source conversation's own model, from
+the source's prompt cache (below). When the brief can't run (flag off, the source busy, over quota, a model error or
+timeout), the card is the deterministic **excerpt**, as built in PR-0.1.
+
+**Why a brief.** The excerpt is the conversation's tail, verbatim, cut at 4k tokens by dropping the oldest turns. On
+dev that dropped the very turns the request referred to: two long answers filled the budget and six earlier turns,
+the actual subject, became `[6 earlier turns omitted]`. It carries noise as faithfully as signal, and it is the same
+whatever the request is. A brief written by a model that has read the whole conversation, for *this* request, is what
+Claude does when it starts a conversation from another one, and it is a better start for the Agent.
+
+**Why from the source's cache.** The source's model has the whole conversation in context already, cached: its last
+turn wrote the prefix (tools, system prompt, history) moments ago. Asking it, with the request it already holds,
+reads that prefix at the cache-read rate instead of paying a second model to read an excerpt from scratch. It also
+sees what the source's model saw: the compaction summary in place of compacted turns, tool results, attachments, and
+what the source's tools could do.
+
+#### 4.5.1 How the brief reuses the cache
+
+A Bedrock cache hit is an exact prefix match on `toolConfig` → system → messages, per model. A change to
+`tool_choice` or to the thinking or effort settings invalidates the **messages** tier, and a change to the tools,
+the system prompt or the model invalidates everything. So the brief request must be the source's last request, byte
+for byte, up to a new final message.
+
+- **The same agent, resolved the same way.** The SPA sends the brief as an invocation on the source session with the
+  body a turn there would carry (model, tools, skills, binding: `buildChatRequestObject`) plus
+  `handoff_brief: {handoffId}`. The Runtime resolves the agent **exactly as a turn does**, through the turn path's
+  agent-resolution phases, so a cache miss in this process rebuilds an identical `toolConfig` and system prompt. The
+  MCP App dispatch's shortcut (`get_agent(cache_write=False)` with no injected tools) is **not** enough: on a miss it
+  builds a different `toolConfig`. This is what PR-1.1's `resolve_turn_agent` extraction is for, so PR-1.1 moves
+  into this work (§11).
+- **The same request, one message longer.** The call is `strands.event_loop.streaming.stream_messages` (the function
+  Strands' event loop calls), with the agent's own model, system prompt content, tool specs, `tool_choice`, inference
+  settings and trailing-block arguments, over a **copy** of `agent.messages` plus one appended user message:
+
+  ```
+  <handoff_brief_request agent="Rubric Builder" agent_description="…">
+  Write a brief for another of the user's agents, which will continue this work in a new conversation …
+  The request: draft a rubric for this
+  </handoff_brief_request>
+  ```
+
+  The instruction is a constant, versioned per deployment; only the request and the Agent's name and description
+  vary. It names the sections and a length bound (about 800 words), and says to answer in text without tools.
+- **Nothing reaches the source.** The copy is never assigned back, no `MessageAddedEvent` fires, no session-manager
+  write happens, and hooks don't run. The source's next real turn has the same `historyHash` lineage it would have
+  had. `apply_pending_compaction` is **not** run: the brief reads the history the cache holds, and a pending cut
+  stays pending for the next real turn.
+- **A rewind applies to the copy first.** On a warm agent, a rewind is cut from the live list only at the head of the
+  next turn (`TurnBasedSessionManager.apply_rewind`). A user who rewinds and then hands off before sending anything
+  has a live list that still holds the hidden messages, and a brief over it would describe what they just took back.
+  So the brief reads the session row's rewind state (`RewindState.from_row`) and cuts **its copy** to the length
+  `apply_rewind` would cut the live list to, leaving the live list, the manager's rewind epoch and the stashed row
+  alone for the next real turn. The retained messages are the bytes the earlier turns sent, so the read still hits
+  up to the cut. The excerpt never had this gap: it reads `GET /messages`, which leaves hidden messages out.
+- **Tools stay offered but aren't used.** Dropping tools or setting `tool_choice` to `none` would invalidate the
+  cache, so the request keeps them and the instruction says not to call them. A response with a `toolUse` block
+  keeps its text if it has some, and otherwise falls back to the excerpt. Nothing is ever executed.
+- **Per-call projections apply the same way.** Whatever a turn does to the history per call, rather than in storage
+  (the TEXT-only model projection, document offload stubs), must happen identically on the brief's copy, or the bytes
+  differ from what the cache holds. The brief calls through the same model wrapper the event loop uses; verify there
+  is nothing a hook does per call that the brief would skip.
+- **Thinking and effort are the source's.** Changing them would invalidate the messages tier. The thinking tokens
+  are billed output; a deep-effort source writes a slower, costlier brief, and that is the price of the cache.
+- **Output.** `max_tokens` is not part of the cached prefix, so the brief caps its own output
+  (`HANDOFF_BRIEF_MAX_TOKENS`, default 2,000 including thinking). The text streams back as `content_block_delta`
+  frames and ends with `metadata` and `done`. The SPA reads this stream into the review sheet's card only, never
+  into any session's message map.
+  *As built (PR-0.3a Runtime):* there is **no per-call output cap yet**. Our model wrappers (the TEXT-only
+  projection, the partial-output marker) bind `model.stream` to the agent's model instance, so a per-call copy
+  with a different `max_tokens` still streams with the original's config, and changing the shared model's config
+  would leak into the next turn. The brief is bounded by the instruction's "about 800 words" and by the turn's own
+  `max_tokens`; `briefTokens` on `HANDOFF#` records what each brief cost, and a cap returns once the wrappers can
+  take a per-call override. The stream ends with `done` carrying `briefHash` and `cacheStatus` (no `metadata`
+  frame), or with one `handoff_brief_fallback` frame and `done`.
+
+**Bookkeeping on the source.**
+- **The lease.** The brief takes the source's single-flight lease, like a turn: a brief can't run beside a turn on the
+  same history, and a source that is streaming answers 409, which falls back to the excerpt.
+- **The user's own turn wins the lease.** The other direction matters more: the sheet sits above the source's
+  composer, and a send there while the brief holds the lease would 409 and show "Already responding" for a turn that
+  isn't one. The SPA started the brief, so it knows one is in flight: a send in the source first stops the brief
+  (`POST /sessions/{id}/interrupt` with `reason: "handoff_brief_preempted"`, which arms the same owner-scoped lease
+  cancel as Stop, which the brief polls, and **nothing else**), waits for the brief's stream to close, then sends.
+  Never Stop's `user_stopped`: that also writes the interrupted-turn marker, and on dev (2026-11-04) a brief
+  preempted that way gave the source's next real turn a false "The user deliberately stopped your previous
+  response" note. The brief is not a turn, so nothing was interrupted. The sheet falls back to the excerpt with its one-line note (`HandoffBriefFallback` reason
+  `preempted`). The brief is never shown as a streaming turn in the source, so the composer doesn't offer mid-turn
+  steering against it. Verify first that the lease is released before the brief's stream closes, or the send can
+  still lose the race.
+- **Quota.** Checked like a turn. Over quota falls back to the excerpt; the brief never streams the quota message.
+- **Metering.** One `C#` cost row on the **source** session, with `callKind: "handoff_brief"` and the usual
+  `cacheStatus` and fingerprint hashes. Its `toolConfigHash` and `systemPromptHash` must equal the source's last
+  turn's; that is the test that the cache was reused (§10). It counts against the user's quota.
+  - **No `messageId`.** A turn's `C#` rows carry the index of the assistant message they produced, and readers join
+    on it: the feedback join (`admin/costs/service.py`) matches `F#` rows to `C#` rows on it, and the fleet view
+    (`admin/feedback/fleet.py`) takes the *last* `C#` row carrying a `messageId` as that turn's row. A brief
+    produces no message. If its row carried the
+    source's last index, the user's thumb on that answer would attach to the brief. `callKind` is new on `C#` rows:
+    a row without it is a turn's, and a reader that counts turns or calls per turn skips the rest.
+  - **Classification needs no change.** A cold brief is `miss_ttl_expired`, which `compute_wasted_usd` prices at zero
+    and `AvoidableMiss` doesn't count. A warm brief that misses wrote a prefix a live entry already held (the agent
+    resolved differently), so `miss_avoidable` and the alarm are the right answer. The row records the source's
+    `rewindEpoch` like a turn's, so the `rewound` flag lands on whichever call is first after a rewind.
+- **The HANDOFF# row** records `briefHash`, `briefTokens` and `briefCacheStatus` at the end. Acceptance (PR-0.2)
+  compares the sent card's hash with `briefHash` when there is one, else `excerptHash`, so `contextEdited` still
+  means "the user changed what we wrote".
+- **Skipped**, because this is not a turn: attachment resolution and the pending-attachment pop, the stale-marker
+  clears (an interrupted-turn note must survive for the next real turn), KB search, title generation, steering, and
+  handoff acceptance.
+- **TTFT.** A turn pays one field check for the new mode. The brief is its own invocation, so nothing it does sits
+  on any turn's path; its own latency is the agent lookup plus the model's time to first token, shown in the sheet.
+
+**Warm and cold.** The cache is warm when the source's last model call started less than 5 minutes ago (our TTL;
+the 1-hour static-prefix flag is off), which is the normal case: the user is mid-conversation when they type the
+mention. Cold, the brief writes the prefix at 1.25× instead of reading it at 0.1×. That write is not wasted when the
+user stays in the source, which is what a handoff is for: their next turn there within 5 minutes reads it instead of
+writing it again. v1 runs the brief either way and records which it was; whether a cold brief should fall back to
+the excerpt instead is a measurement question (§13).
+
+**Cost**, for a 30k-token source history, a ~400-token instruction and a ~900-token brief, at our Regional rates:
+
+| Source model | Warm (history read) | Cold (history written) | For comparison: a separate uncached Haiku 4.5 call over a 24k excerpt |
+|---|---|---|---|
+| Haiku 4.5 ($1.10 / $5.50; read $0.11) | ~$0.009 | ~$0.047 | ~$0.032 |
+| Sonnet 4.6 ($3.30 / $16.50; read $0.33) | ~$0.026 | ~$0.140 | ~$0.032 |
+
+On an expensive source model the output dominates (Fable 5.1 at $50/MTok: ~$0.045 for the brief, ~$0.0075 to read
+the history). Thinking adds output on top. The brief runs once per handoff, when the user asks for one.
+
+**The edges.**
+- **History that ends on a user message** (a failed or interrupted turn with no reply). Appending a second user
+  message breaks Converse's alternation. Verify first whether appending the instruction as a block after that
+  message's existing content (after its cachePoint) keeps the read; until then, fall back to the excerpt.
+- **A source this process has never built.** The agent builds as a turn would, a cold build of a second or more. The
+  sheet shows "Writing a brief…" meanwhile, and a timeout (`HANDOFF_BRIEF_TIMEOUT_SECONDS`, default 30) falls back.
+- **An empty or near-empty source.** Below the model's minimum cacheable prefix there is nothing to reuse and
+  little to brief. A source with fewer than two turns uses the excerpt.
+- **A refusal or a safety stop.** Falls back to the excerpt; the reason is logged, not shown.
+
+**Trust.** The brief is model output over a conversation that may contain web pages and tool results. The review step
+is the protection: the user reads, edits or removes it before anything is sent, exactly as with the excerpt.
+
+#### 4.5.2 The excerpt (the fallback, and Phase 1)
 
 `apis/shared/handoff/excerpt.py` is a pure function over persisted messages. It is deterministic, has no model
 call, and is tested on its own:
@@ -618,9 +787,8 @@ Assistant: …
 - **Watermark-capable.** It takes an optional `since_index`. Phase 0 doesn't use it; Phase 1's repeated consults
   do (§8.4).
 
-A **model-written** brief for 0a (a Nova Micro side-channel like `session_title`, well under a cent even on an
-uncached 50k-token thread) is a deliberate follow-up, not v1. Build the deterministic version first. Replace it
-only if `contextEdited` shows users rewriting it.
+*Superseded 2026-10-22:* this section once deferred a model-written brief until `contextEdited` showed users
+rewriting the excerpt. Dogfooding the built excerpt answered the question first (§4.5).
 
 ### 4.6 Background runs, and what Phase 0 leaves out
 
@@ -664,6 +832,12 @@ EMF, under the existing PromptCache namespace so the cost dashboard can show it:
 - `HandoffCreated` by `kind`
 - `HandoffSent` / `HandoffCancelled` / `HandoffAbandoned` by `kind`
 - `HandoffPromptPreviewed`: the review sheet's full-prompt preview was opened
+- `HandoffBriefWritten` by `briefCacheStatus` (`hit`, `partial_miss`, `miss`), with `HandoffBriefMs` and
+  `HandoffBriefTokens`; `HandoffBriefFallback` by reason (`flag_off`, `not_open`, `busy`, `preempted`, `quota`,
+  `refused`, `timeout`, `error`, `tool_use_only`, `short_source`, `history_ends_on_user`). `not_open`: the handoff
+  is not this conversation's open one. `refused`: the turn path ended before the model (an Agent or model refusal,
+  a retired model, an error building the turn), which the brief discards unstreamed so nothing persists. A high
+  `miss` share decides §13's cold-cache question
 - `HandoffContextEdited` / `HandoffContextRemoved`
 - `HandoffCompleted` / `HandoffNeedsInput` / `HandoffStopped`
 - `HandoffOpenedWhileRunning`: the user opened the target before it finished
@@ -674,6 +848,10 @@ EMF, under the existing PromptCache namespace so the cost dashboard can show it:
   before answering
 - `RelayedPromptConflict`: an answer refused because the other surface answered first
 - `DeliveryArtifacts`: references per delivery, and `DeliveryArtifactOpened` from the card or the sent bubble
+- `HandoffFiles` and `DeliveryFiles`: files per handoff and per delivery. `HandoffFilesUnticked`: files listed on
+  the review sheet and not sent, which feeds §13 Q20
+- `LinkedFileRead` by reader (`document_read`, `word`, `spreadsheet`, `powerpoint`, `workspace_read`), and
+  `LinkedFileGone`: a reference read after its original was deleted
 - `SendBack` by origin (`row` for Bring back result, `target` for Send to *{title}*), with `openedTargetFirst`
 - `DeliveryCreated` / `DeliveryAttached` / `DeliveryDismissed` by `origin` (`user`, later `agent`), and
   `DeliveryEdited`
@@ -795,6 +973,186 @@ and leaves the rubric behind. So a delivery can carry **references** to artifact
 - **Shared Projects.** Unchanged: a delivery into a project task is refused in v1, so an artifact can't reach other
   members this way. Sharing an artifact with a project stays the existing share flow.
 
+### 4.9 The linked workspace: files by reference
+
+*Added 2026-11-08.* Deliveries move text and artifacts between linked conversations, but files don't move at all.
+A handoff names the source's attachments in the card and doesn't carry them (§4.2). The brief lists them by name
+only (`brief.py`: "what is in play, by name"), so the target can't open the syllabus it was asked about. Nothing
+comes back either: a Word document the target writes stays in the target. When the work is a document, the work
+product is exactly what gets left behind.
+
+**The tenet: linked conversations share their work products by reference, never by copy, and never by putting
+them in each other's prompts.** A handoff or delivery says in text what the work is. The files stay where they
+were made, and the receiver reads them on demand, in bounded pieces, with the tools that already read files.
+
+**What Strands offers, and why we keep the shape and not the code.** Checked against the pinned
+`strands-agents==1.63.0`:
+
+- **Swarm's `SharedContext`** is a JSON key/value store that agents add to. `Swarm._build_node_input` writes all
+  of it into each next agent's input as "Shared knowledge from previous agents". It lasts for one `Swarm` run in one
+  process. Our conversations are separate sessions and separate `Agent` instances. They often run in separate
+  microVMs, because affinity pins per `(user, session)`, and days can pass between turns. Writing the whole store
+  into every prompt is also the unbounded pass-through the cost tenet rules out (`multi-agent-patterns.md` counts
+  the same cost for Swarm).
+- **`Agent(sandbox=…)`** treats the workspace as an environment, not as prompt text. Sandbox tools reach files
+  through `context.agent.sandbox`, never through a root path the model supplies. Each agent gets its own sandbox
+  unless it is given a shared one, so sharing is a deliberate choice. That is the shape this section keeps. The
+  sandboxes Strands ships (Docker, SSH and the host) don't suit a multi-tenant Runtime, and a `Sandbox` instance
+  can't be shared across microVMs. So the substrate is the one we already have: the user-files table, with identity
+  injected by closure.
+- **`GraphState`, `invocation_state` and the `subagent` tool's shared history** last for one run or are
+  conversation history. None of them is a place for files.
+
+| Question | Decision |
+|---|---|
+| What is shared | Rows in the user-files table: uploads, Word documents, workspace writes, generated images. Artifacts keep their own store and their own references (§4.8) |
+| Where a shared file lives | In the conversation that made it. A **reference row** in the receiving conversation points at it. Bytes are never copied |
+| Who decides what crosses | The user: on the review sheet going out, and on the delivery card coming back. In Phase 2, the agent, by id, through the same checks |
+| What the receiving model sees | One `<file …/>` line per file inside the existing wrapper, and the file in its conversation's file listing. Never the bytes in the message |
+| How it is read | With the tools that already read a conversation's files: `document_read`, the Word, spreadsheet and PowerPoint tools, and `workspace_read` where granted. No new tool |
+| Can one side change the other's file | No. A reference is read-only. A revision is a new file in the reviser's own conversation |
+| Reach | Linked conversations of one user only (§9.2). Never into or out of a Shared Project task |
+| Flag | Rides `HANDOFFS_ENABLED`, as deliveries do. No switch of its own |
+
+**The reference row.** It is a `FileMetadata` row in the receiving conversation (`GSI1PK = CONV#{receiving}`) with
+a new upload id. It carries:
+
+- `linkedFrom: {sessionId, uploadId, fromTitle}`, naming the original. `fromTitle` is captured at creation, as a
+  delivery's is.
+- The original's `s3Key`, `s3Bucket`, `filename`, `mimeType`, `sizeBytes` and `ttl`.
+- `source: "linked"` and `delivery: "reference"`.
+- `status: READY`. A reference is only ever made from a `READY` original.
+
+It carries no `digest`, `preparation` or `kbIndex`. Derived state belongs to the original and is read from there
+(rule 4). A reference to a reference is resolved to the original when it is made, so no chain is longer than one
+hop.
+
+The row is an ordinary file row in the receiving conversation, so everything that lists "this conversation's
+files" sees it unchanged:
+
+- `document_read`'s listing, and the gate that decides whether the tool exists: `session_has_documents` runs the
+  same `SessionIndex` query (`GSI1PK = CONV#{sessionId}`)
+- `workspace_list`'s session scope
+- the Word tools' lookup
+- the SPA's Files panel
+
+That is why it is a row and not a list of ids on the handoff. With a list, every gate that decides whether a tool
+exists would need a second read before the first token. Without that read, the tool would come and go as microVMs
+recycle. Each flip rotates `toolConfigHash`, which is the prefix re-write the `document_read` gate's docstring
+measured in prod.
+
+**Rules a reference row keeps.** Each one is a test (§10).
+
+1. **No quota.** Creating a reference increments nothing, and deleting one decrements nothing. The bytes are counted
+   once, on the original.
+2. **Deleting a reference never deletes bytes.** Today `FileUploadService.delete_file` and
+   `FileUploadService.delete_session_files` (`apis/app_api/files/service.py`) delete each row's S3 object, its
+   thumbnail and its large-document sidecars under `derived_prefix(s3_key)`, and then decrement quota. A reference
+   shares its original's `s3Key`, so for a row with `linkedFrom` set, both remove the row only. The repository's
+   own `delete_session_files` cascade stays row-only, as it is today. Without this rule, deleting the target would
+   delete the source's syllabus and its prepared pages. One predicate decides it, `is_linked_reference(meta)`, in
+   `apis/shared/files/models.py` beside `is_reference_document`.
+3. **Read-only.** A tool that would change a file in place (`modify_word_document`, `redline_word_document`, any
+   later one) writes its result as a new file in its own conversation when its input is a reference. It never writes
+   to the original's key.
+4. **Derived state comes from the original.** A reader that needs the digest, the large-document sidecars or the
+   attachments-KB index first resolves the reference to its original through one function, `resolve_linked_file`.
+   So nothing is prepared or indexed twice.
+5. **A deleted original reads as gone.** Deleting the source deletes the bytes in its cascade, and its references
+   then resolve to nothing. Listings mark such a file "No longer available (deleted from *{fromTitle}*)", and readers
+   say the same instead of raising `NoSuchKey`. The original's delete does not look for its references. Each
+   reference row is removed with its own conversation.
+6. **Never inlined.** A reference reaches the model only as its `<file>` line and through the readers. It is never
+   in a turn's `file_upload_ids`, so the inline-attachment path never sees it. Its `delivery: "reference"` makes
+   `is_reference_document` agree for document-class files.
+
+⚠️ **Verify first, before PR-0.4a's code.** List every reader of `FileMetadata` outside the workspace service.
+Mark which ones need `resolve_linked_file` (rule 4) and which ones write in place (rule 3). Put the list in the PR.
+At least:
+
+- `document_read`, including its `query` search: that checks the row's `session_id` and then calls
+  `search_attachments` by upload id, while the attachments-KB index is keyed on the original's
+- the Word, spreadsheet and PowerPoint tools
+- `document_offload` and `document_rehydration`
+- large-document preparation
+- the attachments-KB reconcile
+- the Files panel's delete route
+
+**Going out: files on a handoff.** The review sheet (§4.2) lists the source conversation's files from the list the
+SPA already holds, each with a checkbox. Files attached in the source's last five user turns are ticked, up to
+`HANDOFF_MAX_FILES = 5`. The invocation carries them as `handoff_context.file_ids`.
+
+At acceptance, on the target's first turn, the server:
+
+1. checks that each id is the user's, `READY`, and in the source conversation (`session_id == sourceSessionId`).
+   This is §4.8's sender rule for artifacts, applied to files. An id that fails is dropped with a warning
+2. writes the reference rows in one `BatchWriteItem`, in the same phase as the acceptance read
+3. adds one line per file to the wrapper:
+
+```
+<handoff_context from_conversation="{source title}">
+The user brought this context from another of their conversations.
+…brief or excerpt…
+<file upload_id="…" name="syllabus.pdf" type="application/pdf" size="412 KB"/>
+</handoff_context>
+```
+
+This replaces "named in the card, not carried over" (§4.2). The brief still names files. The line is what makes
+them readable. Acceptance has already classified the files, so it passes `turn_has_document` to the
+`document_read` gate, and the tool is there on the first turn without a query. The target is a new conversation,
+so the tool is in its `toolConfig` from its first model call, and no prefix is re-written.
+
+**Coming back: files on a delivery.** A delivery gains `files`: up to `DELIVERY_MAX_FILES = 5` references
+`{uploadId, filename, mimeType, sizeBytes}`.
+
+- **Which files.** Bring back result offers the files the target created after the handoff was accepted. Reference
+  rows are left out. File rows don't record which message made them, unlike artifact HEAD rows, so `createdAt` is
+  the boundary.
+- **Checks.** §4.8's sender rule applies: each file must be the user's, `READY`, and in the sending conversation. A
+  reference the sender holds is resolved to its original first. If that original is in the receiving conversation,
+  the delivery's line points at it and no row is written, so a file can be handed back to where it came from.
+- **When rows are written.** At attach, in the same phase as the delivery's conditional flip, and only by the
+  request whose flip succeeds. Two tabs attaching one card write one set of rows. Until then the files exist only
+  in the `DELIVERY#` row's `files`, which is what the card shows.
+
+**The source's cache.** A file coming back can add `document_read` to the source's `toolConfig` if the source had
+no document of its own. That is the same one-time change as attaching a document mid-conversation. It happens only
+on a send the user makes, and it doesn't flap: the row persists, and the gate's query finds it after a restart. The
+target can never cause it alone, because nothing is written into the source until the user attaches.
+
+**What the user sees.**
+
+- A shared file appears in the receiving conversation's Files panel marked "From *{fromTitle}*", on the delivery
+  card before it is attached, and as a chip on the sent bubble.
+- The handoff row in the source lists the target's new files as they appear, each with Bring back. The list comes
+  from the target's file listing, which the SPA reads, and it is display only, like the row's live status line.
+
+So the user can watch the shared work grow, and nothing reaches the source's model until they choose.
+
+**Trust.** A shared file may be content another conversation's agent produced after reading a web page.
+
+- In Phase 0 a file crosses only when the user acts. In Phase 2 it crosses by id, through the same checks.
+- A file brings no capability. No tool, grant or skill travels with it, and the receiver reads it with its own tools.
+- Its line names the conversation it came from, inside the wrapper's existing framing ("the user brought", "the
+  user chose to include it"). What a reader returns from the file is a tool result: untrusted data, like any other.
+- Filenames are attribute values. The renderer escapes them and neutralises wrapper tags, the rule §9.6 item 5 sets
+  for titles.
+- A reference allows no read that wasn't already possible. `read_document` checks that the user owns the file, not
+  which conversation it is in, and `workspace_read` is user-scoped by design. What a reference adds is a pointer and
+  a listing entry, both inside conversations the user linked.
+
+**TTFT and cost.** A handoff or delivery that carries files pays one `BatchWriteItem`, in the phase that already
+pays the acceptance or delivery round trip. Measure it at five files and put the number in the PR. A send without
+files pays nothing. Each file costs the receiving model about 20 tokens, after the history cachePoint. Reading is
+on demand and bounded by the readers' existing caps.
+
+**Not in Phase 0.**
+
+- An agent-facing listing of the linked conversations' files that weren't handed over (§13 Q20).
+- A Code Interpreter session shared by a linked pair (§13 Q19).
+- Files between two targets of the same source. They aren't linked to each other (§9.2), so a file reaches one from
+  the other only through the source.
+
 ---
 
 ## 5. Goals and non-goals, by phase
@@ -804,6 +1162,8 @@ and leaves the rubric behind. So a delivery can carry **references** to artifact
   user out of the thread they were in.
 - The user can see whether a handoff is running, needs them, or is done, from the original thread.
 - A handoff's result can go back to the original thread in **one action**.
+- The files the work needs, and the files it produces, cross with it by reference: not copied, not pasted into a
+  prompt, and read-only on the receiving side.
 - The model can suggest a handoff without derailing its turn.
 - No prefix is ever re-written; no session is ever served by two configurations.
 - Every handoff, review action, completion and send-back is counted.
@@ -834,12 +1194,15 @@ and leaves the rubric behind. So a delivery can carry **references** to artifact
 |---|---|---|---|
 | `HANDOFFS_ENABLED` / `FEATURES.handoffs` | backend / SPA | off | yes; off = today's immediate handoff |
 | `HANDOFF_SUGGESTIONS_ENABLED` | backend | off | yes; off = `suggest_handoff` never registered |
+| `HANDOFF_BRIEF_ENABLED` | backend (Runtime) | off | yes; off = the card is the excerpt. A **feature switch**: it spends model tokens per handoff, a choice a deployment may decline |
 | `AGENT_CONSULT_ENABLED` / `FEATURES.agentConsult` | backend / SPA | off | yes; off = Phase 0 behaviour |
 | `CONVERSATION_MESSAGES_ENABLED` / `FEATURES.conversationMessages` | backend / SPA | off | yes; off = `send_to_conversation` never registered, agent-sent cards hidden |
 | `CONVERSATION_MESSAGE_STEER_ENABLED` | backend | off | yes; off = a message to a streaming conversation stays pending (2a) |
 | `CONVERSATION_MESSAGE_WAKE_ENABLED` | backend | off | yes; off = a message to an idle conversation stays pending (2a) |
 
 Deliveries (§4.8) ride `HANDOFFS_ENABLED`; they have no switch of their own because Phase 0 has no other way back.
+File references (§4.9) ride it too. They extend the handoff and the delivery without adding a tool or changing a
+tool spec, and with the flag off, `handoff_context.file_ids` is ignored like the rest of that field.
 The two Phase 2 landing flags only matter with `CONVERSATION_MESSAGES_ENABLED` on, and each one falls back to 2a, so
 turning either off loses no message.
 
@@ -1149,7 +1512,8 @@ per-conversation "allow messages from…" setting is the way to widen this later
     "properties": {
       "to":      {"type": "string", "description": "\"parent\" for the conversation this one was handed off from, or the title or Agent name of a conversation handed off from this one"},
       "message": {"type": "string", "maxLength": 8000, "description": "Self-contained text. The other conversation has not seen this one"},
-      "artifact_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 5, "description": "Optional: ids of artifacts you made in this conversation to send with the message"}
+      "artifact_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 5, "description": "Optional: ids of artifacts you made in this conversation to send with the message"},
+      "file_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 5, "description": "Optional: upload ids of files in this conversation to share with the message. They are shared by reference, not copied"}
     },
     "required": ["to", "message"]
   }
@@ -1161,6 +1525,9 @@ per-conversation "allow messages from…" setting is the way to widen this later
 - **Artifacts by reference.** `artifact_ids` go through §4.8's checks: each must be the user's and made in *this*
   conversation. An id that fails is dropped and named in the result ("Sent without *{id}*: it wasn't made in this
   conversation"), rather than failing the whole message.
+- **Files by reference.** `file_ids` go through §4.9's checks and become a delivery's `files`. Reference rows are
+  written only when the user attaches the card (2a), or when the delivery is claimed (2b, 2c), never before. An id
+  that fails is dropped and named in the result, as for artifacts.
 - **Not for pauses.** A paused turn can't call tools, and the pause is relayed by the platform (§4.3). The tool is
   for results and progress the agent chooses to send: a finished draft, an artifact, or "I've drafted the rubric;
   I'll need Canvas access to post it", sent before the tool call that will need it.
@@ -1263,8 +1630,9 @@ has started", and the only one that spends money while nobody is watching.
 1. **One user, linked conversations.** `create_delivery` checks both sessions on `(session, user)` and the link. A
    Shared Project task is refused as a target and as a sender.
 2. **The receiver keeps its own grants.** The sender's tools, model, skills and grants never travel. A message is
-   text plus artifact references (§4.8): no attachments, no tool calls, and no artifact bodies. The user can open a
-   referenced artifact from the card; the receiving model can act on it only with its own tools.
+   text plus artifact references (§4.8) and read-only file references (§4.9): no inlined attachments, no tool calls,
+   and no artifact or file bodies. The user can open a referenced artifact or file from the card. The receiving
+   model can act on either only with its own tools, and it can never change the sender's file (§4.9 rule 3).
 3. **Nothing answers for the user.** A delivery is never an `interrupt_responses` entry, is never attached to a
    resume, is never steered into a paused turn, and is never carried over by `seed_steer_queue`. Tool approvals in a
    woken turn still pause. This is our version of Claude Code's rule against permission laundering: no conversation
@@ -1317,6 +1685,26 @@ has started", and the only one that spends money while nobody is watching.
 **Phase 0**
 - **Excerpt renderer.** Deterministic output for the same input, whole-turn truncation, compaction-summary
   substitution, attachments named not inlined, and a `since_index` that only moves forward.
+- **Brief (cache reuse).** The thing that has to hold is that the brief request *is* the source's last request plus
+  one message:
+  - Capture the request a real source turn sends and the request the brief sends from the same agent: `toolConfig`,
+    system content, `tool_choice`, inference and thinking settings byte-identical; `messages` equal up to the brief's
+    one appended message.
+  - On a fresh process (agent cache miss), the agent the brief resolves has the same cache key and the same
+    `toolConfig` hash as the one a turn resolves (the MCP App shortcut fails this test; it must keep failing).
+  - Nothing persists: no session-manager write, no `MessageAddedEvent`, `agent.messages` unchanged by identity and
+    content, compaction state unchanged, an interrupted-turn marker still set afterwards.
+  - The lease is taken and released; a held lease answers 409 and the SPA shows the excerpt.
+  - A send in the source during a brief stops the brief and goes through without a 409; the sheet shows the excerpt
+    and records `preempted`.
+  - After a rewind with no turn since, the brief's copy ends at the cut and the live list is untouched (same length,
+    same identity, the manager's rewind epoch unchanged), and the next real turn still applies the rewind.
+  - The brief's `C#` row has `callKind: "handoff_brief"` and no `messageId`; the feedback join and the fleet view
+    still match a thumb on the source's last answer to that turn's row.
+  - A `toolUse`-only response, a timeout, a refusal and over-quota each fall back, with the reason recorded.
+  - On dev: a brief right after a source turn records `cacheStatus` `hit` with that turn's `toolConfigHash` and
+    `systemPromptHash`, a `cacheReadInputTokens` near the source's history size, and the source's next turn is still
+    a `hit`.
 - **Handoff lifecycle.** Owner scoping on every `/handoffs` route (cookie auth; another user's handoff id → 404),
   `open → running → needs_input ⇄ running → done | stopped`, `open → dismissed | abandoned`, and no double-send.
 - **`handoff_context`.** The server applies the cap again; `displayText` is the user's text only;
@@ -1338,6 +1726,27 @@ has started", and the only one that spends money while nobody is watching.
   conversation (`SessionIndex` key ≠ the sender's), keeps the version pinned at send, and stops at
   `DELIVERY_MAX_ARTIFACTS`. The rendered block carries one line per artifact and no body, and an artifact title
   containing a wrapper tag can't close the block.
+- **File references (§4.9).**
+  - `handoff_context.file_ids` and a delivery's `files` refuse another user's file, a file from a conversation
+    other than the sender, a non-`READY` file, and any file into or out of a Shared Project task. Each stops at its
+    cap of 5.
+  - A reference to a reference is written pointing at the original. A file handed back to the conversation it
+    came from writes no row.
+  - Quota is unchanged by creating a reference and by deleting one.
+  - Deleting the receiving conversation, or deleting one reference from the Files panel, removes only the reference
+    rows. The original's row, S3 object, thumbnail and `derived_prefix` sidecars stay in place. Assert it against a
+    moto bucket, through `FileUploadService.delete_session_files` and `FileUploadService.delete_file`.
+  - `modify_word_document` and `redline_word_document` on a reference write a new file in the calling
+    conversation, and the original's object is byte-identical afterwards.
+  - With the original deleted, the listing marks the reference "No longer available" and `document_read` answers
+    with that, not with an exception.
+  - Two concurrent sends attaching one delivery with files write one set of rows.
+  - A filename containing `"` or a wrapper tag renders escaped and can't close the block.
+  - The target's first turn carries `document_read` with no gate query. On a fresh process, the next turn still
+    carries it, with the same `toolConfigHash`.
+  - On dev: hand off a conversation with a PDF and a `.docx` attached. The target reads both with `document_read`
+    and the Word tools. Then bring back a Word document the target wrote. The source's next turn after attaching it
+    is one `toolConfigHash` change if the source had no document of its own, and none if it had one.
 - **Deliveries.**
   - `create_delivery` refuses a session another user owns, and a Shared Project task, on either end.
   - Replay returns pending deliveries only, in `createdAt` order.
@@ -1415,23 +1824,408 @@ has started", and the only one that spends money while nobody is watching.
 - **PR-0.1 — Excerpt renderer + `HANDOFF#` store** in `apis.shared.handoff`, and the app-api `/handoffs` routes
   (create, get, dismiss). The create response includes `contextBlock` for the preview. Acceptance happens on the
   first send (PR-0.2), not as a route. Flags off.
+  *Built.* Notes for the PRs that follow:
+  - `apis.shared.handoff.context` holds the wrapper (`wrap_handoff_context`) and the join
+    (`build_handoff_message`). PR-0.2 must build the model message with these two functions, which is what
+    keeps the preview and the sent prompt byte-identical. The create response also returns the joined
+    `prompt`, so the SPA's preview needs no join of its own.
+  - `HandoffStore.accept` is the only way out of `open` into `running`, conditioned on `open` in the write
+    itself. It is PR-0.2's no-double-send guard. `running` can't rewrite itself; `needs_input` and `stopped`
+    can (a second pause with a new `waitingOn`), and `stopped` follows the target's next turn. `done` and
+    `dismissed` are frozen.
+  - `excerptHash` is taken over normalized text (CRLF → LF, trimmed), so a card opened and closed unedited
+    doesn't count as `contextEdited`.
+  - The row stores `sourceTitle` at create, so the wrapper PR-0.2 builds names the same title the preview did
+    even if the conversation is renamed in between.
+  - Rows expire after 365 days and are removed by the session delete cascade, because they hold the request
+    text.
+  - The excerpt clips a newest turn that is over the cap on its own in the middle, rather than returning
+    nothing. §4.5 didn't cover that case.
 - **PR-0.2 — `handoff_context` on the invocation path.** Wrapper, `displayText`, acceptance, status writes after
   `done` (with `statusLine` and `waitingOn`), EMF.
+  *Built* (`apis/shared/handoff/turn.py`, wired in `inference_api/chat/routes.py`). Notes for the PRs that follow:
+  - **TTFT.** An ordinary turn pays one `for_turn` call with no IO (~0.6µs measured). On a target's first turn,
+    acceptance (a `GetItem` and the conditional `accept`, on the process-wide cached client) starts as a task
+    at the head of `_guarded_stream`, beside the agent build, and is awaited only where the message is
+    assembled. A target is always a new session, so its build is a cache miss that outlasts the two round
+    trips, and the first token waits for neither. A route test pins the order (start → build → await).
+    Status writes run after the stream ends.
+  - **Status comes from the frames, not the coordinator.** The route feeds every SSE chunk the turn streams to
+    an observer that reads only `tool_group_summary`, the four interrupt events, `stream_error`,
+    `message_stop` and `done`; other frames are skipped before their JSON is parsed (~0.8µs a frame). A
+    disconnect (`CancelledError`/`GeneratorExit`) is `stopped` with `connection_lost`, a cooperative Stop is
+    `user_stopped`, and an error or a stream that never reached `done` is `error`. A pre-flight
+    `oauth_required` (no `interruptId`) paused nothing and is not `needs_input`. One seam in the outermost
+    generator covers every exit arm of the coordinator without touching it.
+  - **`waitingOn` is `{kind, name}`**, not a string: `oauth_consent` + provider, `tool_approval` + tool,
+    `user_question` + the first question's header, `browser_login` + empty. **`statusLine` is the raw latest
+    tool summary**; PR-0.3 adds the "Finished · " prefix.
+  - **Later turns find their handoff from `spawnedFrom` on the B1 snapshot**, so following a target costs no
+    read. `spawnedFrom` is written by a field-level `SET` after acceptance, in the background. Once the row is
+    `done`, or can no longer move, the target's link is marked `settled` and later turns stop writing.
+  - **What is ignored, with a warning, rather than refused:** the field while the flag is off; on a resume or
+    continuation; on a preview session; on a conversation that already took a handoff; a handoff that is not
+    the caller's, is for a different Agent, or was already sent or dismissed. In every case the turn runs as an
+    ordinary turn. A second send from one handoff therefore starts a conversation without context; it never
+    gets the context twice.
+  - **Not yet:** the sent bubble's "Context from *{title}*" label needs display metadata on the persisted user
+    message, or the SPA can read it from `spawnedFrom` on the first turn of a target. PR-0.3 decides which.
+  - `HANDOFFS_ENABLED` is now also written to the AgentCore Runtime, only while on.
 - **PR-0.3 — SPA handoff.** A mid-thread mention opens the review sheet (request, context card, full-prompt
   preview); a no-navigate send; the handoff row as a linked card with title and live status line, live and replayed; completion and needs-input toasts;
   the card on sent bubbles; the unload guard. Verify interrupt-service scoping (§4.3) here.
+  *Built.* Notes for the PRs that follow:
+  - **Interrupt scoping, settled for 0a:** tool approvals, questions and browser sign-ins were already filtered by
+    session in the message list. OAuth was not: a background target's `oauth_required` anchors to a message id that
+    is never in the source's list, so it rendered in the source's tail as though the source were waiting. The list
+    now filters it by session (a list bound to no session keeps the old behaviour). `session.page` still calls
+    `oauthConsent.clear()` on every route change, which drops a background target's live consent request until its
+    `GET /messages` re-hydrates it; 0.3c's relay has to deal with that.
+  - **SPA:** `HandoffStateService` (rows, `spawnedFrom`, reviews; seeded by `MessageMapService`) and
+    `AgentHandoffService` (open, edit, cancel, send, status refresh, toasts, unload guard) are split so hydration
+    has no injection cycle through `ChatRequestService`. `ChatRequestService.submitHandoffRequest` is the old
+    mention send with no `setViewedSession`, no navigation, no prewarmed id and no mode claim.
+  - **Preview parity** is pinned by `handoff-prompt.fixture.json`, generated from the Python and checked by
+    `test_handoff_prompt_fixture.py` and `handoff-prompt.spec.ts`. The create response gained `sourceTitle` and
+    `sourceMessageIndex` for it.
+  - **Replay:** `GET /messages` returns `handoffs` (sent ones only) and `spawnedFrom` (`{sessionId, handoffId,
+    sourceTitle, agentName}`), first page only, nothing while the flag is off. The target's first bubble shows
+    "Context from *{title}*" with the carried context one click away.
+  - **Status after a turn:** the row re-reads the server row when the target's stream ends. A row still `open`
+    means the Runtime never took it (refused before the stream: quota, an unavailable Agent; or never delivered: a
+    502): the row reads "Didn't start · open it to see why" instead of running forever.
+  - **Live in dev's SPA only** (`environment.development.ts`); local and prod stay off.
+- **PR-0.3a — The brief** (§4.5; flag `HANDOFF_BRIEF_ENABLED`, off). Two PRs:
+  1. **Runtime.** First PR-1.1's pure refactor, extracting `resolve_turn_agent` from `chat/routes.py`, so a turn
+     and the brief resolve the agent through one function. Then the `handoff_brief` invocation mode: quota and
+     lease as a turn, the skipped phases listed in §4.5.1, the non-persisting `stream_messages` call over a copy of
+     the history, the fallbacks, the `C#` row with `callKind: "handoff_brief"`, and `briefHash` /
+     `briefCacheStatus` on `HANDOFF#`. Settle the verify-firsts: the trailing-blocks and `tool_choice` arguments as
+     the event loop passes them, the per-call history projections (§4.5.1), a history that ends on a user
+     message, and that a stopped brief releases the lease before its stream closes. The brief cuts its copy to a
+     pending rewind, and its `C#` row carries no `messageId`.
+  2. **SPA.** After `POST /handoffs` returns, stream the brief into the card ("Writing a brief…", then the text),
+     keep the excerpt as the fallback with a one-line note when it is used, and send whichever the user ends up
+     with. Acceptance compares against `briefHash`.
+
+  Dev validation: a handoff right after a source turn shows a `hit` brief on the source's `C#` rows with the
+  source's hashes, and the source's next turn is still a `hit`; one sent after a 6-minute pause shows the `miss`
+  and the next source turn reading what it wrote.
+
+  *Runtime built (2026-11-03).* Notes for the SPA half:
+  - **The brief is a mode of the turn path, not a second copy of it.** `_handoff_brief_invocation` checks the flag
+    and that the handoff is this conversation's open one, then runs `_run_invocation(brief=handoff)`. That path
+    resolves the agent through the same phases (`resolve_turn_agent(record_use=False)`, `compose_turn_system_prompt`,
+    `apply_turn_prompt_extras`, `_resolve_turn_model`, `_resolve_effective_tools`, `_build_turn_tools`) and the same
+    `_build_main_agent`, and returns the brief's stream where a turn would start its own. It skips the attachment
+    recovery, the session-state writes (an interrupted-turn note survives), the KB search, binding validation and
+    persistence. A route test sends one body as a turn and as a brief and asserts `get_agent` gets identical
+    arguments.
+  - **Anything else that path returns is discarded unstreamed** (a refusal persists only when its generator runs)
+    and answered with a fallback; a 409 becomes `busy`; quota is checked like a turn and answers `quota`.
+  - **The request** is `stream_messages` with the agent's model, its system prompt in content-block form, the
+    registry's tool specs, `tool_choice=None` and a snapshot of the model state: what the event loop sends, since we
+    register no Strands middleware and `dynamic_trailing_blocks` is 0. The history is
+    `session_manager.rewound_copy(...)`, cut to a pending rewind. The fingerprint is computed by the hook's own
+    function over the request actually sent.
+  - **The lease** is the turn's, owned by the brief stream from the route's return; it polls it every second for a
+    cancel (`preempted`) and the deadline (`timeout`, `HANDOFF_BRIEF_TIMEOUT_SECONDS`, default 30, build included),
+    and releases it before `done`. The agent's own cancel flag is never touched, so a stopped brief cannot leave a
+    sticky Stop on the cached agent.
+  - **Metering** goes through the coordinator's `_store_message_metadata` with `call_kind="handoff_brief"`, no
+    `messageId` and the brief's fingerprint. A brief adds to `totalCost` and the cache rollups but never sets
+    `lastContextTokens`; it does not consume a fork's first-call marker. A model call that returned usage is metered
+    whether or not a brief came of it. A cancelled call (preempted or timed out) gets Strands' zero-filled usage,
+    because the provider's terminal usage never arrived. Once the provider has answered (`messageStart` or a text
+    delta), its row is **estimated** the way a stopped turn's is (`interrupted_usage.build_side_call_usage`). The
+    input is the last reported call's billed prompt plus that call's answer plus the instruction. The read/write split
+    takes that call's cache entry as the prefix, and the output counts the text streamed. The row carries
+    `usageEstimated` (`inputTokens: prior_call_prompt`), so it reads `cacheStatus: estimated` with zero `wastedUsd`.
+    There is no row when nothing in the history reports usage (a source restored into a fresh container) or the cancel
+    came before the provider answered. *Fixed 2026-11-04:* on dev, a preempted brief had streamed 17 deltas and
+    written no row.
+  - **Not built:** the output cap (see "Output" above).
+
+  *SPA built (2026-11-04)*, behind `features.handoffBrief` (on only in `environment.development.ts`):
+  - **The request** is `ChatRequestService.buildHandoffBriefRequest`: `buildChatRequestObject` for the source, with
+    the source's binding (`HandoffDraft.sourceAssistantId`, the same bound Agent a turn there sends) and the
+    handoff's request as the message, plus `handoff_brief`. `HandoffBriefService` streams it to `/chat/stream` with
+    the same transport fields a turn carries (the fork pin, the sign-in panel height) and **its own fetch**, never
+    `ChatHttpService.sendChatRequest`: no message map, no loading flag, no abort controller, no turn timing, so the
+    source never shows as streaming and the composer never offers steering against a brief.
+  - **The card** shows "Writing a brief…" until the first text, then the text as it streams; Send is disabled while
+    it writes, so what the user reviewed is what goes, and "Use the conversation excerpt instead" stops waiting. A
+    written brief becomes the card (trimmed, as the Runtime hashes it); Edit, Remove and Preview act on it, and Send
+    carries it as `handoff_context.text`. A `handoff_brief_fallback` frame, a `done` without `briefHash`, or a
+    stream that closes without either discards any streamed text and keeps the excerpt, with a one-line note.
+  - **Preempt.** `ChatHttpService.sendChatRequest` awaits `HandoffBriefService.preempt` before any turn on a session
+    with a brief in flight (a map lookup otherwise, so no latency is added to a turn). The preempt re-arms the
+    cancel every 1.5 s until the stream closes, because a cancel armed before the brief has taken the lease finds no
+    owner and is a no-op, and after 8 s it cuts the transport and lets the send go. Cancelling the sheet while a
+    brief writes stops it the same way.
 - **PR-0.3b — Notifications.** The three `handoff_*` inbox kinds, written by inference-api after `done`; the scoped
   `PutItem` grant; the bell shown with `features.handoffs` and rendering the new kinds; read-state rules; browser
   notifications through the Notification API, with the in-context permission ask.
+  *Built (2026-11-04).* Notes for the PRs that follow:
+  - **Inbox writes** live in `apis/shared/handoff/notify.py`, called from `HandoffTurn._transition` right after a
+    transition that actually moved the row, in the same background step. So an entry is written exactly when the
+    row changes, a frozen `done` repeated by a later turn writes nothing, and a second pause (or a stop after a
+    stop) is a second entry, which the browser notification's tag replaces. A Stop the user pressed
+    (`user_stopped`) writes none: they know. An error stop and `connection_lost` do.
+  - **The recipient is the token's email** (`current_user.email` on the Runtime, the same claim app-api's
+    `GET /notifications` reads), passed into `HandoffTurn.for_turn`. A token without one skips the inbox, never the
+    row. `NotificationService.notify` skips the actor, who is the recipient here, so handoffs use `notify_own`,
+    which writes with no `actorEmail`.
+  - **The IAM grant already existed.** Shared Projects 2.5a gave the Runtime a `ProjectsInboxWrite` statement
+    (`PutItem` / `BatchWriteItem` under `ForAllValues:StringLike dynamodb:LeadingKeys INBOX#*`), separate from
+    `ProjectsTableReadUpdate` and pinned by `test/projects-table.test.ts`. No CDK change, no new resource, no
+    Runtime environment bytes (`DYNAMODB_PROJECTS_TABLE_NAME` is already derived).
+  - **Read state.** `POST /sessions/{id}/handoffs/{handoffId}/notifications/read {kinds}` marks the caller's unread
+    entries of those kinds for that handoff (`NotificationService.mark_read_matching`, a filtered query over their
+    own partition), after the usual owner check on the handoff row. The SPA calls it on opening a target (once per
+    visit, only when the bell has unread entries or this tab saw that handoff change while the user was elsewhere)
+    and when a change lands while the source or target is in view. The entry is written a moment after the row
+    moves and the SPA learns the status from the row, so the in-view mark waits 1.5 s and looks once more at 3 s.
+    Bring back result (0.4) should call the same route with `["handoff_done"]`.
+  - **Browser notifications** (`HandoffNotificationService`) fire from the same place the toasts do, only while
+    `document.visibilityState === "hidden"`, with `tag: handoffId` and a title only ("*Agent* needs your input" /
+    "finished" / "stopped"). A failed `new Notification` (a browser that wants a service worker) is ignored. The
+    offer is a secondary toast action (`ToastOptions.secondaryAction`, new) and two buttons under a `needs_input`
+    row, both shown until the user answers the browser prompt or presses No thanks (kept in `localStorage`); the
+    setting is a card in Settings → Chat Preferences. 0.3c changes only where a click goes for a relayable prompt.
+  - **Metrics.** `HandoffNotified{inbox}` is emitted where the entry is written. The browser-side ones
+    (`HandoffNotified{browser}`, `HandoffNotificationOpened{inbox|browser}`, `HandoffBrowserPermission{outcome}`)
+    go through `POST /sessions/{id}/handoffs/{handoffId}/notifications/events`, which emits and reads nothing. A
+    permission answered from Settings has no handoff and isn't counted; the in-context ask is the one §4.7 is for.
 - **PR-0.3c — Relayed prompts.** Settle the two §4.3 verify-firsts (interrupt-service scoping, resuming a session
   that isn't viewed), then: `relayedPrompts` on the source's `GET /messages`; the relay under the row for consent,
   approval and questions, and the link-only relay for a browser sign-in; resume of the target from the source;
   first-answer-wins handling; notifications that open the source for a relayable prompt.
+  *Built (2026-11-04).* The verify-firsts, settled:
+  - **Interrupt scoping.** Every prompt slot in the source's message list is filtered by its own session: OAuth
+    since PR-0.3, tool approvals, questions and browser sign-ins before that (a list bound to no session shows none
+    of the last three). The stream parser tags each prompt with the session whose stream raised it, so a background
+    target's prompt is held under the target's id and never matches. Quota and error state are not prompt slots:
+    `quota_warning` and `quota_exceeded` are the user's (account-wide, shown wherever they are), `quota_session_notice`
+    is scoped to the conversation it names, and a `stream_error` is a message in the stream's own thread plus a
+    stored `lastError`, never a toast. One leftover, outside this PR: a background turn's `reset()` clears the
+    account-wide quota-exceeded and funding banners the source shows, because every turn starts without them.
+  - **The `oauthConsent.clear()` gap.** `session.page` still clears the consent queue on every route change. The relay
+    no longer depends on it: its prompts live on the row (`relayedPrompts`), and `HandoffRelayService` re-registers
+    them whenever the queue changes, so a clear is undone on the next tick.
+  - **Resuming a session that isn't viewed.** The resume is addressed by the request's `session_id` end to end: the
+    snapshot lookup (`get_paused_turn(session_id, user_id)`), the lease (taken for that session before the snapshot is
+    read, so a second answer while the first one streams is a 409) and `seed_steer_queue` (seeded on that lease, from
+    the target's own composer queue, which is empty when answering from the source). In the SPA,
+    `beginContinuationStreaming`, loading, the abort controller and the parser are all keyed by the resumed session;
+    nothing in the resume path calls `setViewedSession` or navigates. The consent popup returns over a
+    `BroadcastChannel` to the opener and the resume handler runs from there, so the user stays in the source.
+
+  Notes for the PRs that follow:
+  - **The relay is read, never written.** `apis/shared/handoff/relay.py` reads the target's `META` row for
+    `(target, user)` (`load_session_meta`, so another user's target has no row and relays nothing) and keeps a
+    breadcrumb only while the pause can still be answered: breadcrumbs **and** an unexpired `pausedTurn`, the rule
+    `derive_awaiting_input` uses for the sidenav dot. OAuth is deduplicated by `providerId`, `client_tool` is never
+    relayed, and a sign-in carries only its interrupt id. It runs for `needs_input` rows only, on `GET /messages`
+    and on `GET /sessions/{id}/handoffs/{handoffId}`, which the SPA reads when a target's turn ends: that is how the
+    live relay comes from the same breadcrumbs a reload reads, instead of from prompt state a route change clears.
+    Neither is on the turn path, and nothing is written to the source (pinned by a test that the source's `META` row
+    and its three prefix hashes are unchanged by a relayed and answered pause).
+  - **The SPA puts the relayed prompts in the interrupt services the target's own thread reads**, tagged with the
+    target's session id, and renders the same consent, approval and question components under the row. Answering
+    in either place resolves the one request, so the other surface clears at once in the same tab. When a row stops
+    waiting (superseded, or re-read without them), what the relay registered is withdrawn (`withdraw` on the
+    approval and question services).
+  - **One resume path.** `ChatRequestService`'s four resumes share `resumePausedTurn`, which reports a handoff target's
+    resume to `HandoffRelayService` (`beginResume` / `endResume`) with its outcome: the guard's streamed refusal
+    (`resume_unavailable`, its `reason` now kept by `ChatStateService`) is `conflict` for `missing` /
+    `unknown_interrupt` and `expired` for `expired`, and a 409 is `conflict`. A conflict reads "Already answered" (a
+    line under the row in the source, a toast in the target), re-reads the target's thread, which drops the
+    refusal it streamed, and re-reads the row. A relayed resume passes `quietConflict` so the 409 shows no "Already
+    responding" notice. An ordinary resume is unchanged.
+  - **Notifications.** A `handoff_needs_input` inbox entry now carries `waitingKind`. The bell, the amber toast
+    ("Answer") and the browser notification open the source with the row scrolled into view and focused
+    (`HandoffStateService.requestFocus`) when the prompt is relayable; a sign-in, and every other state, opens the
+    target ("Open"). An entry written before `waitingKind` existed reads the row the tab holds, else the target.
+  - **Metrics** ride the existing `/notifications/events` route: `RelayedPromptShown` (once per interrupt, when the
+    user can see it), `RelayedPromptAnswered` with `relaySurface` (`source` after a resumed turn; `target` before
+    the resume, counted only while the row is still `needs_input`, the one count that reads the row) and
+    `RelayedPromptConflict`.
+  - **Not built:** "Connected · *Agent* resumed" is held per tab, so a reload shows the row's live status instead.
+    A relay registered for a consent never takes over another conversation's pending consent for the same
+    provider (the queue is keyed by provider); that relay shows nothing for it until the other is answered.
 - **PR-0.4 — Send back over delivery.** `create_delivery` and the `DELIVERY#` store in `apis.shared.handoff`, with
   wrapper-tag neutralising; the `deliveries` request field and its acceptance in the same prelude phase as
   `handoff_context`; replay as `deliveries`; the dismiss route. Bring back result on a `done` row; Send to
   *{title}* through the review sheet, without navigating; delivery cards on the composer. Artifact references on
   both paths, with the sender-conversation check and chips on the card and the sent bubble.
+  *Backend built (2026-11-12); the SPA half is its own PR.* Where it differs from the text above:
+  - **Routes.** Send-back has its own sub-route rather than a `kind` on `POST …/handoffs`, because that route's
+    callers omit `kind` and its response is the mention shape: `POST /sessions/{targetId}/handoffs/send-back`
+    `{messageIndex?, deliver}` renders the return excerpt and lists the artifacts that message produced (HEAD
+    `produced_by_message_index` equal to it). `deliver: true` is Bring back result; without it the `send_back` row
+    stays `open` for Send to *{title}*'s review, and `POST …/handoffs/{handoffId}/deliver` `{text, artifactIds}`
+    sends what the user kept. The source is always the target's `spawnedFrom`, so the link is never client-named.
+    `POST /sessions/{id}/deliveries/{deliveryId}/dismiss` removes a card (204 again for a dismissed one, 409 once
+    a send attached it).
+  - **A `send_back` row goes `open` → `done` directly** (`HandoffStore.complete_send_back`, conditioned on the
+    kind, so a mention row can't take that path). It runs nothing, so it never passes through `running`. The
+    route checks the delivery first (`prepare_delivery`), then closes the row, then writes the delivery, so a
+    refused card leaves the review open to fix and resend, and a double click sends once.
+  - **Attaching is one conditional `UpdateItem` per card, with no read first.** `pending` → `attached` on
+    `(owner, receiving session)` with `ReturnValues=ALL_NEW` both guards exactly-once and returns the text, so a
+    send with cards pays one round trip per card, issued together beside the agent build (`DeliveryTurn`, the
+    `HandoffTurn` pattern), instead of §4.8's `BatchGetItem` then write. Only the first three ids are tried, so a
+    stale id takes a slot and a card past it waits for the next send; the SPA only sends cards it holds as
+    pending. `edited` is written in the background after the block is built.
+  - **A sent bubble renders its card from its own message.** The block is in the persisted user message, behind
+    the displayText split, so replay (`deliveries` on `GET /messages`) lists pending cards only and an attached
+    card needs no link to a message id. The SPA PR parses the message's leading `<handoff_context>` blocks and
+    their `<artifact/>` lines.
+  - **Wrapper tags are defused in both directions of travel** (§9.6 rule 5): `<handoff_context`,
+    `<conversation_message`, `<user_message_during_turn` and `<artifact` can be neither opened nor closed by a
+    body, and the excerpt's own tag not closed, in `context.py` and its TypeScript copy alike. The parity fixture
+    gained a case for it.
+  - **Known gap:** a card attaches at the head of the turn. A turn that fails before the agent appends the user
+    message (an agent build that raises) spends the card without sending it. Measure how often on dev before
+    deciding whether a release on that path is worth its cost.
+  - **TTFT, measured on dev 2026-11-12 and accepted.** A `delivery_attach` line per send records `waitMs` (how
+    long the turn blocked on the writes) and `attachMs` (the writes' own time). On a warm source: 1 card
+    0.1–0.2 ms (the 16–21 ms of writes finish behind the build), 2 cards 5.0 ms, 3 cards 4.3 and 4.5 ms with
+    one 45.6 ms outlier (the first three-card send on that container, whose writes took 50 ms). A send
+    without cards runs nothing. Every source call stayed a cache `hit`.
+  *SPA built (2026-11-13).* `DeliveryStateService` holds the cards per receiving conversation (seeded from
+  `deliveries`) and Send to *{title}*'s review per target; `DeliveryService` makes the calls.
+  - **Composer cards** (`DeliveryCardsComponent`, above the composer): "From *{title}*", a one-line preview,
+    Preview, Edit and Remove (dismissed on the server), and artifact chips. The first three say "Goes with your
+    next message", the rest "Goes with the message after".
+  - **The send** takes up to three cards (`takeForSend`), oldest first, sending `text` only for an edited card,
+    and puts them back if the send is refused before it starts (`StreamNotStartedError`). The live bubble's
+    text is the same blocks the server stores, with `displayText` the typed words, so the live and reloaded
+    bubbles render through one path.
+  - **The sent bubble** reads its cards back out of its own text (`extractDeliveryBlocks`, the exact shape the
+    server writes and only at the start of a message with `displayText`), as "From *{title}*" with Show result
+    and the chips. A message the user typed is never read as a card.
+  - **Bring back result** is a sibling button under a done row, and reads "Added to your next message" once the
+    card is on the composer. **Send to *{title}*** is an icon in the action row of every answer in a conversation
+    with `spawnedFrom`; it opens `SendBackSheetComponent` (the review sheet's look, not its code: the mention
+    sheet is built around an Agent, a request and a brief) with the result editable and each artifact a
+    checkbox. Neither navigates; Send's toast offers Open.
+  - **Artifact chips** (`DeliveryArtifactChipsComponent`) open `/artifacts/{id}`. One read of the user's
+    artifact library (`ArtifactAvailabilityService`, re-read after 30 s) marks a chip "Newer version available"
+    or, as plain text, "No longer available"; until it lands a chip is a plain link.
+  - **Parity.** `renderDeliveryBlock` is the TypeScript copy of `render_delivery_block`, pinned by the
+    fixture's `deliveryCases`, which both sides' tests read.
+  - **Not built:** the `DeliveryArtifactOpened` count (§4.7) needs the notification-events route to accept it.
+- **PR-0.4a — Files by reference (§4.9).** Settle §4.9's verify-first (the inventory of `FileMetadata` readers)
+  first. Then:
+  - `linkedFrom` on `FileMetadata`, which is additive, plus `is_linked_reference` and `resolve_linked_file`
+  - the delete, quota and write-in-place rules in the repository and the tools the inventory names
+  - `handoff_context.file_ids` and the rows written at acceptance
+  - a delivery's `files` and the rows written at attach
+  - the `<file>` line in the wrapper renderer
+  - the review sheet's file checkboxes, the "From *{title}*" marking in the Files panel, and the handoff row's list
+    of the target's files
+  - the §4.7 metrics
+
+  It can land after PR-0.4, or with it: the handoff half needs only PR-0.2's acceptance.
+
+  *Verify-first, settled (2026-11-13).* Every reader and writer of a `FileMetadata` row outside the repository,
+  and what a reference row needs from it. Thumbnails, previews and sidecars all live under the row's `s3Key`
+  (`derived_prefix`, `thumbnail_key`, the legacy `_thumb.png`), so a reference that shares the key reads all of
+  them and, before this PR, deleted all of them.
+
+  | Reader or writer | What it does with the row | Rule | Built |
+  |---|---|---|---|
+  | `FileUploadService.delete_file` (Files panel `DELETE /files/{id}`, folder removal) | deletes the object, thumbnail and `_derived/`, then decrements quota | 1, 2 | a reference removes its row only |
+  | `FileUploadService.delete_session_files` (session delete cascade) | the same per row | 1, 2 | row only for a reference |
+  | `FileUploadRepository.delete_session_files` | row only, no callers | 2 | unchanged |
+  | `evals.fixtures.delete_upload` | row, then every object under the key's prefix | 2 | row only for a reference |
+  | `FileUploadService.replace_file_content` (folder refresh) | new bytes at the same key, quota by the delta | 3 | refuses a reference |
+  | `modify_word_document`, `redline_word_document`, `compare_word_documents`, the spreadsheet and deck modify/template tools | read the source's bytes, save through `_store_document`: a **new** upload id and key in the caller's conversation | 3 | already a new file; pinned by tests |
+  | `document_read` (`read_document`, `document_provenance_units`) | `is_prepared`, sidecars, digest; the 8 MB check | 4, 5 | reads through to the original (`readable_view`); gone → "No longer available (deleted from *{title}*)" |
+  | `document_read`'s `query` (`search_documents` → `search_attachments`) | `search_status` from `kbIndex`; KB filter on this conversation and upload id | 4 | each reference searched under its original's session and id, alone, hits reported under the reference's id; nothing else of the source is reachable |
+  | `session_has_documents` (the gate), `list_session_documents`, `workspace_list` | list by `CONV#` and mime type | — | unchanged: the row is why |
+  | `workspace_read` | bytes at `s3Key` | 5 | gone message, never `NoSuchKey` |
+  | Word, spreadsheet and deck tools' reads (`_download_s3_bytes`), `analyze_spreadsheet` | bytes at `s3Key` | 5 | missing object → a "no longer available" error the tool relays |
+  | `get_preview_url`, `get_download_url`, `get_text_snippet`, `get_sheet_preview`, `get_or_create_thumbnail` | presign or read the key; thumbnail queued under the row's ids | 4, 5 | the original's row (`_readable_file`), so the prepare Lambda's key guard accepts the thumbnail; gone → 404 |
+  | `GET /files/{id}/search-status` | `kbIndex`, `preparation` | 4 | the original's |
+  | `requeue_evicted_attachments` (conversation open) | `kbIndex` eviction | 4 | a reference re-queues its evicted original |
+  | `FileResolver._resolve_single_file` (`file_upload_ids`) | inline bytes, or a `ReferenceAttachment` | 6 | refuses a reference with a warning |
+  | `_start_session_files_read` (phase 5's conversation set), `load_session_documents` / `digest_for` (rehydration, offload, `_fill_document_index`) | facts, preparation, digest; a lazy digest written back onto the row | 4, 6 | references left out (never in history; their `<file>` line already says how to read them); no digest is ever written onto one |
+  | large-document prepare Lambda `prepare_upload` | would record `preparation=failed` on an unprepared-looking row | 4 | returns `linked_reference` before any write |
+  | `list_user_files` (Files panel) | lists | 5 | each reference carries `linkedFrom` and `originalAvailable` (one batched read, only when the page holds one) |
+  | admin costs `_attachment_profile` (`list_session_file_stats`) | sums sizes | — | unchanged: a reference's `source: "linked"` is visible there; diagnostic only |
+  | attachments-KB `reconcile`, the S3 delete handler | walk KB documents and object keys, not rows | — | unchanged: they never see a reference |
+
+  *Built (2026-11-13).* `apis/shared/files/linked_files.py` holds the rules; where it differs from §4.9:
+  - **Reference ids are deterministic**: `{originalUploadId}_ref_{first 12 hex of the handoff or delivery id}`
+    (`reference_upload_id`, mirrored in `handoff-prompt.ts`). The review sheet's preview and the live bubble name
+    the id the row is written under, and a repeated write lands on the same row, so the `BatchWriteItem` needs no
+    condition. Exactly-once comes from the acceptance and attach conditions, which run first.
+  - **The gate is told by a hint, not by acceptance.** Tools are built in the handler, before the stream where
+    acceptance runs, so acceptance can't classify in time. Instead `HandoffTurn.prefetch` / `DeliveryTurn.prefetch`
+    read the `HANDOFF#` row and the files (or the cards) **read-only, before the lease**, and the gate awaits that
+    `document_hint` beside its own query, only when its memo hasn't already said yes. A send without files starts
+    nothing; a handoff without files prefetches nothing. Acceptance reuses the prefetched row. A delivery attach turn
+    therefore carries `document_read` on the turn that brings a document back, not one turn later.
+  - **A file that may not cross is dropped from a handoff with a warning, but refuses a delivery**
+    (`file_not_in_sender`), like an artifact: the handoff's ids come from a send that must not fail, the
+    delivery's from a review the user can fix.
+  - **Bring back result carries the target's own files** (up to five, newest first: a target is a new
+    conversation, so all of its own files postdate acceptance). The row's per-file Bring back is
+    `POST …/handoffs/send-back {deliver: true, fileIds: [id], filesOnly: true}`, a files-only card. Send to
+    *{title}* lists the same files as checkboxes (`files` on the response, `fileIds` on `…/deliver`).
+  - **A delivery's files are stored as originals** (`DeliveryFile`: id, session, title, name, type, size, and the
+    key, bucket and TTL so the attach writes the row without reading the original). The card's view omits the key.
+  - **A failed row write drops the lines**: the model is never told about a file it can't open.
+  - **Metrics**: `HandoffFiles` and `DeliveryFiles` carry the count as the value; `HandoffFilesUnticked` is
+    `handoff_context.filesUnticked`, sent by the review sheet; `LinkedFileRead` / `LinkedFileGone` by reader from
+    `readable_view` and the office tools' finders.
+  - **The wrapper defuses `<file` too**, opening and closing, in both copies.
+
+  *SPA built (2026-11-13).*
+  - **Review sheet.** The sheet lists the source's ready files (`GET /files?sessionId=`, read when it opens),
+    each a checkbox. Files attached to the source's last five user messages are ticked, up to five, and a sixth
+    box is disabled. The preview wraps the ticked files' `<file>` lines exactly as the server will
+    (`referenceUploadId` on the original's id, so a file the source itself holds by reference names its
+    original). Send carries `fileIds` and `filesUnticked`. A source file whose original is gone isn't offered.
+  - **Send to *{title}*** lists the target's own files as checkboxes, all ticked. **Bring back result** carries
+    them.
+  - **Cards and bubbles.** Delivery cards and sent bubbles show each file as a chip
+    (`DeliveryFileChipsComponent`). The chip downloads through the durable `/files/{id}/download` path: the
+    original's id on a pending card, and the reference row's id in a sent bubble (read back from its `<file>`
+    line).
+  - **The handoff row** lists the target's own files (`HandoffTargetFilesService`, re-read each time the row
+    settles into a new state, never while it streams), each with its own Bring back (`filesOnly`). These are
+    sibling controls, never inside the row's link.
+  - **The Files panel** (`/files`) marks a reference "From *{title}*", or "No longer available (deleted from
+    *{title}*)" when `originalAvailable` is false.
+  - **Browser-checked on dev after both merged**; see *Dev-validated* below.
+
+  *Found on dev and fixed after merge.*
+  - **Every tool gate that reads the conversation's files gets a hint, not only `document_read`'s** (found on
+    dev). The Spreadsheet Analysis and PowerPoint auto-enables query the conversation's READY uploads too, and a
+    shared CSV's reference row did not exist yet when they ran. So a target that received a spreadsheet got
+    `analyze_spreadsheet` on turn 2, not turn 1: the model could not read the file on the turn it arrived, and
+    `toolConfigHash` changed between the two turns, which re-wrote the whole cached prefix once (21,371 tokens
+    on the measured target). The prefetch now classifies the shared files into kinds (`apis/shared/files/file_kinds.py`:
+    document, tabular, presentation, by the same predicates the session queries use), and `_session_has_tabular` /
+    `_session_has_presentation` await their kind's hint beside their query, exactly as the document gate does.
+
+  *Dev-validated (2026-11-13), and TTFT accepted.* Twelve handoffs carried 0, 1, 3 and 5 files.
+  - **TTFT.** `document_hint gateMs` was 4.4–6.8 ms, with `readyAtGate` false every time but never extending
+    past the query. `handoff_files writeMs` was 8.8–10.6 ms whatever the count. The warm `tools` stage was
+    241–267 ms with no files and 254–316 ms with files, which is noise. The developer accepted this.
+  - **Correctness.** The target's wrapper carried the `<file>` lines under deterministic ids, with
+    `originalAvailable` set on the rows. `document_read` quoted the original PDF and .docx.
+  - **SPA, checked in the browser.** The review sheet listed the source's files ticked, and an unticked CSV did
+    not cross. The handoff row listed only the target's own file. Bring back put a card with a download chip on
+    the composer, and the model read the file on send. The sent bubble rebuilt its chip on reload. The Files
+    panel showed "From *{title}*".
+  - **Contrast.** Text contrast passed AA in both themes on the sheet, the row, the card and the Files label;
+    the lowest was 4.84:1. axe itself was not run on dev: the page can't load it from a CDN, and the repo has no
+    `axe-core` installed.
 - **PR-0.5 — `suggest_handoff`.** Tool, `handoff_suggested` event, chip UI that opens the review sheet, replay,
   `CLAUDE.md` SSE table. Marginal CountTokens measured and recorded in the PR.
 - **Dev validation.**
@@ -1451,7 +2245,7 @@ has started", and the only one that spends money while nobody is watching.
   Then flip defaults on and start the §7 clock.
 
 **Phase 1** (after the gate)
-- **PR-1.1 — Extract `resolve_turn_agent`.** Pure refactor.
+- **PR-1.1 — Extract `resolve_turn_agent`.** Pure refactor. *Moved into PR-0.3a (2026-10-22)*, which needs it. *Built (2026-11-03):* `resolve_turn_agent` returns the refusal to stream or a `ResolvedTurnAgent`; `record_use=False` skips the share and last-used writes. Prompt composition is `compose_turn_system_prompt` and `apply_turn_prompt_extras`, so the brief's system prompt is the turn's, byte for byte. The consult's `degrade=False` is not a parameter yet; Phase 1 adds it.
 - **PR-1.2 — Backend consult** (flag off): session prefix + list filter, orchestration, report, `CONSULT#` rows,
   SSE events, metering attributes, interrupt handling, `CLAUDE.md` SSE table.
 - **PR-1.3 — SPA**: Ask here / Hand off choice, consult card, disclosure, replay.
@@ -1525,13 +2319,43 @@ has started", and the only one that spends money while nobody is watching.
 - **O. Show a relayed prompt in the source composer's own prompt slot.** One place for every prompt, but it makes
   the target's pause look like the source's, which is the exact failure §4.3's scoping check guards against.
   Rejected: the relay lives in the handoff row.
+- **Q. A separate, cheap model writes the brief from the excerpt** (Nova Micro or Haiku over a ~24k-token excerpt).
+  Independent of the source's model and its price, but it reads the conversation from scratch every time (~$0.03
+  on Haiku 4.5 at 24k, uncached), sees only what the excerpt kept, and doesn't know what the source's tools could
+  do. Rejected for the cached brief (§4.5), which is cheaper whenever the cache is warm and reads everything the
+  source's model saw.
+- **R. Strip the tools, or set `tool_choice` to `none`, so the brief can't call one.** Either invalidates the cache
+  the brief exists to reuse (tools invalidate every tier; `tool_choice` the messages tier). Rejected: keep the
+  request identical and instruct against tool use, and never execute a tool call.
+- **S. Persist the brief request and answer into the source's history** (the model "writes a handoff note" as a
+  turn). The cache stays warm the same way, but the source's history would carry an instruction and a brief the
+  user didn't write, in the cached prefix for good. Rejected: the brief is a side call that leaves the source as it
+  was.
 - **P. Inline artifact bodies in a delivery.** The model could read the artifact without a tool, but a whole
   document would enter the receiver's history permanently, at model rates on every later turn, whether or not the
   conversation needs it again. Rejected for references plus, if needed, a bounded `read_artifact` (§13 Q14).
+- **T. Strands Swarm's `SharedContext` as the workspace.** It is the SDK's built-in shared state. But it lasts one
+  in-process `Swarm` run, and `_build_node_input` writes all of it into every next agent's prompt. Our linked
+  conversations are separate sessions in separate microVMs, so it can't reach across them, and writing the store
+  into every prompt is the unbounded pass-through the cost tenet rules out. Rejected (§4.9).
+- **U. A shared folder per handoff that both sides write**, for example a `WORKSPACE#<handoffId>` namespace. It is
+  closest to "a workspace" as a word. But two writers on one file need a conflict rule, and the folder has no owner
+  once one side is deleted. It also brings back a second key convention, the one `session-workspace-tools.md`
+  dropped from the reference repo. Rejected: each file stays with its writer, and a reference shares it.
+- **V. Copy the bytes into the receiving conversation.** Simple and fully isolated. But it counts the quota twice,
+  and after a revision on one side, the other side holds a stale copy that looks like the original. Rejected for
+  references.
+- **W. Put a list of upload ids on the `HANDOFF#` or `DELIVERY#` row, and have readers accept them.** No new rows.
+  But every gate that asks "does this conversation have a document" would need a second read before the first token,
+  or the tool would flap across microVMs and rotate `toolConfigHash`. Rejected for a row the existing query finds.
+- **X. Show the model every linked file automatically.** It would put files the user never chose in front of a
+  model that may have read an injected page. It would also make the source's `toolConfig` depend on what the target
+  does. Rejected: the user decides what crosses, and the handoff row shows them the rest.
 
 ## 13. Open questions
 
-1. **Excerpt size.** Is 4k tokens enough in practice? Measure `HandoffContextEdited` before tuning.
+1. **Excerpt size.** Is 4k tokens enough in practice? Measure `HandoffContextEdited` before tuning. *(2026-10-22: the
+   excerpt is now the fallback; the question moves to the brief's length bound.)*
 2. **Should the source's model learn about a handoff?** Today it doesn't until a result is brought back, so "what
    did Rubric Builder say?" gets a blank. One option: on the source's next user turn, append a one-line note
    (`[Handed off "draft a rubric for this" to Rubric Builder]`). It is append-only, so the cached prefix is safe, but
@@ -1565,6 +2389,33 @@ has started", and the only one that spends money while nobody is watching.
     `update_artifact` lets it overwrite a document it can't read. Is a bounded, offset-paged `read_artifact` worth
     its one-time fleet-wide `toolConfig` write? It would help well beyond handoffs (revising an artifact from an
     earlier turn after compaction, say), so it may belong in the artifacts spec rather than here.
+
+15. **A cold brief.** When the source's cache has expired, should the brief still run on the source's model (it
+    writes the prefix at 1.25×, which the user's next source turn then reads), fall back to the excerpt, or switch to
+    a cheaper uncached model? Decide from `HandoffBriefWritten` by `briefCacheStatus` and whether the next source turn
+    reads the write.
+16. **Expensive source models.** A brief on Fable 5.1 costs mostly output (~$0.045). Is that fine because the user
+    chose that model, or should a brief on a very expensive model show its cost, or fall back?
+17. **A suggested request.** Claude also rewrites the request into a self-contained prompt. Should the brief end
+    with a suggested request the user can accept into the Request field, or should the request always stay exactly
+    what the user typed?
+18. **Phase 1 reuse.** A consult needs the same "what does the other Agent need to know" step. Should the consult's
+    context be this brief, written from the parent's cache, instead of an excerpt?
+19. **A shared Code Interpreter session.** A linked pair could share one Code Interpreter session, which is the case
+    Strands' shareable `Sandbox` fits best. Three things are open: its lifetime (an idle timeout, against a handoff
+    that runs for days), who pays for it, and which microVM owns it. Until then, a file made in one conversation's
+    sandbox crosses only once it is saved to the user-files table, and §4.9 covers it from there.
+20. **An agent-facing linked listing.** Should `workspace_list` gain `scope: "linked"`, listing the user's files in
+    this conversation's linked conversations and bounded like the other scopes, so a target can find a file the user
+    didn't tick? It would ride the `workspace_files` grant, which no prod role holds, so it would reach few users
+    until that changes. Decide from `HandoffFilesUnticked`, and from whether targets ask the user for files the
+    source had.
+21. **Warn before deleting a shared file.** Deleting an original leaves references that read as gone (§4.9 rule 5).
+    Should the Files panel warn "Used in 2 linked conversations" first? That needs a lookup by `linkedFrom` on
+    delete, which means a GSI or a query per linked conversation.
+
+**Decided (2026-10-22):** the context card is a brief written by the source conversation's own model from its own
+prompt cache, as a non-persisting side call; the deterministic excerpt is the fallback.
 
 **Decided (2026-09-27):** review before sending is required, and the handoff never sends immediately. This replaces
 the earlier open question about auto-send.

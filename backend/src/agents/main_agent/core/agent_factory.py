@@ -16,8 +16,10 @@ from agents.main_agent.core.retry_strategy import TransientModelRetryStrategy
 from agents.main_agent.config.constants import EnvVars, Defaults
 from apis.shared.models.bedrock_responses import build_bedrock_responses_model
 from apis.shared.models.mantle import build_mantle_model
-from apis.shared.models.signed_reasoning import signed_reasoning_input
 from apis.shared.models.stream_output import tag_partial_output
+from apis.shared.feature_flags import converse_document_cap_enabled
+from apis.shared.files.attachment_plan import documents_as_text
+from apis.shared.models.document_cap import CONVERSE_MAX_NON_PDF_DOCUMENTS, UNCAPPED, converse_document_cap
 from apis.shared.models.text_only_input import text_only_input
 from apis.shared.models.usage_normalization import usage_normalized
 
@@ -246,13 +248,42 @@ class AgentFactory:
         if model_config.text_only:
             model = text_only_input(model)
 
-        # Claude verifies the signature on every replayed reasoning block, and
-        # a turn that ran on another model (GPT, after a mid-conversation
-        # model switch) left unsigned ones in the shared history. A history
-        # that only ever ran on Claude has none, so this changes nothing there.
-        model_lower = model_config.model_id.lower()
-        if provider == ModelProvider.BEDROCK and ("claude" in model_lower or "anthropic" in model_lower):
-            model = signed_reasoning_input(model)
+        # Converse rejects a request with more than five non-PDF documents in
+        # it, history and tool results included. The composer caps a message
+        # at five, not a conversation, so a later turn's attachments can tip a
+        # warm session over. Same per-call projection: past the fifth, a
+        # document is sent as its text (apis/shared/models/document_cap.py).
+        # When the planner's profile says so (CONVERSE_DOCUMENTS_AS_TEXT_ENABLED
+        # in the legacy profile, always in the token profile) every non-PDF
+        # document it can render goes as text, not only the overflow.
+        if provider == ModelProvider.BEDROCK:
+            capped = converse_document_cap_enabled()
+            as_text = documents_as_text()
+            if capped or as_text:
+                model = converse_document_cap(
+                    model,
+                    limit=CONVERSE_MAX_NON_PDF_DOCUMENTS if capped else UNCAPPED,
+                    as_text=as_text,
+                )
+        else:
+            # Every other provider is an OpenAI-shaped or Gemini Strands model
+            # (OpenAIModel, OpenAIResponsesModel, GeminiModel). Strands formats
+            # a document block for them as a base64 file part whose MIME type
+            # comes from `mimetypes` on the format: docx has no entry there, so
+            # it goes as application/octet-stream, and Chat Completions' file
+            # part reads PDFs only. Text is the one shape all of them accept,
+            # so every non-PDF document they get is sent as its text, the
+            # projection's documents-as-text mode. There is no five-document
+            # limit off Converse, so nothing is capped. PDFs and images keep
+            # their native parts, which each of these formatters maps (Strands
+            # 1.63.0: `image_url`, `input_image`, `inline_data`).
+            model = converse_document_cap(model, limit=UNCAPPED, as_text=True)
+
+        # Reasoning blocks a model would reject are dropped by Strands itself
+        # since 1.61.1 (#5166), in `BedrockModel._format_bedrock_messages` via
+        # `_rejects_reasoning_block`. We carried the same projection locally
+        # from 29b05de1; upstream's covers more (the Claude -> GPT/Nova/Llama
+        # direction too) and runs for every Bedrock model, so ours was removed.
 
         retry_strategy = AgentFactory._build_retry_strategy(model_config, model)
 
@@ -266,15 +297,18 @@ class AgentFactory:
         # point misses — see the cachePoint budget comment in
         # ModelConfig.to_bedrock_config.
         #
-        # INVARIANT, as of strands-agents 1.55.0 (the pinned version): this
-        # hand-placed system cachePoint is honored, never doubled. 1.55 does
-        # place a system cachePoint of its own — _should_cache_system(), with
-        # CacheConfig.system_prompt_ttl defaulting to True — but it arms on two
-        # conditions that together can never catch a block list this branch
-        # skipped. (1) It returns early unless _cache_strategy == "anthropic",
-        # i.e. "claude"/"anthropic" in the model id — the same test inside
-        # bedrock_cache_points_supported(), so on any model where upstream
-        # would place one, the list below already carries ours. (2) Its final
+        # INVARIANT, established on strands-agents 1.55.0 and still true on
+        # 1.63.0: this hand-placed system cachePoint is honored, never
+        # doubled. Upstream does place a system cachePoint of its own —
+        # _should_cache_system(), with CacheConfig.system_prompt_ttl defaulting
+        # to True — but it arms on two conditions that together can never catch
+        # a block list this branch skipped. (1) It returns early unless
+        # _cache_strategy == "anthropic". Since 1.63.0 that reads
+        # model_info.json's prompt_caching rather than a "claude"/"anthropic"
+        # name test, but it agrees with bedrock_cache_points_supported() on
+        # every id we run (test_strands_model_info_defaults.py pins this), so
+        # on any model where upstream would place one, the list below already
+        # carries ours. (2) Its final
         # guard is `not any("cachePoint" in block for block in system_blocks)`,
         # which sees that block and stands down. Upstream's own CacheConfig
         # docstring says the same thing ("A hand-placed system cache point is
@@ -282,10 +316,11 @@ class AgentFactory:
         # "strips only message-level cachePoints, never system ones" was a
         # 1.51-era fact and is NOT the reason this is safe — do not restore it.
         #
-        # Measured on the pinned 1.55.0 (2026-09-11) rather than read off the
-        # source: formatting a request with this block present yields exactly
-        # ONE system cachePoint, and with it absent upstream injects exactly one
-        # of its own. The same probe shows the converse, which is why the
+        # Measured on 1.55.0 (2026-09-11) rather than read off the source:
+        # formatting a request with this block present yields exactly ONE
+        # system cachePoint, and with it absent upstream injects exactly one
+        # of its own. test_bedrock_golden_requests.py now pins the whole
+        # formatted request, so a bump that breaks this fails CI. The same probe shows the converse, which is why the
         # bedrock_cache_points_supported() gate below cannot be dropped —
         # on a NON-Anthropic model this block is passed through untouched and
         # Bedrock rejects the call with AccessDeniedException.

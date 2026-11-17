@@ -87,14 +87,14 @@ call inside `async def`, which blocks the event loop for its round trip.
 | B1 | `preamble.ownership` | `load_session_meta`: **one** `SessionLookupIndex` query answering both "is this someone else's session" (→ 404) and "the caller's META row" (threaded as `session_meta` into everything below). | D ×1 sync | 6–7ms |
 | B2 | `preamble.skills` | `_apply_enabled_skills_filter(await _resolve_accessible_skill_ids(...))` **only when** `enabled_skills` is non-empty (opt-in, D6). | R + skill catalog | ~0 (6–21 with skills) |
 | B3 | *(unmarked)* | Model retirement resolve (`resolve_effective_model`, 60s catalog cache). Then the two **non-turn early exits**: `app_tool_call` and `app_context_update` (MCP Apps) build/reuse the agent with `cache_write=False` and return JSON. Then the **model access** RBAC check (row handed over from the retirement resolve, so no catalog read): a refusal streams a conversational denial here that persists nothing (`_forbidden_turn(..., persist=False)`), before B4–B5 write anything (no attachment-marker pop, no row pre-create, no title task) — unless quota is exceeded, which the refused path consults first so the quota message keeps precedence. Skipped for a non-resume retired-without-successor id, which B7 answers. | C, R | ~0 |
-| B4 | `preamble.files` | `pop_pending_attachments` (snapshot; a write only if a marker exists) → `_select_recovered_attachments` → per-message file cap (a folder counts one, after the files) → `resolve_files` (**one S3 GET per upload id**), overlapped with the folder rows (`folder_attachment_ids`, flag-gated: **one GetItem per folder**, ≤2, in worker threads; none without folders) → dedupe → `_partition_attachments` (inline / tabular / pptx / oversized) → inline byte budget → marker names. | S ×N, D ×0–2 | 1ms with no attachments |
+| B4 | `preamble.files` | `pop_pending_attachments` (snapshot; a write only if a marker exists) → `_select_recovered_attachments` → per-message file cap (`cap_message_attachments`; a folder counts one, after the files) → `resolve_files` (**one S3 GET per upload id**; the resolver asks `delivers_by_reference` first, so a reference row is never fetched), overlapped with the folder rows (`folder_attachment_ids`, flag-gated: **one GetItem per folder**, ≤2, in worker threads; none without folders) → dedupe → `plan_attachments` (`apis/shared/files/attachment_plan.py`: native / on_demand / tool / dropped per file, byte rules of the `legacy` profile, pure, ~70 µs for five files) → marker names. The model's rules (`refine_for_model`: text for a TEXT-only model or with documents-as-text) apply at B11, once the model is known. | S ×N, D ×0–2 | 1ms with no attachments |
 | B5 | `preamble.session_state` | `ensure_session_metadata_exists` (a conditional `put_item` on a new session; snapshot short-circuit otherwise) → `clear_paused_turn`, `clear_pending_interrupts`, `clear_truncated_turn`, `clear_interrupted_turn` (all snapshot short-circuits; a write only when a marker exists) → `set_pending_attachments` (write if uploads) → **title task spawned** on a first turn (`generate_conversation_title`, Nova Micro in `to_thread`, persists in the background). | D 0–3 | 3–4ms |
 | B6 | `preamble.quota` | `check_quota(session_total_cost=<from snapshot>)`: tier (cached), user cost summary (cached), session notice from the snapshot. Early return with a conversational message if exceeded. | cached | 5ms |
 | B7 | *(unmarked)* | Retired-model denial (conversational). `_load_user_settings` (**one GetItem**, feeds default model + personal instructions). | R, D ×1 sync | ~6ms |
 | B8 | `rag` | **Agent turns only** (`rag_assistant_id`, not resume). In order: `_session_has_messages` (mention turns only); `get_session_metadata` (**a second read of the META row**, outside the PR-2 snapshot); `get_assistant_with_access_check` (assistants table + shares); `resolve_invocation_agent` (version snapshot); `mark_share_as_interacted` (**write**, non-owner); `bump_last_used_at` (**conditional write every turn**, throttled to one real bump/day) + `resume_inactive_policies`; project gate (project row); `resolve_agent_invocation` (bound tools/skills/model/memory, RBAC); **knowledge-base search** (embedding + vector query; the one wait here the answer genuinely needs); prompt composition; memory hydration (`to_thread`); `get_session_metadata` (**third read**) + `store_session_metadata` (**full-row write every bound turn**). Every DynamoDB call in `assistants/service.py` constructs its own `boto3.resource("dynamodb")` (14 sites) rather than using `apis.shared.aws_clients` — the ~47ms-per-construction cost the preamble spec removed from `metadata.py` is still paid here. | D ×4–6 sync, KB | 0 on plain chat; unmeasured on agent turns |
 | B9 | *(unmarked)* | Active custom prompt (`resolve_active_prompt_text`: a prompts-table read when the turn or session selects one); personal instructions composed for plain turns. | D 0–1 | ~0 |
 | B10 | *(in `tools`)* | **Single-flight lease** `acquire_session_lease` (one conditional update; 409 if held) and, on a resume, `seed_steer_queue`. | D ×1 sync | ~6ms |
-| B11 | `tools` | Non-resume: model fallback (`_resolve_fallback_model`: settings → catalog default → RBAC re-check), `_resolve_model_settings` (catalog cache; admin bounds/locks; the row's `inputModalities`), `_adapt_attachments_for_model` (returns at once unless the row is TEXT-only and the turn inlined a file; then documents become text off the loop — 0.5ms for 1 page, 22ms for 100, warm — and images are dropped with a note), attachment auto-enable (`_session_has_tabular`: a DynamoDB query unless memoized; RBAC per spreadsheet tool id), always-on union (catalog snapshot), **injected tool builders** (spreadsheet / artifact / word / workspace / excel / powerpoint / account / skill authoring / memory — closures, no IO; `@tool` decoration is a few ms per family, and skill authoring memoizes its seven per session: ~9ms on a session's first turn, ~0 after), `_build_document_tools` (`_session_has_documents`: a query unless memoized), cache-key material. Resume: `get_paused_turn` + an eager `get_agent` from the snapshot. | C, R, D 0–2 | 98–102ms warm, 196–244 cold — **never decomposed** |
+| B11 | `tools` | Non-resume: model fallback (`_resolve_fallback_model`: settings → catalog default → RBAC re-check), `_resolve_model_settings` (catalog cache; admin bounds/locks; the row's `inputModalities`), `_adapt_attachments_for_model` (returns at once unless the row is TEXT-only and the turn inlined a file; then documents become text off the loop — 0.5ms for 1 page, 22ms for 100, warm — and images are dropped with a note), attachment auto-enable (`_session_has_tabular` and `_session_has_presentation`, run concurrently: each a DynamoDB query unless memoized; RBAC per spreadsheet tool id; the deck gate checks its one id and RBAC first and skips its query when the id is already on or not granted), always-on union (catalog snapshot), **injected tool builders** (spreadsheet / artifact / word / workspace / excel / powerpoint / account / skill authoring / memory — closures, no IO; `@tool` decoration is a few ms per family, and skill authoring memoizes its seven per session: ~9ms on a session's first turn, ~0 after), `_build_document_tools` (`_session_has_documents`: a query unless memoized), cache-key material. Resume: `get_paused_turn` + an eager `get_agent` from the snapshot. | C, R, D 0–2 | 98–102ms warm, 196–244 cold — **never decomposed** |
 | B12 | `stream_setup` | Citations list, the two generators wired, `StreamingResponse` returned. Headers flush here. | — | ~1ms |
 
 **`agent_build` is not in this table** because with `AGENT_PREPARING_PHASE_ENABLED`
@@ -121,7 +121,7 @@ between B11 and B12 and the `preparing`/`prepared` frames are never sent.
 | `registry` | `create_default_registry` (imports; sympy behind `calculator`), `ToolFilter`, `_register_external_mcp_tools`: a `ThreadPoolExecutor` + fresh event loop + `asyncio.run`, **one `get_tool` GetItem per enabled tool** (uncached; `repository.get_tool` is a direct `get_item`). | C ×N | 50 |
 | `session_mgr` | `SessionFactory.create_session_manager`: `load_memory_config`; **`_discover_strategy_ids`** (`MemoryClient(region)` → 2 clients on a fresh session, then a control-plane `get_memory_strategies` call; `lru_cache` per process, so **once per fresh process = once per conversation**); retrieval config; `TurnBasedSessionManager(...)` → SDK ctor builds **`MemoryClient()` (fresh session + 2 clients) and then a second fresh session + 2 clients that replace the first pair**; Strands `RepositorySessionManager.__init__` → `read_session` (**1 `ListEvents`, 2 on a new session** via the legacy fallback) → `create_session` (**1 `CreateEvent`** on a new session). | 4 parses, M ×2–3 | 616–830 |
 | `tools` | `filter_tools_extended`; gateway: `_expand_gateway_tool_ids` (executor + `asyncio.run`, `get_tool` per gateway id) and `get_gateway_client_if_enabled` (client object; started later by Strands); external MCP: capture contextvars, executor + `asyncio.run` → `load_external_tools`: `get_tool` per server, `create_external_mcp_client`, **`await client.load_tools()` per server, serially** = `MCPClient.start()` (a background thread with its own loop, HTTP `initialize`) + `tools/list`; OAuth pre-flight recovery; `extra_tools` appended. | C ×N, MCP ×servers | **2039** (62% of the build) with **one** server on dev — undecomposed |
-| `hooks` | Eleven hooks constructed (no IO). | — | 0 |
+| `hooks` | Eleven hooks constructed (no IO); a twelfth, `WebSearchDefaultsHook`, only while `WEB_SEARCH_DEFAULT_MAX_RESULTS_ENABLED` is on. | — | 0 |
 | `plugins` | Skills runtime (skill records if any), `build_tool_result_offloader`. | 0–1 | 13 |
 | `finalize` (#1377 splits it into `strands_agent` + `finalize`) | `AgentFactory.create_agent`: `CountTokensBedrockModel` → Strands `BedrockModel` → **fresh `boto3.Session()` + `bedrock-runtime` client (another parse)**; `Agent(...)`: tool registry `process_tools` (MCP clients register as consumers; `load_tools` is a no-op because the pre-flight primed the cache); `AgentInitializedEvent` → `TurnBasedSessionManager.initialize` → SDK `read_agent` (**1–2 `ListEvents`**, skipped on a new session) → `list_messages` (**1 `ListEvents`, `MAX_FETCH_ALL`**) → converter → document-byte strip → sanitize → compaction (`_load_compaction_state`: **1 DynamoDB GSI read**; possibly `_retrieve_session_summaries`) → pairing repair. New session: `create_agent` `CreateEvent`. Then `_adopt_session_conversation`, snapshot stamping, cache insert. | 1 parse, M ×2–3, D ×1 | 194 |
 
@@ -457,6 +457,16 @@ did not move. The cold turn called `search_classes` three times and answered fro
 With MCP loading reduced to the slowest server, `rag` (1404–1485ms) is now the largest
 stage on this agent's first turn — P3b's case.
 
+*MCP negotiation on the 2.x SDK (2026-10-17).* Since `mcp` 2.1.1 each `start()` negotiates
+with `negotiate_auto`: a `server/discover` probe, then `initialize` if the server rejects
+it. A 2026-07-28 server (GitHub) answers the probe and needs nothing else. A legacy one
+pays one extra POST per connect: `mcp.excalidraw.com` went from 201ms to 325ms p50.
+`mcp_apps._UIExtensionClientSession` removes that after the first connect per process. A
+rejected probe followed by a good handshake marks the URL legacy for an hour
+(`mcp_transport.remember_legacy_server`), and later connects skip the probe: 205ms p50,
+back to 1.30 parity. A 5xx or timed-out probe is not a verdict. Only a cache-miss build
+connects at all, so a cache hit pays none of this.
+
 *P3a. Inside the constructor, no async plumbing.* In `BaseAgent.__init__`, `session_mgr`
 and `tools` do not depend on each other (hooks, which take the session manager, are built
 after both). Run them on two threads of one `ThreadPoolExecutor` and join — the same
@@ -604,6 +614,29 @@ Locally the parse is ~3ms for a 345K-character `.docx` and the render 0.3ms for 
 the network half is unmeasured. Expected on dev: ≈0 on a follow-up (the `Query` overlaps the
 `tools` stage), and on a first turn at most the downloads less that same window. Read
 `agent_build.kb_full_context` on dev before turning it on anywhere else.
+
+*P3b″. Project file readiness (`PROJECT_FILE_READINESS_ENABLED`, default off).* A Shared
+Project harness turn (not a resume or continuation) also starts `load_file_status_note` at the
+project gate, beside the member note: one `Query` for the harness's `DOC#` rows, run in a
+thread. It is awaited only at message assembly in the stream, after the agent build, so its
+round trip overlaps the KB search and the build and adds nothing before the first token unless
+the `Query` outlasts both. Its result is a `<project_files_status>` block appended to the user
+message, or nothing when every file is ready; it never reaches the system prompt or
+`toolConfig`. It reads the rows separately from `load_full_kb_context`, which costs a second
+small `Query` on project turns while both flags are on; sharing one listing would couple the
+two loaders for no measurable gain.
+
+*P3b‴. The conversation's on-demand set (unified-attachment-delivery phase 5, under
+`ATTACHMENT_PLAN_ENABLED` with the attachments KB on).* Every turn whose message is composed
+(not a brief, a resume or a continuation) starts `_start_session_files_read` just before B4:
+one `SessionIndex` `Query` for the conversation's READY file rows, run in a worker thread
+(`list_session_files_sync` via `asyncio.to_thread`; the async wrapper would block the loop).
+It is awaited only in C2, at attachment guidance (`_plan_conversation_set`), so it overlaps
+B4's S3 fetches, model resolution and the agent build. The planner (`plan_conversation`) then
+judges the rows in memory and may add one steering line to the user message. The await's wait
+is logged as `attachment conversation set: … wait_ms=`. Expected on dev: ≈0, since the `Query`
+is one round trip and the window it overlaps is the whole preamble. Read that log line on dev
+before turning the profile on anywhere else.
 
 *Tests.* P3a: a fake session factory and a fake tool loader that each sleep; assert the
 build's wall time is the max not the sum, that `tools` order is unchanged across runs
@@ -830,6 +863,10 @@ In the order the V2 spec gives, with two additions from this map:
   `MCPSessionHealHook` probes the MCP client's session (~1–2µs on top of Strands' ~1.6µs
   dispatch of any callback pair) and reconnects only a session that already died, off the
   loop, on the call that would otherwise fail.
+  `WebSearchDefaultsHook` (only while `WEB_SEARCH_DEFAULT_MAX_RESULTS_ENABLED` is on) pays
+  a string suffix test per call (~0.1µs), plus a dict copy on a `___WebSearch` call that
+  names no `maxResults` (~0.3µs; both measured 2026-10-31, local). It replaces `event.tool_use` instead of writing into it, because that dict
+  is the `toolUse` block already in history.
 - Nothing in P2–P5 touches the prompt, `toolConfig` or restored history. If a change here
   ever needs to, it is a different spec.
 
@@ -863,7 +900,7 @@ test whose assertion never ran.
 | I3 | **One cache key per configuration, shared by all three callers.** The main turn, the resume (`is_resume=True`, `cache_write=False`, `memory_binding=snapshot.memory_binding`) and the MCP App dispatch (`cache_write=False`) compute the same key for the same session state. | `tests/apis/inference_api/test_get_agent_call_sites.py` (AST-pinned), `test_chat_service.py::test_resume_replay_from_snapshot_hits_same_cache_slot` |
 | I4 | **Lease discipline.** Acquired exactly once per turn before the stream; released on every exit: stream end, cancellation, pre-stream `HTTPException`, pre-stream error; heartbeat cancelled first. | `tests/apis/inference_api/test_turn_lease_release.py`, `test_carried_steering.py` |
 | I5 | **No session state on an agent instance.** `turn_lease`, `cancelled`, display-text arm, fingerprints, interrupt state are reset at the head of every turn; conversation list is aliased across instances **of the same `(session, user)`**, never across users on one session id; compaction state is re-read per turn. | `test_chat_service.py::test_second_cache_key_for_a_session_shares_the_conversation`, `::test_adoption_never_crosses_users_on_one_session_id`, `tests/agents/main_agent/session/test_compaction_deferred_apply.py`, `test_turn_based_session_manager.py` |
-| I6 | **Early exits stream, they do not 4xx.** Quota exceeded, retired model without successor, model access denied (not granted, or disabled by an admin), blocked agent binding, archived project, an agent that is gone or that the caller may not use (one message for both, so the answer never says whether an id exists): a conversational `message_start … done` with the metadata event, persisted via `persist_synthetic_messages` — except the model-access denial, which is streamed only (it runs at B3, before the session row exists, and the turn never ran). Only ownership (404), resume validation (400) and duplicate turn (409) raise. | `tests/routes/test_inference.py`, `test_inference_unavailable_agent.py`, `test_model_retirement_routes.py`, `test_model_access_enforcement.py`, `test_project_harness_invocation.py` |
+| I6 | **Early exits stream, they do not 4xx.** Quota exceeded, retired model without successor, model access denied (not granted, or disabled by an admin), blocked agent binding, archived project, an agent that is gone or that the caller may not use (one message for both, so the answer never says whether an id exists): a conversational `message_start … done` with the metadata event, persisted via `persist_synthetic_messages` — except the model-access denial, which is streamed only (it runs at B3, before the session row exists, and the turn never ran). A resume that can no longer be picked up (snapshot missing or past `paused_turn_ttl`, or ids the rebuilt agent never paused on) streams too, unpersisted, with `error_kind: "resume_unavailable"` so the SPA skips its post-resume reload. Only ownership (404) and duplicate turn (409) raise. | `tests/routes/test_inference.py`, `test_inference_unavailable_agent.py`, `test_model_retirement_routes.py`, `test_model_access_enforcement.py`, `test_project_harness_invocation.py` |
 | I7 | **Attachment semantics.** CSV/XLSX never inline; PPTX never inline; oversized dropped with a note; per-message cap and byte budget applied before S3 reads; marker names follow attachment order; recovered attachments dropped when the turn carries its own. A model whose row declares TEXT input *only* never receives a document or image block, from this turn or from history (keyed on TEXT-only, never on a missing `DOCUMENT`: Claude rows declare `["TEXT", "IMAGE"]`). History is projected per call, never mutated, because the list is shared with a vision agent serving the same session. | `test_attachment_turn_guard.py` (37), `test_attachment_recovery.py`, `test_presentation_attachment_carveout.py`, `test_attachment_tool_autoenable.py`, `test_text_only_model_attachments.py`, `tests/shared/test_text_only_input.py`, `test_get_agent_call_sites.py` |
 | I8 | **`turn_prelude` shape.** One line per agent turn with `stages`, `groups` (`preamble`, `agent_build`), `totalMs`, `isResume`, `deferredBuild`, `hasAssistant`; EMF metric names derived from stage names; disabled by `TURN_LATENCY_METRICS_ENABLED=false`. | `test_turn_timing.py` |
 | I9 | **No network in tests.** | the socket guard in `tests/conftest.py` (fails at teardown) |
@@ -945,7 +982,7 @@ Three instruments, each blind where another sees. Read the user-facing one first
 How the client metric is recorded (`apis/app_api/telemetry/routes.py`, `TurnTimingService` in the SPA):
 - One `POST /telemetry/turn-timing` per send, after the first token has arrived, fire-and-forget. A turn that ends before its first token, a resume and a "Continue" report nothing.
 - Recorded as EMF under metric names, not dimensions, like every EMF caller here: `ClientFirstTokenMs` on every turn; `ClientFirstTurnFirstTokenMs` or `ClientFollowUpFirstTokenMs`; and, for first turns, `ClientFirstTurnWarmedFirstTokenMs` or `ClientFirstTurnColdFirstTokenMs`. A first turn starts its Runtime session and a follow-up usually finds it running, so one percentile over both moves whenever the mix does.
-- Properties for Logs Insights on the app-api log group: `modelId` (the selected model, even when the request omits it as the default), `warmAgeMs` (time since this tab prewarmed the conversation, or null), `hasAgent`, `hasFiles`, `visible`. No message content, user id or session id.
+- Properties for Logs Insights on the app-api log group: `modelId` (the selected model, even when the request omits it as the default), `warmAgeMs` (time since this tab prewarmed the conversation, or null), `hasAgent`, `hasFiles`, `visible`, `spaVersion` (the bundle that measured it). Every EMF record, on every namespace, also carries the emitting service's `appVersion` and `build` (`docs/specs/release-ledger.md` D1), so a percentile can be read per version without a dimension. No message content, user id or session id.
 - A turn is "first" when this tab knows the conversation as new and it has no messages, so an existing conversation sent to before its history loads stays a follow-up.
 
 How the probe runs (`apis/app_api/telemetry/ttft_probe.py`, `TtftProbeConstruct`):
@@ -957,6 +994,34 @@ How the probe runs (`apis/app_api/telemetry/ttft_probe.py`, `TtftProbeConstruct`
 - First manual run on dev (2026-10-10): cold 9,004 ms, prewarmed 2,321 ms, follow-up 1,533 ms, warm call 2,024 ms. One sample is not a baseline; set latency alarms on the probe's daily median after one to two weeks of it.
 
 Reading drift: compare the daily medians on the dashboard's trend widget, first turns and follow-ups separately, and when one moves, slice it by `modelId` in Logs Insights before calling it a regression; a change of default model moves every percentile. Alarms wait for a baseline (see the probe).
+
+#### Recorded comparisons
+
+A dependency bump or a change on this path that gets measured by hand lands here,
+with the statistics it actually supports. `smoke_turns.py` is the usual
+instrument, and its first-token line is the number quoted.
+
+**strands-agents 1.57.2 → 1.61.1, bedrock-agentcore 1.24.0 → 1.24.2** (PRs
+`71c24232` + `961b8f7a`, measured on dev 2026-10-20). Both runs
+`scripts/smoke_turns.py --auth headless-grant` against dev, same rows, same user,
+same day; pre-bump on the image deployed 20:06:18Z (which carried #1681 and
+#1686 but not the bump), post-bump on `78321529`.
+
+| first token | pre-bump | post-bump | Δ |
+|---|---|---|---|
+| min | 1,365 ms | 1,355 ms | −10 ms |
+| median | 4,062 ms | 4,242 ms | **+180 ms (+4.4%)** |
+| max | 4,611 ms | 4,849 ms | +238 ms |
+
+**Read this as "no evidence the bump moved TTFT", not as "TTFT unchanged."**
+Six turns per side, and every smoke row opens a new session, so each measurement
+is a cold agent build — the noisiest thing on this path. That sample has no power
+to detect anything under roughly **500 ms**, so the +180 ms median sits inside
+expected variance and a real regression smaller than half a second would have
+passed this comparison unnoticed. The budget in §1 is not satisfied by this
+number; it is merely not contradicted by it. Anything claiming a TTFT effect at
+finer resolution needs the probe's daily medians (above) or a purpose-built A/B,
+not a six-turn smoke run.
 
 ## 7. Clarity refactors
 
@@ -971,6 +1036,14 @@ Next, in this order, each its own PR:
 
 1. The assistant block (B8) into `resolve_agent_turn(...)` returning either a refusal to
    stream or the resolved instructions/overrides/citations, with its writes moved per P4.
+   *Done as `resolve_turn_agent` (2026-11-03)*, with the same order and the same awaits:
+   access, version snapshot, the use writes (skippable with `record_use=False`), the
+   project gate and its two tasks, `resolve_agent_invocation` and the full-context load.
+   Binding validation stays ahead of it, and the KB search, `compose_turn_system_prompt`
+   (steps 5–5a), the project-memory await and binding persistence follow it. The custom
+   prompt and plain-turn personal instructions are `apply_turn_prompt_extras`. Split out
+   so a handoff brief resolves the agent a turn would (agent-handoffs-and-consults.md
+   §4.5.1). The P4 write moves are still open.
 2. The build's three sync→async bridges (F8) into one `run_blocking_async(coro)` helper
    with the contextvar capture in one place.
 3. `stream_with_quota_warning` and `_guarded_stream` into a `TurnStream` object that owns

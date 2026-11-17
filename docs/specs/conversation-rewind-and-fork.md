@@ -1,6 +1,40 @@
 # Conversation rewind and fork
 
-**Status:** DRAFT spec, written 2026-10-03 against `develop` @ `ac4212a7`. Nothing built yet.
+**Status:** Rewind (§4–§6) and fork (§7) built, delivery PRs 1–4, behind `SESSION_REWIND_ENABLED` /
+`features.sessionRewind` and `SESSION_FORK_ENABLED` / `features.sessionFork`, both default off. Spec
+written 2026-10-03 against `develop` @ `ac4212a7`.
+
+**As built (2026-10-29), where it differs from the text below:**
+- The restore filter runs inside `TurnBasedSessionManager.list_messages`, only while the SDK's restore
+  is reading (`_restoring`), which answers §4.3's *Verify*: the SDK's tool-use repair then runs on the
+  filtered list. Every other caller, including the coordinator's message count, gets the physical list.
+- The warm cut is `apply_rewind`, at the head of every turn before `apply_pending_compaction`, and it
+  hands its row read to the compaction re-read so a turn still pays one GSI query. What the shared live
+  list has been cut to travels with the list (`LiveConversation`, aliased by
+  `_adopt_session_conversation`), so a sibling agent never cuts it twice. The row records each rewind's
+  logical cut (`cuts`) so several rewinds before a send apply as one.
+- Measured on dev: the first call after a warm rewind was a `hit` that read the same 12,651 tokens the
+  rewound turn had read and wrote 28; its row carried `rewound: true` and `wastedUsd` 0.
+- **Fork resolves §2.3 for the warm case without a sidecar (§9 Q1 stays open for cold restores).**
+  The copy is verbatim and written with `extractionMode="SKIP"`, so §7.2's re-extraction question
+  does not arise. The child records `forkedFrom` (with the parent's rewind epoch) and `rootSessionId`,
+  and the SPA sends `affinity_session_id` on the fork's turns, so app-api pins them to the root's
+  microVM (still per user). There, `_seed_forked_conversation` starts the fork's first turn from a
+  deep copy of the parent's *live* list, LTM context included, when the coordinates line up
+  (same live offset, same rewind epoch, same turn structure); otherwise it keeps the stored copy.
+  Later turns stay in that microVM, so they never fall back to the lossy restore. The first cost row
+  carries `forkedFrom` and `forkSeeded`. Measured on dev: the fork's first call was a `hit` reading the
+  parent's full 12,650-token prefix and writing 28, and its second read 12,678. That run had no LTM
+  context; the seed's handling of it is pinned by `test_fork_seed.py`.
+- Fork not built: copying session files (§7.1), tool summaries and UI resources, sidebar "Forked from"
+  provenance, and `rootSessionId` offload bucketing.
+- **Rewind does not reach long-term memory (§7.3, measured 2026-11-04).** A rewound turn's facts
+  are extracted about 60 s after the turn whether or not it is rewound, and they come back in new
+  conversations. The recommendation there is to disclose this now and offer a "Forget them" after
+  a rewind, behind a flag.
+- Not yet built: the Undo toast (§4.4), hiding Rewind on summarized messages (the endpoint refuses
+  them with 409 and the SPA shows the reason), `rewindMissCount` / `rewindUsd` rollups (§6, the row
+  flag is written), and the smoke-matrix rows (§8.1).
 **Tracking issue:** #1421
 **Flags (in development, default OFF):** `SESSION_REWIND_ENABLED` / `CDK_SESSION_REWIND_ENABLED` /
 `features.sessionRewind`, and `SESSION_FORK_ENABLED` / `CDK_SESSION_FORK_ENABLED` / `features.sessionFork`.
@@ -148,6 +182,9 @@ A new span always runs from the cut point to the current physical end. That keep
 index *below the cut* unchanged across any number of rewinds, which is why compaction state, kept in
 logical indices, stays valid (§5).
 
+The span hides events from the conversation only. Long-term memory has usually already extracted
+them, and a span cannot undo that (§7.3).
+
 Why not delete: deletion makes indices reusable (breaks invariant 2), gives up undo, and still has to
 clean feedback/metadata rows by index. Why not fork-and-replace: the session id changes, which
 breaks links, project task crumbs and anything else holding the id. It also pays for a full copy on
@@ -249,7 +286,7 @@ What gets copied:
 | `compactionState` | Yes | Verbatim, then apply §5 at *k*. A fresh state would mean checkpoint 0 (full history instead of summary) and anchor 0 (untruncated tool output): a guaranteed history miss |
 | Agent / project / Memory Space binding, model | Yes | A different config is a different prefix, and a different agent |
 | `displayText`, tool summaries (`TSUM#`), UI resources for indices < *k* | Yes | Display parity on reload |
-| Session files (S3 + metadata) | Yes, server-side `CopyObject` | `document_read` resolves files per session, and the parent's delete would remove shared objects. Counts toward the user's file quota |
+| Session files (S3 + metadata) | **No**: read through to the parent and root | Shipped without the planned `CopyObject`. The fork's restore, its `document_read` gate, listing and `query` search, the planner's conversation-files read and the re-index of evicted documents on open read the caller's own upload rows on the fork, then on `forkedFrom.sessionId`, then on `rootSessionId` (`apis.shared.sessions.fork.ancestor_session_ids`), taken from the session row each already reads. The attachments KB keeps a document under the session it was attached in, so a fork's search widens only the session clause (`in` over those ids), never the owner clause. Deleting the root deletes its files, and the fork's blocks then fall back to placeholders. A file attached in a middle generation of a fork of a fork is not reached |
 | Cost rows, feedback, pending interrupts | No | Invariant 3; feedback belongs to the parent's messages; a paused turn cannot be forked |
 | Title | `"<title> (fork)"` | No Nova call |
 
@@ -266,6 +303,107 @@ its own is correct. Semantic and preference records are actor-scoped and consoli
 re-extraction probably merges into existing records, but that is unverified. **Measure on dev before
 the fork flag turns on** (§9, Q2): count the actor's records before and after forking a long
 conversation, and price the extraction against the AgentCore pricing page.
+
+### 7.3 Long-term memory after a rewind (measured 2026-11-04, open)
+
+Rewind hides messages from the conversation. It does not hide them from long-term memory. By the
+time most users rewind, AgentCore Memory has usually already extracted the rewound turn into the
+user's semantic and preference records, and those records reach later conversations through
+`retrieve_customer_context` like any others. This section records what happens today, measured
+on dev, and the options for closing the gap. Nothing here changes rewind's behaviour yet.
+
+#### What happens today
+
+A rewind writes a span on the session row and nothing else (§4.1). The events stay in short-term
+memory, and their extraction was queued when they were written, so rewind cannot stop it. Nothing
+on the rewind path touches long-term records. The only code that deletes records is session delete,
+which purges the session's **summary** records only (`SessionService._purge_session_summaries`).
+Semantic and preference records stay, because they carry no source session
+(`memory-baseline-decision.md`, Phase 0.2 item 2).
+
+Controlled test on dev, one user, memory mode "on", default Haiku 4.5. Each conversation had a
+neutral first turn and then a second turn stating a synthetic fact. The second turn was then
+rewound:
+
+| | A: rewind after extraction | B: rewind immediately |
+|---|---|---|
+| Fact turn finished → rewind | 84 s | **0.65 s** |
+| Fact turn finished → records listed | 63 s | 62 s |
+| Records extracted from the rewound turn | 2 semantic, 1 preference | 2 semantic, 2 preference |
+| Summary records holding the fact | 2 (session-scoped) | 2 |
+| Records still present after the rewind | yes, 6 min later | yes |
+
+Then a third, new conversation (C), about 2 minutes later:
+
+- "Where is our weekly team meeting held?" got "Based on your user context, your weekly team
+  meeting is held in a room called the **Quartz Lantern**." That fact was stated only in A's
+  rewound turn.
+- "What should I order at the coffee shop?" got "Order your usual cardamom oat cortado". That
+  fact was stated only in B's rewound turn.
+- B's hazelnut allergy did not come back. Its preference record scored under the 0.40 retrieval
+  cut for that question. That is a retrieval miss, not protection.
+
+Readings:
+
+- **Rewinding faster does not help.** B was rewound well inside the extraction window and leaked
+  exactly as much as A. Extraction reads the stored events, and a rewind never removes them. The
+  ~60 s lag matches the Phase 0 audit's ~70 s.
+- **Nothing expires the residue.** Long-term records have no TTL. They stay until someone deletes
+  them, either the user on `/memories` or session delete for summaries.
+- **Residue can reinforce itself.** In an earlier dev pair (2026-11-03/04), a conversation's reply
+  restated a remembered preference. Consolidation then rewrote the actor's records under **new
+  record ids**, with text saying the fact was "confirmed again" at the new conversation's
+  timestamp. Conversation C restated both facts but produced no new records within 4 minutes, so
+  this does not happen every time. Two consequences follow. A cleanup that runs after the next
+  conversation has already used the residue can be too late. And a record id saved at rewind time
+  does not reliably point at the record later.
+- **The service cannot attribute a record to the events it came from.** A built-in strategy's
+  records carry only system metadata (`recordType`, `strategyType`, `createdAt`, `updatedAt`).
+  `ListMemoryExtractionJobs` returns only *failed* jobs (its status enum is `FAILED`), so the
+  event ids a job processed are visible only when the job failed. No API answers "which records
+  came from event X".
+- **A note on the report that started this.** The 2026-11-03 "2-week unit" recall was not rewind
+  residue. The session row's span hid the "add a lab activity" turn at 18:47:09Z, and "Actually,
+  make it a 2-week unit instead" was the *replacement* message, sent one second later and still
+  visible. A new conversation recalling it was long-term memory working as designed. The gap is
+  real, but the controlled test above is what shows it.
+
+#### Options
+
+| | What it does | Precision | Cost | Latency | Verdict |
+|---|---|---|---|---|---|
+| **A. Disclose** | Rewind's confirmation and docs say that anything already learned from these messages stays in Memories, with a link to `/memories` (which already lists and deletes records) | n/a | none | none | **Do now** |
+| **B1. Exact attribution** | Tag every event with a per-turn (or per-session) key, declared `STRICTLY_CONSISTENT` in each strategy's `memoryRecordSchema` and in `indexedKeys`. Then delete by `metadataFilters` | Exact | Consolidation never merges records across different key values. So a fact stated in 10 turns becomes 10 records, which grows storage ($0.75/1k records-month) and lets duplicates crowd out `topK=10`. Indexed keys can never be removed, and changing the strict keys isolates every existing record. Not available on summary strategies | none on the turn path | **Rejected.** It breaks the consolidation that makes records useful. AWS's own guidance is not to put per-interaction values in metadata |
+| **B2. Match and delete** | After a rewind, in app-api and off the turn path: for each rewound user message, `RetrieveMemoryRecords` in the semantic and preference namespaces with that message's text as the query, filtered to `updatedAt` AFTER the rewound span's first event. Delete what scores ≥ a cut | Measured on A and B: the 7 residue records scored 0.51–0.72. Every other record, in or out of the time window, scored ≤ 0.38, so a cut near 0.45 caught exactly the 7. But these were distinctive synthetic facts. A record that consolidation merged from rewound and kept turns would match too, and deleting it would also lose the kept fact | 2 retrievals per rewound user message, ≈ $0.001 per rewind at $0.50/1k, plus one `BatchDeleteMemoryRecords` | 250–380 ms per retrieval, measured. The check must wait until extraction has landed, ~90 s after the span's last event | **Build as an offer, not an automatic delete** (below). A delete is irreversible, and §4.4's Undo cannot bring back deleted records |
+| **C. Defer extraction** | Write every event with `extractionMode="SKIP"` (the per-manager `_SkipExtractionClient` already exists). Once a turn is settled (a later turn was sent, or the session has been idle N minutes), send its visible text to `IngestData` with the same `actorId` and `sessionId`. Rewound turns are never sent | Exact for any rewind made before the turn settles. A rewind after that leaks as it does today | `IngestData` has no listed price. It also needs a settle trigger: an idle sweep (a schedule plus a Lambda, or a delay queue) against a dev resource budget of 432 of 500 | Every fact reaches other conversations N minutes later than today's ~60 s. The turn path is untouched only if ingestion runs after the stream | **Not now.** It is the only exact fix, but it changes extraction for every conversation to address something only rewinds cause. Extraction quality from `IngestData` payloads is also unverified, because the payload must carry enough context. Revisit if prod rewinds cluster within a few minutes of the turn *and* users report residue |
+| **D. User-visible memory edit** | The `/memories` dashboard, which already exists, linked from where the rewind happened | User decides | none beyond B2's lookup | none | **Combine with B2** |
+
+#### Recommendation
+
+1. **Now (option A):** a single sentence in the Rewind confirmation or tooltip: "Anything already
+   saved to your memories from these messages stays there. Review memories." Add the same
+   sentence to the docs-site page for rewind. It costs nothing, and it is true whichever option
+   follows.
+2. **Next, behind an in-development flag (B2 surfaced through D):** a read-only, owner-scoped
+   app-api endpoint, for example `GET /sessions/{id}/rewind/memories`, computed on read from the
+   row's latest span and its events, with nothing stored. It returns the candidate records B2
+   finds. After a rewind, the SPA calls it once the span's last event is ~90 s old. If there are
+   candidates, the SPA offers "This conversation saved N memories from the messages you rewound:
+   Forget them / Keep". Forget calls the existing `DELETE /memory/{record_id}`. The cost is about
+   $0.001 per rewind and nothing on the turn path. It keeps the user in charge of the one case
+   B2 gets wrong (a merged record). It also closes the window before the next conversation
+   reinforces the residue.
+3. **Before choosing between that and C:** measure, read-only, how soon after the rewound turn
+   prod users rewind. That is the row's `rewind.updatedAt` minus the rewound user message's event
+   timestamp. Dev has only 5 rewinds, all of them tests. If most rewinds come within a minute or
+   two, C's deferral would have to be short to catch them and still leave extraction lagging, so
+   the offer stays the better trade.
+
+Out of scope here, and the same kind of gap in a different store: the conversation archive and
+index (`apis/shared/conversation_archive/`) has no reference to rewind spans, so rewound turns are
+probably still matched by conversation search. That is unverified and needs its own check. Fork
+does not have this problem for the messages it copies (§7.2, written with `extractionMode="SKIP"`).
+Incognito conversations have no residue to clean, because their events are never extracted.
 
 ## 8. Delivery
 
@@ -312,3 +450,6 @@ Rewind ships first: it is the more common action and the one with the strong cac
 5. **Shared Projects sessions.** v1 is owner-only, like every session route. Whether a member may fork
    a project thread they can see is a Projects decision (§9.6 of that spec governs degraded
    harnesses, and a fork inherits the binding).
+6. **Long-term memory residue after a rewind** (§7.3). Should the offer to forget saved memories
+   ship, and should extraction be deferred instead? Decide after measuring how soon after the
+   rewound turn prod users rewind.

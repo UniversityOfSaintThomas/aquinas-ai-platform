@@ -221,6 +221,32 @@ class CompactionEvent(BaseModel):
     slice_tokens: Optional[int] = Field(None, alias="sliceTokens")
 
 
+class AttachmentPlanFile(BaseModel):
+    """How one attachment was delivered on a turn (the planner's decision,
+    ``apis.shared.files.attachment_plan``). Codes, an estimate and an id; never
+    a filename."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    mode: str
+    file_class: str = Field(..., alias="class")
+    tokens: int = 0
+    reason: str
+    upload_id: Optional[str] = Field(None, alias="uploadId")
+    # Images under the ``token`` profile: which stored copy was sent,
+    # ``high`` or ``compact`` (spec §4.4.1); ``None`` for everything else.
+    variant: Optional[str] = None
+
+
+class AttachmentPlanRecord(BaseModel):
+    """``attachmentPlan`` on a turn's last cost row
+    (``docs/specs/unified-attachment-delivery.md`` §8.2)."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    profile: str
+    files: List[AttachmentPlanFile] = Field(default_factory=list)
+    dropped_over_count: int = Field(0, alias="droppedOverCount")
+
+
 class DocumentReads(BaseModel):
     """``document_read`` retrievals one model call requested: calls, pages
     returned as native document blocks, and their byte size."""
@@ -237,6 +263,9 @@ class SessionCallRow(BaseModel):
 
     timestamp: str
     message_id: Optional[int] = Field(None, alias="messageId")
+    call_kind: Optional[str] = Field(
+        None, alias="callKind", description="Set on a call that is not a turn, e.g. 'handoff_brief'; absent on turns"
+    )
     model_id: Optional[str] = Field(None, alias="modelId")
 
     input_tokens: int = Field(0, alias="inputTokens")
@@ -255,12 +284,31 @@ class SessionCallRow(BaseModel):
         None, alias="cachePrefixGapSeconds"
     )
     wasted_usd: float = Field(0.0, alias="wastedUsd")
+    # Set when this call's usage was estimated rather than reported by the
+    # provider — today only an interrupted turn's cut generation, whose
+    # terminal usage event never arrived. A field -> method map (which figure
+    # came from a native count, from the projection, from the streamed text),
+    # so a reader never mistakes these tokens or this cost for a measurement.
+    # Such a row's `cacheStatus` is `estimated` and its `wastedUsd` is zero.
+    usage_estimated: Optional[Dict[str, str]] = Field(None, alias="usageEstimated")
     # #756 — which Agent ran this call, and whether that changed from the call
     # before it. An `@`-mention (Marketplace D11) hands one turn to a different
     # Agent, which genuinely re-writes the prefix; without this a deliberate swap
     # is indistinguishable from a nondeterministic-ordering regression, since both
     # flip `toolConfigHash` and `systemPromptHash` together.
     turn_agent_id: Optional[str] = Field(None, alias="turnAgentId")
+    # Which build of inference-api served this call (release-ledger spec D1):
+    # the VERSION file and the image's content-hash tag. Absent on rows
+    # written before the stamp shipped.
+    app_version: Optional[str] = Field(None, alias="appVersion")
+    build: Optional[str] = Field(None)
+    # How this call's turn ended (release-ledger spec §5.1): `completed`,
+    # `paused` (waiting on the user), `error`, `stopped` or `interrupted`.
+    # Absent on rows written before it shipped and on calls that are not a
+    # turn's (a handoff brief). `emptyAnswer` is true only on the last row of a
+    # completed turn whose final model call streamed no text.
+    outcome: Optional[str] = Field(None)
+    empty_answer: bool = Field(False, alias="emptyAnswer")
     agent_switched: bool = Field(
         False,
         alias="agentSwitched",
@@ -301,6 +349,9 @@ class SessionCallRow(BaseModel):
     document_slice_tokens: Optional[int] = Field(None, alias="documentSliceTokens")
     document_mime: Optional[Dict[str, int]] = Field(None, alias="documentMime")
     document_reads: Optional[DocumentReads] = Field(None, alias="documentReads")
+    # How the turn's attachments were delivered (on the turn's last row only;
+    # absent on rows written before it shipped and on turns without one).
+    attachment_plan: Optional[AttachmentPlanRecord] = Field(None, alias="attachmentPlan")
 
 
 class SessionCostAnatomy(BaseModel):
@@ -545,10 +596,22 @@ class FingerprintChanges(BaseModel):
 
 
 class ToolCensusEntry(BaseModel):
+    """One tool's census over the session: how often it ran and failed, and
+    (release-ledger spec D4) how much it weighed. The weights are ``None``, not
+    zero, when no row carried them — rows written before the measure shipped,
+    or a census that was off — so "not measured" never reads as "nothing"."""
     model_config = ConfigDict(populate_by_name=True)
 
     calls: int = 0
     errors: int = 0
+    # Summed characters the tool's results put into the context (text, JSON,
+    # a fixed 1,500 per image) and the characters of the inputs the model wrote.
+    result_chars: Optional[int] = Field(None, alias="resultChars")
+    input_chars: Optional[int] = Field(None, alias="inputChars")
+    # Strands' measured execution time, summed over the calls that reported
+    # one; `timedCalls` is how many did, so a mean divides by the right count.
+    duration_ms: Optional[int] = Field(None, alias="durationMs")
+    timed_calls: Optional[int] = Field(None, alias="timedCalls")
 
 
 class FeedbackCounts(BaseModel):

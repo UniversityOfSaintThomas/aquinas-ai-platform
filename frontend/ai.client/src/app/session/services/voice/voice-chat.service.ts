@@ -5,6 +5,8 @@ import { AudioRecorderService } from './audio-recorder.service';
 import { AudioPlayerService } from './audio-player.service';
 import { VoiceTicketService } from './voice-ticket.service';
 import { UserSettingsService } from '../../../services/user-settings.service';
+import { IncognitoChatService } from '../incognito';
+import { ToastService } from '../../../services/toast/toast.service';
 import { DEFAULT_VOICE_ID, findVoice, type NovaSonicVoice } from './voice-catalog';
 import { Message } from '../models/message.model';
 import {
@@ -48,6 +50,12 @@ export interface VoiceTranscriptEntry {
  *      bidi_transcript_stream → transcript signal
  *   4. disconnect() → stops mic, closes WebSocket, clears audio
  */
+/** Toast titles for the coded `bidi_error` frames the voice route sends (#625). */
+const VOICE_ERROR_TITLES: Record<string, string> = {
+  voice_capacity: 'Voice mode is busy',
+  agent_voice_unavailable: 'Voice mode unavailable',
+};
+
 @Injectable({ providedIn: 'root' })
 export class VoiceChatService implements OnDestroy {
   private readonly recorder = inject(AudioRecorderService);
@@ -55,6 +63,8 @@ export class VoiceChatService implements OnDestroy {
   private readonly ticketService = inject(VoiceTicketService);
   private readonly config = inject(ConfigService);
   private readonly userSettings = inject(UserSettingsService);
+  private readonly incognitoChat = inject(IncognitoChatService);
+  private readonly toast = inject(ToastService);
 
   // --- Voice choice ---
   /**
@@ -177,12 +187,18 @@ export class VoiceChatService implements OnDestroy {
 
   /**
    * Connect to the voice endpoint and start recording.
-   * If no sessionId is provided, one is auto-generated.
+   * If no sessionId is provided, one is auto-generated. `agentId` is the
+   * conversation's Agent (#625); the backend checks it against the Agent
+   * saved on the session and runs that Agent's instructions, knowledge base
+   * and tools.
    */
-  async connect(sessionId?: string): Promise<void> {
+  async connect(sessionId?: string, agentId?: string | null): Promise<void> {
     if (this._isConnected()) return;
 
     this.sessionId = sessionId || uuidv4();
+    // Before any await, while the new-chat composer's toggle still holds it
+    // (#1738). The backend honours it only if this connection creates the session.
+    const incognito = this.incognitoChat.claim(this.sessionId);
     this._status.set('connecting');
     this._bufferedTranscript.set('');
     this._revealedIndex.set(0);
@@ -213,8 +229,16 @@ export class VoiceChatService implements OnDestroy {
         : `${window.location.origin.replace(/^http/, 'ws')}${httpUrl}`;
       const url = `${wsBase}/voice/stream?ticket=${encodeURIComponent(ticket)}`;
 
-      await this.openWebSocket(url, this.sessionId!);
+      await this.openWebSocket(url, this.sessionId!, incognito, agentId ?? null);
       await this.recorder.start();
+
+      // The server can end the session while the mic is starting (a coded
+      // `bidi_error` already cleaned up and told the user why).
+      if (!this.ws) {
+        this.cleanupAll();
+        this._status.set('idle');
+        return;
+      }
 
       // Wire audio chunks to WebSocket
       this.recorder.onAudioChunk = (base64, sampleRate) => {
@@ -331,7 +355,7 @@ export class VoiceChatService implements OnDestroy {
 
   // --- WebSocket ---
 
-  private openWebSocket(url: string, sessionId: string): Promise<void> {
+  private openWebSocket(url: string, sessionId: string, incognito = false, agentId: string | null = null): Promise<void> {
     return new Promise((resolve, reject) => {
       this.ws = new WebSocket(url);
 
@@ -349,6 +373,8 @@ export class VoiceChatService implements OnDestroy {
           type: 'config',
           session_id: sessionId,
           voice: this._voiceId(),
+          ...(incognito ? { incognito: true } : {}),
+          ...(agentId ? { agent_id: agentId } : {}),
         });
         resolve();
       };
@@ -582,6 +608,14 @@ export class VoiceChatService implements OnDestroy {
 
       case 'bidi_error':
         console.error('Voice error:', data['message']);
+        // A coded error ends the session for a reason the user should hear about
+        // (#625): Nova 2 Sonic at capacity, or an agent that can't run in voice.
+        if (typeof data['code'] === 'string' && typeof data['message'] === 'string') {
+          this.toast.error(VOICE_ERROR_TITLES[data['code'] as string] ?? 'Voice mode', data['message'] as string);
+          this.cleanupAll();
+          this._status.set('idle');
+          this._isConnected.set(false);
+        }
         break;
 
       case 'bidi_connection_close':

@@ -19,6 +19,7 @@ and the user cost-summary update are fakes that record what reached them.
 """
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -32,7 +33,16 @@ USER_ID = "user-fake-0001"
 MODEL_ID = "global.fake.model-v1"
 
 # $1 / $5 per million tokens, so one call of 1,000 in + 100 out is $0.0015.
-PRICING = {"inputPricePerMtok": 1.0, "outputPricePerMtok": 5.0, "snapshotAt": "2026-10-01T00:00:00Z"}
+# The cache rates are the real multipliers of the input rate — 1.25x for a
+# write, 0.1x for a read — so an interrupted call's bucket attribution shows
+# up in the dollars the way it does in production.
+PRICING = {
+    "inputPricePerMtok": 1.0,
+    "outputPricePerMtok": 5.0,
+    "cacheWritePricePerMtok": 1.25,
+    "cacheReadPricePerMtok": 0.1,
+    "snapshotAt": "2026-10-01T00:00:00Z",
+}
 CALL_USAGE = {"inputTokens": 1000, "outputTokens": 100, "totalTokens": 1100}
 CALL_COST = 0.0015
 
@@ -87,8 +97,22 @@ class _FakeAgent:
     turn's prompt or its tool results), ``assistant`` while tools run.
     """
 
-    def __init__(self, events: List[Any], session_manager: _SessionManager, tail_role: str) -> None:
+    def __init__(
+        self,
+        events: List[Any],
+        session_manager: _SessionManager,
+        tail_role: str,
+        prior_usage: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self.messages = [{"role": tail_role, "content": [{"text": "hi"}]}]
+        if prior_usage is not None:
+            # An earlier call in this conversation whose usage we did see —
+            # what the cut call's cache split is read from.
+            self.messages.insert(0, {
+                "role": "assistant",
+                "content": [{"text": "earlier"}],
+                "metadata": {"usage": prior_usage},
+            })
         self._events = events
         self._session_manager = session_manager
 
@@ -120,12 +144,15 @@ class _ProbeToolCensus:
         return {"probe": {"calls": call_index, "errors": 0}}
 
 
-def _wrapper() -> SimpleNamespace:
+def _wrapper(caching: bool = False) -> SimpleNamespace:
     return SimpleNamespace(
         model_config=SimpleNamespace(
             model_id=MODEL_ID,
             get_provider=lambda: SimpleNamespace(value="bedrock"),
             long_ttl_static_prefix=lambda: False,
+            # The same predicate the request's cachePoints were placed from.
+            bedrock_cache_points_supported=lambda: caching,
+            caching_enabled=caching,
         ),
         tool_census_hook=_ProbeToolCensus(),
     )
@@ -147,6 +174,7 @@ class _Recorded:
         self.cost_summary = AsyncMock()
         self.activity = AsyncMock(return_value=True)
         self.synthetic_writes = MagicMock()
+        self.sse: List[str] = []
 
     @property
     def cost_rows(self) -> List[Dict[str, Any]]:
@@ -172,6 +200,8 @@ async def _run(
     projected_input_tokens: Optional[int] = None,
     expect: Optional[type] = None,
     recorded: Optional[_Recorded] = None,
+    caching: bool = False,
+    prior_usage: Optional[Dict[str, Any]] = None,
 ) -> _Recorded:
     monkeypatch.setenv("DYNAMODB_SESSIONS_METADATA_TABLE_NAME", "fake-sessions-metadata")
     recorded = recorded or _Recorded()
@@ -201,14 +231,14 @@ async def _run(
 
         async def _drive() -> None:
             async for _sse in coordinator.stream_response(
-                agent=_FakeAgent(events, session_manager, tail_role),
+                agent=_FakeAgent(events, session_manager, tail_role, prior_usage),
                 prompt="look this up",
                 session_manager=session_manager,
                 session_id=SESSION_ID,
                 user_id=USER_ID,
-                main_agent_wrapper=_wrapper(),
+                main_agent_wrapper=_wrapper(caching),
             ):
-                pass
+                recorded.sse.append(_sse)
 
         if expect is not None:
             with pytest.raises(expect):
@@ -366,6 +396,15 @@ async def test_a_successful_turn_is_metered_exactly_once(monkeypatch):
 PROJECTED_TOKENS = 2000
 PROJECTED_COST = 0.002
 
+# The partial answer the cut call streamed ("partial" from
+# `_failing_call_start`, then the "…" the Stop rides in on): 8 characters, so
+# 2 tokens on the chars/4 fallback — the fake agent carries no model, so there
+# is no native counter to count it exactly. At $5/M that is $0.00001, and its
+# presence is the point: before this it was recorded as zero output.
+PARTIAL_OUTPUT_TOKENS = 2
+PARTIAL_OUTPUT_COST = 0.00001
+CUT_CALL_COST = PROJECTED_COST + PARTIAL_OUTPUT_COST
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -387,10 +426,11 @@ async def test_an_interrupted_turn_meters_every_completed_call_and_the_one_in_fl
 
     rows = recorded.cost_rows
     # Calls 0-2 at their own ids; the cut call at the id its partial reply
-    # was persisted at, priced from the projected input.
+    # was persisted at, priced from the projected input plus the tokens of
+    # the partial it streamed.
     assert [row["messageId"] for row in rows] == [5, 7, 9, 11]
-    assert sum(recorded.session_costs()) == pytest.approx(3 * CALL_COST + PROJECTED_COST)
-    assert sum(recorded.summary_costs()) == pytest.approx(3 * CALL_COST + PROJECTED_COST)
+    assert sum(recorded.session_costs()) == pytest.approx(3 * CALL_COST + CUT_CALL_COST)
+    assert sum(recorded.summary_costs()) == pytest.approx(3 * CALL_COST + CUT_CALL_COST)
     recorded.activity.assert_awaited_once()
     recorded.synthetic_writes.assert_called_once()
 
@@ -425,6 +465,65 @@ async def test_a_stop_before_the_first_token_meters_the_projected_input(monkeypa
 
     assert [row["messageId"] for row in recorded.cost_rows] == [5]
     assert sum(recorded.summary_costs()) == pytest.approx(PROJECTED_COST)
+
+
+@pytest.mark.asyncio
+async def test_the_cut_calls_prompt_is_priced_as_the_cache_write_it_was(monkeypatch):
+    """The reproduction. A first turn stopped mid-answer wrote the cache —
+    proven by the next call in that session reading the same prefix back — and
+    Bedrock bills a write at 1.25x base, not the 1x the plain `inputTokens`
+    bucket prices. Recording the projection as plain input understated the
+    call by 20% and misdescribed what happened."""
+    recorded = await _run([*_failing_call_start(), _STOP], monkeypatch,
+                          projected_input_tokens=PROJECTED_TOKENS, caching=True)
+
+    row = recorded.cost_rows[0]
+    assert int(row["tokenUsage"]["inputTokens"]) == 0
+    assert int(row["tokenUsage"]["cacheWriteInputTokens"]) == PROJECTED_TOKENS
+    assert int(row["tokenUsage"]["cacheReadInputTokens"]) == 0
+    # 2,000 written at $1.25/M plus the 2-token partial at $5/M.
+    assert sum(recorded.summary_costs()) == pytest.approx(0.0025 + PARTIAL_OUTPUT_COST)
+
+
+@pytest.mark.asyncio
+async def test_a_cut_call_after_one_that_reported_usage_is_priced_as_a_read(monkeypatch):
+    """Mid-conversation the prefix is already cached, so the same projection
+    is mostly a read at 0.1x — pricing it as a write would overstate it by
+    12.5x, which is the other way to get this wrong."""
+    recorded = await _run(
+        [*_failing_call_start(), _STOP],
+        monkeypatch,
+        projected_input_tokens=PROJECTED_TOKENS,
+        caching=True,
+        prior_usage={"cacheReadInputTokens": 1500, "cacheWriteInputTokens": 100},
+    )
+
+    usage = recorded.cost_rows[0]["tokenUsage"]
+    assert int(usage["cacheReadInputTokens"]) == 1600
+    assert int(usage["cacheWriteInputTokens"]) == 400
+    assert sum(recorded.summary_costs()) == pytest.approx(
+        1600 * 0.1 / 1e6 + 400 * 1.25 / 1e6 + PARTIAL_OUTPUT_COST
+    )
+
+
+@pytest.mark.asyncio
+async def test_only_the_cut_calls_row_is_marked_estimated(monkeypatch):
+    """Three calls reported their own usage; the fourth was cut off. A reader
+    has to be able to tell the measured rows from the estimated one, and the
+    estimate map names what produced each figure."""
+    recorded = await _run(
+        _three_calls_then([_STOP]), monkeypatch,
+        projected_input_tokens=PROJECTED_TOKENS, caching=True,
+    )
+
+    rows = recorded.cost_rows
+    assert [row.get("usageEstimated") for row in rows[:3]] == [None, None, None]
+    assert rows[3]["usageEstimated"] == {
+        "reason": "interrupted",
+        "inputTokens": "projection",
+        "outputTokens": "chars_per_token",
+        "cacheSplit": "assumed_first_write",
+    }
 
 
 @pytest.mark.asyncio
@@ -554,3 +653,399 @@ async def test_a_stop_while_a_retry_is_pending_projects_onto_the_right_call(monk
     assert [row["messageId"] for row in rows] == [5, 7]
     assert _hook_indices(rows) == [0, 2]
     assert sum(recorded.summary_costs()) == pytest.approx(CALL_COST + PROJECTED_COST)
+
+
+# ---------------------------------------------------------------------------
+# Calls that never announce themselves. Bedrock ConverseStream sends no
+# `messageStart` for an EMPTY response, only `messageStop` + `metadata`
+# (reproduced with Haiku 4.5: ~2 output tokens). The coordinator opened a
+# slot only on `message_start`, so the empty call's usage overwrote the
+# previous call's: that call went unbilled and the empty call's row carried
+# its message id (dev, eval session with 3 rows for 4 calls, 2026-10-30).
+# ---------------------------------------------------------------------------
+
+EMPTY_CALL_USAGE = {"inputTokens": 6141, "outputTokens": 2, "totalTokens": 6143}
+EMPTY_CALL_COST = 0.006151  # 6,141 in at $1/M + 2 out at $5/M
+
+
+def _empty_call() -> List[Dict[str, Any]]:
+    return [
+        {"event": {"messageStop": {"stopReason": "end_turn"}}},
+        {"event": {"metadata": {"usage": dict(EMPTY_CALL_USAGE), "metrics": {"latencyMs": 300}}}},
+    ]
+
+
+def _row_usage(row: Dict[str, Any]) -> Dict[str, int]:
+    usage = row["tokenUsage"]
+    return {key: int(usage[key]) for key in ("inputTokens", "outputTokens")}
+
+
+@pytest.mark.asyncio
+async def test_an_empty_call_after_a_tool_gets_its_own_row(monkeypatch):
+    """call → tool → empty call: two calls, two rows, each its own usage."""
+    recorded = await _run([*_completed_call("looking it up"), *_empty_call()], monkeypatch)
+
+    rows = recorded.cost_rows
+    assert [row["messageId"] for row in rows] == [5, 7]
+    assert [_row_usage(row) for row in rows] == [
+        {"inputTokens": 1000, "outputTokens": 100},
+        {"inputTokens": 6141, "outputTokens": 2},
+    ]
+    assert _hook_indices(rows) == [0, 1]
+    assert sum(recorded.summary_costs()) == pytest.approx(CALL_COST + EMPTY_CALL_COST)
+
+
+@pytest.mark.asyncio
+async def test_an_empty_last_call_keeps_every_earlier_calls_usage(monkeypatch):
+    """The eval shape: three tool rounds, then an empty answer. Four rows."""
+    recorded = await _run(
+        [*_completed_call("one"), *_completed_call("two"), *_completed_call("three"), *_empty_call()],
+        monkeypatch,
+    )
+
+    rows = recorded.cost_rows
+    assert [row["messageId"] for row in rows] == [5, 7, 9, 11]
+    assert [_row_usage(row)["outputTokens"] for row in rows] == [100, 100, 100, 2]
+    assert sum(recorded.summary_costs()) == pytest.approx(3 * CALL_COST + EMPTY_CALL_COST)
+
+
+@pytest.mark.asyncio
+async def test_an_empty_first_call_is_metered(monkeypatch):
+    """No slot exists yet when the turn's only call is empty."""
+    recorded = await _run(_empty_call(), monkeypatch)
+
+    rows = recorded.cost_rows
+    assert [row["messageId"] for row in rows] == [5]
+    assert [_row_usage(row) for row in rows] == [{"inputTokens": 6141, "outputTokens": 2}]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_call_after_a_retry_keeps_ids_and_hook_indices(monkeypatch):
+    recorded = await _run(
+        [
+            *_completed_call("one"),
+            {"event": {"messageStart": {"role": "assistant"}}},  # abandoned attempt
+            _RETRY,
+            *_empty_call(),
+            *_completed_call("three"),
+        ],
+        monkeypatch,
+    )
+
+    rows = recorded.cost_rows
+    assert [row["messageId"] for row in rows] == [5, 7, 9]
+    assert [_row_usage(row)["outputTokens"] for row in rows] == [100, 2, 100]
+    assert _hook_indices(rows) == [0, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_usage_with_no_message_boundary_at_all_gets_its_own_row(monkeypatch):
+    """Usage arriving after a finished, already-metered call opens a slot even
+    without a `messageStop` to announce it."""
+    recorded = await _run(
+        [
+            *_completed_call("one"),
+            {"event": {"metadata": {"usage": dict(EMPTY_CALL_USAGE), "metrics": {"latencyMs": 300}}}},
+        ],
+        monkeypatch,
+    )
+
+    rows = recorded.cost_rows
+    assert [row["messageId"] for row in rows] == [5, 7]
+    assert [_row_usage(row)["outputTokens"] for row in rows] == [100, 2]
+
+
+@pytest.mark.asyncio
+async def test_a_stop_after_an_empty_call_meters_both_finished_calls(monkeypatch):
+    """The interruption arm reads the same slots: the empty call is finished,
+    so the Stop projects nothing onto it."""
+    recorded = await _run(
+        [*_completed_call("one"), *_empty_call(), _STOP],
+        monkeypatch,
+        tail_role="assistant",
+    )
+
+    rows = recorded.cost_rows
+    assert [row["messageId"] for row in rows] == [5, 7]
+    assert [_row_usage(row)["outputTokens"] for row in rows] == [100, 2]
+
+
+# ---------------------------------------------------------------------------
+# Turn outcome on the cost row (release-ledger spec §5.1): every row of a turn
+# says how the turn ended, and the last row of a completed turn whose final
+# call streamed no text says `emptyAnswer` — the eval-harness failure of
+# 2026-10-30, a turn whose last visible words were a tool preamble.
+# ---------------------------------------------------------------------------
+
+
+def _final_answer(text: str) -> List[Dict[str, Any]]:
+    return [
+        {"event": {"messageStart": {"role": "assistant"}}},
+        {"event": {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": text}}}},
+        {"event": {"messageStop": {"stopReason": "end_turn"}}},
+        {"event": {"metadata": {"usage": dict(CALL_USAGE), "metrics": {"latencyMs": 100}}}},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_completed_turn_marks_every_row_completed_and_none_empty(monkeypatch):
+    recorded = await _run([*_completed_call("looking"), *_final_answer("Here it is.")], monkeypatch)
+
+    rows = recorded.cost_rows
+    assert [row["outcome"] for row in rows] == ["completed", "completed"]
+    assert not any("emptyAnswer" in row for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_a_turn_whose_final_call_said_nothing_is_an_empty_answer_on_its_last_row(monkeypatch):
+    """The eval shape: "Now let me verify:" before a tool, then a final call
+    with no text. The preamble is not an answer."""
+    recorded = await _run(
+        [*_completed_call("Now let me verify:"), *_completed_call("Checking"), *_empty_call()],
+        monkeypatch,
+    )
+
+    rows = recorded.cost_rows
+    assert [row["outcome"] for row in rows] == ["completed"] * 3
+    assert [row.get("emptyAnswer") for row in rows] == [None, None, True]
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_text_is_still_an_empty_answer(monkeypatch):
+    recorded = await _run([*_completed_call("one"), *_final_answer("  \n ")], monkeypatch)
+
+    assert [row.get("emptyAnswer") for row in recorded.cost_rows] == [None, True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param([_RAISE], id="exception-out-of-agent-stream"),
+        pytest.param([_FORCE_STOP], id="strands-force-stop"),
+    ],
+)
+async def test_a_failed_turn_marks_its_rows_error_and_never_empty(failure, monkeypatch):
+    recorded = await _run(_three_calls_then(failure), monkeypatch)
+
+    rows = recorded.cost_rows
+    assert [row["outcome"] for row in rows] == ["error"] * 3
+    assert not any("emptyAnswer" in row for row in rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "interruption, expect, outcome",
+    [
+        pytest.param(_STOP, None, "stopped", id="user-stop"),
+        pytest.param(_DISCONNECT, asyncio.CancelledError, "interrupted", id="disconnect"),
+    ],
+)
+async def test_an_interrupted_turn_names_how_it_was_cut(interruption, expect, outcome, monkeypatch):
+    recorded = await _run(
+        _three_calls_then([interruption]),
+        monkeypatch,
+        projected_input_tokens=PROJECTED_TOKENS,
+        expect=expect,
+    )
+
+    rows = recorded.cost_rows
+    assert [row["outcome"] for row in rows] == [outcome] * 4
+    assert not any("emptyAnswer" in row for row in rows)
+
+
+def test_a_paused_turn_is_paused_and_never_an_empty_answer():
+    """A pause ends on the tool use the user is answering, so its last call
+    has no text by design; that is not an empty answer."""
+    paused = SimpleNamespace(_interrupt_state=SimpleNamespace(activated=True))
+    slots = [{"has_text": False}]
+    assert StreamCoordinator._completed_turn_outcome(paused, slots) == ("paused", False)
+
+    running = SimpleNamespace(_interrupt_state=SimpleNamespace(activated=False))
+    assert StreamCoordinator._completed_turn_outcome(running, slots) == ("completed", True)
+    assert StreamCoordinator._completed_turn_outcome(running, [{"has_text": True}]) == ("completed", False)
+    # A MagicMock-ish truthy attribute is not a pause: only a real True counts.
+    odd = SimpleNamespace(_interrupt_state=SimpleNamespace(activated=MagicMock()))
+    assert StreamCoordinator._completed_turn_outcome(odd, [{"has_text": True}]) == ("completed", False)
+
+
+# ---------------------------------------------------------------------------
+# Release ledger (release-ledger spec §5.2): a turn counts once, on its last
+# row, whichever arm it ended in, and every model call counts as a call.
+# ---------------------------------------------------------------------------
+
+
+def _ledger_version_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    from apis.shared.sessions.ledger_rollups import ledger_updates, merge_updates
+
+    merged = merge_updates(u for row in rows for u in ledger_updates(row))
+    (version,) = [u for u in merged if u.pk == "LEDGER#VERSION"]
+    return version.add
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "events, kwargs, expect, counter, calls",
+    [
+        pytest.param(
+            [*_completed_call("looking"), *_final_answer("Here it is.")], {}, None,
+            "completedTurns", 2, id="completed",
+        ),
+        pytest.param(
+            _three_calls_then([_RAISE]), {}, None, "errorTurns", 3, id="error",
+        ),
+        pytest.param(
+            _three_calls_then([_STOP]), {"projected_input_tokens": PROJECTED_TOKENS}, None,
+            "stoppedTurns", 4, id="user-stop",
+        ),
+        pytest.param(
+            _three_calls_then([_DISCONNECT]), {"projected_input_tokens": PROJECTED_TOKENS},
+            asyncio.CancelledError, "interruptedTurns", 4, id="disconnect",
+        ),
+    ],
+)
+async def test_the_ledger_counts_each_turn_once_and_every_call(
+    events, kwargs, expect, counter, calls, monkeypatch
+):
+    recorded = await _run(events, monkeypatch, expect=expect, **kwargs)
+
+    rows = recorded.cost_rows
+    assert len(rows) == calls
+    # Exactly one row per turn carries `turnDurationMs`: the last.
+    assert ["turnDurationMs" in row for row in rows] == [False] * (calls - 1) + [True]
+    totals = _ledger_version_totals(rows)
+    assert totals["calls"] == calls
+    assert totals["turns"] == 1
+    assert totals["outcomeTurns"] == 1
+    assert totals[counter] == 1
+    assert totals["callKind.chat"] == calls
+
+
+@pytest.mark.asyncio
+async def test_an_empty_answer_counts_once_per_turn(monkeypatch):
+    recorded = await _run(
+        [*_completed_call("Now let me verify:"), *_completed_call("Checking"), *_empty_call()],
+        monkeypatch,
+    )
+
+    totals = _ledger_version_totals(recorded.cost_rows)
+    assert (totals["calls"], totals["turns"], totals["emptyAnswerTurns"]) == (3, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_the_cost_summary_gets_the_stored_item_for_the_ledger(monkeypatch):
+    recorded = await _run([*_completed_call("one"), *_final_answer("two")], monkeypatch)
+
+    handed = [c.kwargs["ledger_row"] for c in recorded.cost_summary.await_args_list]
+    assert handed == recorded.cost_rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag, marked", [("true", True), ("", False), ("false", False)])
+async def test_a_row_the_live_ledger_counts_is_marked_on_its_own_put(monkeypatch, flag, marked):
+    """The backfill skips a marked row (release-ledger §7): the mark rides the same
+    put as the row, so a row is marked exactly when the live writer will count it."""
+    monkeypatch.setenv("RELEASE_LEDGER_ENABLED", flag)
+    monkeypatch.setenv("DYNAMODB_SYSTEM_ROLLUP_TABLE_NAME", "fake-rollups")
+    recorded = await _run([*_completed_call("one"), *_final_answer("two")], monkeypatch)
+
+    assert len(recorded.cost_rows) == 2
+    assert [row.get("ledgered") for row in recorded.cost_rows] == ([True, True] if marked else [None, None])
+
+
+# ---------------------------------------------------------------------------
+# What a call's output was made of (`outputChars` on the cost row): characters
+# of answer text, of streamed reasoning and of the reasoning signature, per
+# call. Lengths only.
+# ---------------------------------------------------------------------------
+
+
+def _thinking_answer(reasoning: str, signature: str, text: str) -> List[Dict[str, Any]]:
+    return [
+        {"event": {"messageStart": {"role": "assistant"}}},
+        {"reasoning": True, "reasoningText": reasoning},
+        {"reasoning_signature": signature},
+        {"event": {"contentBlockDelta": {"contentBlockIndex": 1, "delta": {"text": text}}}},
+        {"event": {"messageStop": {"stopReason": "end_turn"}}},
+        {"event": {"metadata": {"usage": dict(CALL_USAGE), "metrics": {"latencyMs": 100}}}},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_each_row_carries_what_its_own_call_streamed(monkeypatch):
+    recorded = await _run(
+        [*_completed_call("looking"), *_thinking_answer("weighing it", "s" * 62, "Here it is.")],
+        monkeypatch,
+    )
+
+    rows = recorded.cost_rows
+    assert rows[0]["outputChars"] == {"text": len("looking")}
+    assert rows[1]["outputChars"] == {
+        "text": len("Here it is."),
+        "reasoning": len("weighing it"),
+        "reasoningSignature": 62,
+    }
+    assert "weighing" not in repr(rows) and "Here it is" not in repr(rows)
+
+
+@pytest.mark.asyncio
+async def test_a_call_that_streamed_nothing_has_no_output_chars(monkeypatch):
+    recorded = await _run([*_completed_call("looking"), *_empty_call()], monkeypatch)
+    assert "outputChars" not in recorded.cost_rows[-1]
+
+
+@pytest.mark.asyncio
+async def test_output_chars_ride_the_cost_diagnostics_switch(monkeypatch):
+    monkeypatch.setenv("COST_DIAGNOSTICS_ENABLED", "false")
+    recorded = await _run([*_final_answer("Here it is.")], monkeypatch)
+    assert not any("outputChars" in row for row in recorded.cost_rows)
+
+
+# ---------------------------------------------------------------------------
+# A call the provider declined (stop reason content_filtered, no text) shows
+# the declined notice instead of a blank bubble, and is not an empty answer
+# (agents/main_agent/session/hooks/declined_answer.py).
+# ---------------------------------------------------------------------------
+
+
+def _declined_call(stop_reason: str = "content_filtered") -> List[Dict[str, Any]]:
+    return [
+        {"event": {"messageStart": {"role": "assistant"}}},
+        {"event": {"messageStop": {"stopReason": stop_reason}}},
+        {"event": {"metadata": {"usage": {"inputTokens": 1000, "outputTokens": 0, "totalTokens": 1000},
+                                "metrics": {"latencyMs": 100}}}},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_reason", ["content_filtered", "guardrail_intervened"])
+async def test_a_declined_call_streams_the_notice_before_its_stop(stop_reason, monkeypatch):
+    from agents.main_agent.session.hooks.declined_answer import DECLINED_NOTICE
+
+    recorded = await _run(_declined_call(stop_reason), monkeypatch)
+
+    stream = "".join(recorded.sse)
+    assert json.dumps(DECLINED_NOTICE) in stream
+    assert stream.index(json.dumps(DECLINED_NOTICE)) < stream.index("event: message_stop")
+    (row,) = recorded.cost_rows
+    assert row["outcome"] == "completed" and "emptyAnswer" not in row
+
+
+@pytest.mark.asyncio
+async def test_a_declined_call_that_already_said_something_gets_no_notice(monkeypatch):
+    from agents.main_agent.session.hooks.declined_answer import DECLINED_NOTICE
+
+    events = [
+        {"event": {"messageStart": {"role": "assistant"}}},
+        {"event": {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "The guardrail's own message."}}}},
+        {"event": {"messageStop": {"stopReason": "guardrail_intervened"}}},
+        {"event": {"metadata": {"usage": dict(CALL_USAGE), "metrics": {"latencyMs": 100}}}},
+    ]
+    recorded = await _run(events, monkeypatch)
+    assert json.dumps(DECLINED_NOTICE) not in "".join(recorded.sse)
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_empty_final_call_is_still_an_empty_answer(monkeypatch):
+    recorded = await _run([*_completed_call("looking"), *_empty_call()], monkeypatch)
+    assert recorded.cost_rows[-1].get("emptyAnswer") is True

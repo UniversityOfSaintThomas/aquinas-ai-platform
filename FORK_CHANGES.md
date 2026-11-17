@@ -14,7 +14,7 @@ A promotion is the pull request from `develop` into `production`. Each branch's 
 
 **Maintained on `develop`.** This file reaches `production` with the next promotion. It is kept off `main`, because a local commit there means `main` no longer matches upstream, and *Sync fork* can then hit conflicts that GitHub asks you to resolve with a pull request.
 
-**Not every entry is on every branch.** Entry 1 exists only on `production`, so a reader on `develop` will not find it in their working tree, and that is expected. Entries 2 to 10 exist on `develop` and reach `production` at the next promotion.
+**Not every entry is on every branch.** Entry 1 exists only on `production`, so a reader on `develop` will not find it in their working tree, and that is expected. Entries 2, 3, 4, 6, 7 and 8 exist on `develop` and reach `production` at the next promotion. Entries 5, 9 and 10 were retired at the 1.36.1 upgrade (2026-11-16), because upstream's own fixes replaced them; their numbers are not reused.
 
 ## Summary
 
@@ -24,12 +24,9 @@ A promotion is the pull request from `develop` into `production`. Each branch's 
 | 2 | SPA hosted zone lookup | `spa-distribution-construct.ts` | `develop`, both after promotion | Fix ready; pull request not yet opened | Upstream fixes it |
 | 3 | Rebranding | `brand.config.ts` plus assets | `develop`, both after promotion | Not applicable, local identity | Never |
 | 4 | `favicon.ico` hand-maintained | `public/favicon/favicon.ico` | `develop`, both after promotion | Defect, not yet reported | Upstream fixes it |
-| 5 | `log_success` in teardown script | `scripts/teardown/managed-kb.sh` | `develop`, both after promotion | Fixed upstream in v1.33.0 (#1808) | The 1.35.0 upgrade |
 | 6 | St. Thomas base system prompt | `system_prompt_builder.py` (6 lines) | `develop`, both after promotion | Not applicable; a configurable prompt is an issue candidate | Upstream makes it configurable |
 | 7 | St. Thomas web crawler user agent | `crawler.py` (1 line) | `develop`, both after promotion | Not applicable; a configurable user agent is an issue candidate | Upstream makes it configurable |
 | 8 | System prompt date in Central time | `timezone.py` (2 lines), `test_timezone.py` | `develop`, both after promotion | A configurable timezone is an issue candidate | Upstream makes it configurable |
-| 9 | Backport: attachment eviction tests | `test_attachment_index.py` (test only) | `develop`, both after promotion | Fixed upstream in `e4b1961` (v1.31.0) | The 1.35.0 upgrade |
-| 10 | Backport: conversation search tests | `test_conversation_search_route.py` (test only) | `develop`, both after promotion | Fixed upstream in `12643da3` (v1.34.0) | The 1.35.0 upgrade |
 
 ---
 
@@ -115,7 +112,7 @@ The fix is ready to submit upstream; the pull request has not been opened yet (t
 
 **Branches:** `develop`; reaches `production` at the next promotion
 
-**Files:** under `frontend/ai.client/`: `src/branding/brand.config.ts`, `src/styles/generated/brand-theme.css`, `public/img/logo-light.png`, `public/img/logo-dark.png`, `public/favicon-source.png`, `public/favicon/` (five PNGs, `favicon.ico`, `site.webmanifest`), and `src/version.ts` (see below)
+**Files:** under `frontend/ai.client/`: `src/branding/brand.config.ts`, `src/styles/generated/brand-theme.css`, `public/img/logo-light.png`, `public/img/logo-dark.png`, `public/favicon-source.png`, `public/favicon/` (five PNGs, `favicon.ico`, `site.webmanifest`)
 
 **Commit:** `0fc9d15` on `develop`
 
@@ -136,8 +133,6 @@ Source assets, under `frontend/ai.client/`: `public/img/logo-light.png` and `pub
 **`appName` must stay at 12 characters or fewer.** `generate-favicons.ts` performs an unguarded `substring(0, 12)` when writing the web manifest's `short_name`, so a longer value is silently truncated mid-word.
 
 **Generated output is committed.** The following travel with this change: `src/styles/generated/brand-theme.css`, the five `public/favicon/*.png` files, and `site.webmanifest`. Only `brand-theme.css` is pinned by a spec (`brand-theme-golden.spec.ts`). Any future edit to `brand.config.ts` or `favicon-source.png` must be followed by `npm run prestart`, with the regenerated files committed. A colour change left unregenerated fails `brand-theme-golden.spec.ts` in CI; a new source image left unregenerated leaves the old favicon PNGs in place, with no error.
-
-**`frontend/ai.client/src/version.ts` also differs from upstream, and is not a deliberate change.** The npm `prebuild` hook runs `scripts/gen-version.js`, which writes it from the root `VERSION` file. `0fc9d15` committed it at `'1.22.0'`, the `VERSION` at the time (the commit message calls it prebuild churn), while upstream's committed copy at v1.30.0 reads `'1.14.0'`. The file's own header says production builds overwrite it. Upstream's copy is restored at the 1.35.0 upgrade, after which this paragraph is removed.
 
 **Not covered by this change.** Upstream hard-codes "Boise State" in user-facing text that `brand.config.ts` does not reach: the home link on the shared artifact page (`shared-artifact-view.page.ts`, `boisestate.ai`), the agent share dialog (`share-agent-dialog.component.ts`, "Everyone at Boise State"), the store submission dialog (`submit-listing-dialog.component.ts`, "everyone at Boise State can open it") and the marketplace publisher hint (`marketplace.model.ts`, "agents that speak for Boise State"). They are left as upstream until a pull request makes them configurable (PR TODO).
 
@@ -160,38 +155,6 @@ So the `.ico` does **not** track `favicon-source.png`. Anyone who replaces the s
 Current file is a three-resolution ICO at 48, 32 and 16 pixels, 32-bit BMP encoding, built by hand.
 
 Replacing it requires a tool that writes multi-resolution ICO files, run on `favicon-source.png` at 48, 32 and 16 pixels. Note that the inaccurate header comment is itself worth reporting upstream, since it is what makes the behaviour misleading rather than merely limited. Not yet reported upstream; to be raised as its own issue (PR TODO).
-
----
-
-## 5. `log_success` defined in `managed-kb.sh`
-
-**Branches:** `develop`; reaches `production` at the next promotion
-
-**File:** `scripts/teardown/managed-kb.sh`, 10 lines added
-
-**Commit:** `34eecec` on `develop`
-
-An upstream defect from at least v1.25.1 until v1.33.0, not an adaptation to our environment.
-
-`managed-kb.sh` calls `log_success` at lines 228, 293 and 313 in upstream's v1.25.1 to v1.30.0 file (238, 303 and 323 in ours, after the fix), but sources only `scripts/common/load-env.sh`, which defines `log_info`, `log_warn`, `log_error` and `log_config` and nothing else. `destroy.sh` does define its own `log_success` at line 20, but invokes this script with `bash` at line 174, a separate process, so the definition is not inherited. Standalone invocation has the same gap.
-
-**It blocked teardown entirely for any environment with zero managed knowledge bases**, which is the default state for any deployment that never enabled the managed KB backend. The undefined function returns 127, so the `exit 0` immediately below line 228 is never reached, and `destroy.sh` reads that exit code as knowledge base teardown having failed. It then halts before deleting any stack, which is correct behaviour on a false signal: the Bedrock service role lives in `PlatformStack`, so deleting that first would strand real knowledge bases.
-
-Lines 293 and 313 are worse in principle. They fire after deletions have already succeeded, so an environment that does have managed knowledge bases would delete them and then report failure.
-
-Fixed by defining the function once, guarded with `declare -f` in the same style as the source block directly above it, rather than patching three call sites:
-
-```bash
-if ! declare -f log_success >/dev/null 2>&1; then
-    log_success() {
-        echo -e "${GREEN:-}[SUCCESS]${NC:-} $1"
-    }
-fi
-```
-
-The `:-` defaults on `GREEN` and `NC` are deliberate. Those variables come from `load-env.sh`, whose sourcing the guard above may skip. The script runs with `set -u`, so an unset `GREEN` or `NC` would otherwise stop it with an "unbound variable" error.
-
-**Fixed upstream in v1.33.0 (#1808), with the same guarded definition.** Upstream's v1.35.0 `managed-kb.sh` differs from ours only in the four comment lines above the guard. At the 1.35.0 upgrade, take upstream's file, then delete this entry and its summary row.
 
 ---
 
@@ -258,38 +221,6 @@ Both zone lookups (the `zoneinfo` branch and the `pytz` fallback) now use `Ameri
 `test_timezone.py` pinned Pacific behaviour. Six of its tests now use Central (four renamed from Pacific to Central), and a new test (`test_uses_central_date_not_pacific_date`) pins the fix itself: at 05:30 UTC the date must be Central's, not Pacific's previous day.
 
 Retires if upstream makes the prompt timezone configurable.
-
----
-
-## 9. Backport: attachment eviction tests no longer expire on a calendar date
-
-**Branches:** `develop`; reaches `production` at the next promotion
-
-**File:** `backend/tests/shared/test_attachment_index.py` (+12 −3, test only)
-
-**Commit:** `c0f7486c` on `develop`, cherry-picked with `-x` from upstream `e4b1961` ("test(files): stop the attachment eviction tests expiring on a calendar date (#1704)", upstream author kept)
-
-An upstream defect in a test, not in the product, and already fixed upstream. `TestEviction` and `TestReconcile` compared rows against a fixed `NOW` of 2026-11-20 but built those rows with today's real creation date. From 00:00 UTC on 2026-10-21 the gap fell under the 30-day retention window and both eviction assertions failed. Because every Backend build job depends on `test-backend`, this blocked all Backend deploys from `develop` on v1.30.0.
-
-Upstream fixed it on `develop` on 2026-10-21, three days after v1.30.0 was tagged. The fix pins the rows' creation time to the same `NOW`-relative instant. Production code is unchanged.
-
-**Temporary.** Upstream's copy of the file at v1.31.0 and v1.35.0 is identical to ours, so the upgrade merge should apply cleanly or report the change as already present. After the 1.35.0 upgrade, confirm the file matches upstream and delete this entry and its summary row.
-
----
-
-## 10. Backport: conversation search tests no longer expire on a calendar date
-
-**Branches:** `develop`; reaches `production` at the next promotion
-
-**File:** `backend/tests/shared/test_conversation_search_route.py` (+7 −1, test only)
-
-**Commit:** `3a6dc678` on `develop`, cherry-picked with `-x` from upstream `12643da3` ("test(search): date the fake KB turns relative to now", upstream author kept)
-
-An upstream defect in a test, not in the product, and already fixed upstream. The fake knowledge base document's default `created_at` was a fixed 2026-10-07. With the test's 30-day retention it aged past the window on 2026-11-06, and `test_turns_past_retention_are_dropped` failed. Because every Backend deploy job depends on `test-backend`, this blocked all Backend deploys on v1.30.0, including production's first (2026-11-13).
-
-Upstream fixed it on `develop` on 2026-11-06, and released it in v1.34.0. The fix dates the fake turns an hour before now. Production code is unchanged.
-
-**Temporary.** With this backport, our copy of the file is identical to upstream's at v1.34.0 and v1.35.0, so the upgrade merge should apply cleanly. After the 1.35.0 upgrade, confirm the file matches upstream and delete this entry and its summary row.
 
 ---
 

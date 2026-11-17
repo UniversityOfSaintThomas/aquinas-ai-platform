@@ -34,8 +34,15 @@ import type {
   ToolResultEventData,
   AgentStatusEvent,
   ToolGroupSummaryEvent,
+  SourceProvenanceEvent,
+  SourceProvenanceClaim,
+  SourceLocator,
+  DocumentExtractionEvent,
+  DocumentExtractionRun,
+  DocumentExtractionField,
   QuotaWarningEvent,
   QuotaSessionNoticeEvent,
+  QuotaFundingNoticeEvent,
   QuotaExceededEvent,
   StreamErrorEvent,
   ConversationalStreamErrorEvent,
@@ -89,6 +96,7 @@ export interface StreamParserCallbacks {
   // Quota events
   onQuotaWarning?: (data: QuotaWarningEvent) => void;
   onQuotaSessionNotice?: (data: QuotaSessionNoticeEvent) => void;
+  onQuotaFundingNotice?: (data: QuotaFundingNoticeEvent) => void;
   onQuotaExceeded?: (data: QuotaExceededEvent) => void;
 
   // OAuth consent required (external MCP tool needs user authorization)
@@ -112,6 +120,11 @@ export interface StreamParserCallbacks {
   // mid-turn, out of band with the content stream, and replaces the
   // deterministic formatter line the rail has been showing.
   onToolGroupSummary?: (data: ToolGroupSummaryEvent) => void;
+  onSourceProvenance?: (data: SourceProvenanceEvent) => void;
+
+  // One document's `document_extract` rows. A call over N documents emits N
+  // of these sharing one toolUseId; the renderer groups them into one table.
+  onDocumentExtraction?: (data: DocumentExtractionEvent) => void;
 
   // Compaction (backend rolled older turns into a summary on this turn)
   onCompaction?: (data: CompactionEvent) => void;
@@ -373,6 +386,27 @@ export function validateQuotaSessionNoticeEvent(
     event.sessionId.length > 0 &&
     typeof event.sessionCost === 'number' &&
     typeof event.quotaLimit === 'number'
+  );
+}
+
+/**
+ * Validate QuotaFundingNoticeEvent structure
+ */
+export function validateQuotaFundingNoticeEvent(
+  data: unknown,
+): data is QuotaFundingNoticeEvent {
+  if (!data || typeof data !== 'object') {
+    return false;
+  }
+
+  const event = data as Partial<QuotaFundingNoticeEvent>;
+
+  return (
+    event.type === 'quota_funding_notice' &&
+    typeof event.label === 'string' &&
+    typeof event.chargedThisPeriod === 'number' &&
+    typeof event.message === 'string' &&
+    (event.cap === undefined || typeof event.cap === 'number')
   );
 }
 
@@ -786,6 +820,180 @@ export function validateToolGroupSummaryEvent(
   );
 }
 
+const PROVENANCE_STATES = new Set([
+  'supported',
+  'quote_unsupported',
+  'unassessed',
+  'unverified',
+]);
+const LOCATOR_KINDS = new Set(['page', 'paragraph', 'line']);
+const LOCATOR_PRECISIONS = new Set(['measured', 'estimated']);
+
+/**
+ * A locator, accepted only whole. A partial one (a page with no `precision`)
+ * is exactly the shape that renders invented precision, so it becomes `null`
+ * — losing the page reference, never faking one.
+ */
+function normalizeLocator(raw: unknown): SourceLocator | null {
+  const loc = raw as Partial<SourceLocator> | null | undefined;
+  return loc &&
+    typeof loc === 'object' &&
+    typeof loc.kind === 'string' &&
+    LOCATOR_KINDS.has(loc.kind) &&
+    typeof loc.value === 'number' &&
+    Number.isFinite(loc.value) &&
+    typeof loc.precision === 'string' &&
+    LOCATOR_PRECISIONS.has(loc.precision)
+    ? {
+        kind: loc.kind as SourceLocator['kind'],
+        value: loc.value,
+        precision: loc.precision as SourceLocator['precision'],
+      }
+    : null;
+}
+
+/**
+ * Validate one claim of a `source_provenance` event.
+ *
+ * An unknown `state` is rejected rather than passed through: every renderer
+ * branches on it, and a state nothing recognises would fall through to
+ * whatever the default arm happens to be — which for a citation badge means
+ * showing something reassuring about a value we know nothing about.
+ *
+ * A locator is accepted only whole. A partial one (a page with no `precision`)
+ * is exactly the shape that renders invented precision, so it is dropped to
+ * `null` — losing the page reference, never faking one.
+ */
+function normalizeProvenanceClaim(raw: unknown): SourceProvenanceClaim | null {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const claim = raw as Partial<SourceProvenanceClaim>;
+  if (typeof claim.state !== 'string' || !PROVENANCE_STATES.has(claim.state)) {
+    return null;
+  }
+  const locator = normalizeLocator(claim.locator);
+  return {
+    id: typeof claim.id === 'string' ? claim.id : '',
+    state: claim.state as SourceProvenanceClaim['state'],
+    method: typeof claim.method === 'string' ? claim.method : '',
+    value: typeof claim.value === 'string' ? claim.value : undefined,
+    quote: typeof claim.quote === 'string' ? claim.quote : '',
+    locator,
+    uploadId: typeof claim.uploadId === 'string' ? claim.uploadId : '',
+    filename: typeof claim.filename === 'string' ? claim.filename : '',
+  };
+}
+
+/**
+ * Validate a `source_provenance` event.
+ *
+ * Claims that do not validate are dropped individually rather than failing the
+ * whole event: losing one verdict degrades to "no provenance shown for that
+ * value", while rejecting the batch would also discard a `quote_unsupported`
+ * sitting beside it — the one verdict that must never go missing quietly.
+ */
+export function validateSourceProvenanceEvent(
+  data: unknown,
+): data is SourceProvenanceEvent {
+  if (!data || typeof data !== 'object') {
+    return false;
+  }
+  const event = data as Partial<SourceProvenanceEvent>;
+  if (event.type !== 'source_provenance' || !Array.isArray(event.claims)) {
+    return false;
+  }
+  const claims = event.claims
+    .map(normalizeProvenanceClaim)
+    .filter((c): c is SourceProvenanceClaim => c !== null);
+  if (claims.length === 0) {
+    return false;
+  }
+  event.claims = claims;
+  return typeof event.toolUseId === 'string' && event.toolUseId.length > 0;
+}
+
+const str = (v: unknown): string => (typeof v === 'string' ? v : '');
+
+/**
+ * One extracted field. An unknown `state` drops the FIELD, for the same reason
+ * as a provenance claim: a state nothing recognises would render as whatever
+ * the default arm is, which for a badge means something reassuring.
+ */
+function normalizeExtractionField(raw: unknown): DocumentExtractionField | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const field = raw as Partial<Record<keyof DocumentExtractionField, unknown>>;
+  if (typeof field.state !== 'string' || !PROVENANCE_STATES.has(field.state)) {
+    return null;
+  }
+  const name = str(field.name);
+  const value =
+    typeof field.value === 'string'
+      ? field.value
+      : typeof field.value === 'number' || typeof field.value === 'boolean'
+        ? String(field.value)
+        : '';
+  const quote = str(field.quote);
+  return {
+    name,
+    title: str(field.title) || name,
+    type: str(field.type),
+    value,
+    state: field.state as DocumentExtractionField['state'],
+    method: str(field.method),
+    quote: quote || null,
+    locator: normalizeLocator(field.locator),
+  };
+}
+
+/**
+ * One document's extraction run, from the live `document_extraction` event OR
+ * a `GET /messages` `extractions` row — both go through here, so a reloaded
+ * table is validated exactly like a live one.
+ *
+ * Returns `null` without a `toolUseId` (nothing to anchor the table to) or
+ * with no valid field. `schemaEnforced` defaults to `true` only when absent;
+ * any explicit non-`true` value is read as unenforced, because the safe error
+ * here is a disclosure that was not needed, never a missing one.
+ */
+export function normalizeDocumentExtractionRun(raw: unknown): DocumentExtractionRun | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const run = raw as Partial<Record<keyof DocumentExtractionRun, unknown>>;
+  const toolUseId = str(run.toolUseId);
+  if (!toolUseId || !Array.isArray(run.fields)) return null;
+  const fields = run.fields
+    .map(normalizeExtractionField)
+    .filter((f): f is DocumentExtractionField => f !== null);
+  if (fields.length === 0) return null;
+  return {
+    toolUseId,
+    fieldSet: str(run.fieldSet),
+    fieldSetVersion: str(run.fieldSetVersion),
+    uploadId: str(run.uploadId),
+    filename: str(run.filename),
+    modelId: str(run.modelId),
+    schemaEnforced: run.schemaEnforced === undefined ? true : run.schemaEnforced === true,
+    artifactId: str(run.artifactId) || null,
+    downloadUploadId: str(run.downloadUploadId) || null,
+    ...(typeof run.documentCount === 'number' ? { documentCount: run.documentCount } : {}),
+    ...(run.quotesOmitted === true ? { quotesOmitted: true } : {}),
+    fields,
+  };
+}
+
+/** Validate a `document_extraction` event, normalizing it in place. */
+export function validateDocumentExtractionEvent(
+  data: unknown,
+): data is DocumentExtractionEvent {
+  if (!data || typeof data !== 'object') return false;
+  const event = data as Partial<DocumentExtractionEvent>;
+  if (event.type !== 'document_extraction') return false;
+  const run = normalizeDocumentExtractionRun(event);
+  if (!run) return false;
+  Object.assign(event, run);
+  return true;
+}
+
 /**
  * Validate an `agent_notice` event. `message` is what the user reads, so an
  * empty one is rejected rather than rendered as a blank notice.
@@ -960,6 +1168,12 @@ export function processStreamEvent(
         }
         break;
 
+      case 'quota_funding_notice':
+        if (validateQuotaFundingNoticeEvent(data)) {
+          callbacks.onQuotaFundingNotice?.(data);
+        }
+        break;
+
       case 'quota_exceeded':
         if (validateQuotaExceededEvent(data)) {
           callbacks.onQuotaExceeded?.(data);
@@ -1081,6 +1295,22 @@ export function processStreamEvent(
           callbacks.onAgentStatus?.(data);
         } else {
           callbacks.onParseError?.('agent_status: invalid data structure');
+        }
+        break;
+
+      case 'source_provenance':
+        if (validateSourceProvenanceEvent(data)) {
+          callbacks.onSourceProvenance?.(data);
+        } else {
+          callbacks.onParseError?.('source_provenance: invalid data structure');
+        }
+        break;
+
+      case 'document_extraction':
+        if (validateDocumentExtractionEvent(data)) {
+          callbacks.onDocumentExtraction?.(data);
+        } else {
+          callbacks.onParseError?.('document_extraction: invalid data structure');
         }
         break;
 

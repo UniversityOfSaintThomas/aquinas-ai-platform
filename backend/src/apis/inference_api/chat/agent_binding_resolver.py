@@ -78,7 +78,7 @@ from apis.shared.models.retirement import (
 from apis.shared.rbac.model_access import model_access_denied_message
 from apis.shared.rbac.service import get_app_role_service
 from apis.shared.skills.access import resolve_invocable_skill_ids
-from apis.shared.skills.pins import binding_pin, pinned_ref
+from apis.shared.skills.pins import binding_pin, pinned_ref, project_skill_adders
 from apis.shared.tools.scoped_ids import base_tool_id
 
 
@@ -252,7 +252,9 @@ async def resolve_agent_invocation(
         # (docs/specs/model-retirement.md §5 Stage 3). The Agent's params ride
         # along; the successor's own spec drops what it does not support.
         effective = await resolve_effective_model(model_settings.model_id) or EffectiveModel(
-            requested_id=model_settings.model_id, model_id=model_settings.model_id
+            requested_id=model_settings.model_id,
+            model_id=model_settings.model_id,
+            catalog_read=False,
         )
         model_id = effective.model_id
         provider = effective.provider if effective.redirected else model_settings.provider
@@ -262,7 +264,9 @@ async def resolve_agent_invocation(
                 plan.unavailable.model_id = model_settings.model_id
             else:
                 raise AgentBindingBlockedError(retired_model_message(effective.retired, agent=True))
-        elif await app_role_service.can_access_model(invoker, model_id, record=effective.record):
+        elif await app_role_service.can_access_model(
+            invoker, model_id, record=effective.record, catalog_read=effective.catalog_read
+        ):
             plan.model_override = ResolvedModel(
                 model_id=model_id,
                 provider=provider,
@@ -273,7 +277,9 @@ async def resolve_agent_invocation(
             plan.unavailable.model_id = model_id
         else:
             raise AgentBindingBlockedError(
-                model_access_denied_message(model_id, effective.record, agent=True)
+                model_access_denied_message(
+                    model_id, effective.record, agent=True, uncataloged=effective.uncataloged
+                )
             )
 
     plan.tools = await _resolve_tools(assistant, invoker, plan.unavailable if degrade else None)
@@ -296,7 +302,8 @@ async def _resolve_skills(
 
     Each bound skill is re-checked against the invoker with the **invoke-through**
     predicate (§6/D7, ``resolve_invocable_skill_ids``): catalog grant ∪ ownership ∪
-    "the Agent's owner authored it". A single missing skill blocks the turn
+    "the Agent's owner authored it" ∪, on a project harness, "the editor who added
+    it authored it" (the binding's ``addedBy``, shared-projects §9.6). A single missing skill blocks the turn
     (block-with-message, no silent drop — D5). The skills feature being disabled in
     this environment also blocks — design-time refuses to create these while the flag is off,
     so reaching here with the flag off is environment drift (mirror ``_resolve_tools``).
@@ -337,7 +344,7 @@ async def _resolve_skills(
         )
 
     invocable = await resolve_invocable_skill_ids(
-        invoker, refs, getattr(assistant, "owner_id", None)
+        invoker, refs, getattr(assistant, "owner_id", None), adders=project_skill_adders(assistant)
     )
     missing = [ref for ref in refs if ref not in invocable]
     if missing and dropped is None:

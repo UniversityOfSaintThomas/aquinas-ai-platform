@@ -1,3 +1,4 @@
+import { inject } from '@angular/core';
 import { Routes } from '@angular/router';
 import { FineTuningLayout } from './fine-tuning-access/fine-tuning.layout';
 import {
@@ -5,6 +6,16 @@ import {
   adminScopeGuard,
   AdminScopeRouteData,
 } from '../auth/admin-scope.guard';
+import { FEATURES } from '../services/features';
+
+/** Matches only in a build with quota requests on (compile-time; see environments/feature-flags.ts). */
+const quotaRequestsEnabled = () => inject(FEATURES).quotaRequests;
+
+/** Matches only in a build with the release ledger on (compile-time; see environments/feature-flags.ts). */
+const releaseLedgerEnabled = () => inject(FEATURES).releaseLedger;
+
+/** Matches only in a build with AWS Limits on (compile-time; see environments/feature-flags.ts). */
+const awsLimitsEnabled = () => inject(FEATURES).awsLimits;
 
 /**
  * Admin console routes.
@@ -48,10 +59,39 @@ export const adminRoutes: Routes = [
     loadComponent: () => import('./feedback/fleet-feedback.page').then(m => m.FleetFeedbackPage),
   },
   {
+    // The eval harness's published runs over time (eval-harness spec §16). It
+    // reads `LEDGER#EVAL` rows through the release ledger's store, so it takes
+    // the ledger's scope and flag; unmatched in a build with the ledger off.
+    path: 'evaluations',
+    canMatch: [releaseLedgerEnabled],
+    canActivate: [adminScopeGuard],
+    data: { scope: 'admin.costs' } satisfies AdminScopeRouteData,
+    loadComponent: () => import('./evaluations/evaluations.page').then(m => m.EvaluationsPage),
+  },
+  {
     path: 'quota',
     canActivate: [adminScopeGuard],
     data: { scope: 'admin.quota' } satisfies AdminScopeRouteData,
     loadChildren: () => import('./quota-tiers/quota-routing.module').then(m => m.quotaRoutes),
+  },
+  {
+    // Its own scope so a department approver can hold the queue without the
+    // tier editor (quota-requests spec §8.6); unmatched in a build with the
+    // feature off.
+    path: 'quota-requests',
+    canMatch: [quotaRequestsEnabled],
+    canActivate: [adminScopeGuard],
+    data: { scope: 'admin.quota_requests' } satisfies AdminScopeRouteData,
+    loadChildren: () => import('./quota-requests/quota-requests.routes').then(m => m.quotaRequestsRoutes),
+  },
+  {
+    // The account's AWS Service Quotas (GitHub issue #12); unmatched in a
+    // build with the feature off.
+    path: 'aws-limits',
+    canMatch: [awsLimitsEnabled],
+    canActivate: [adminScopeGuard],
+    data: { scope: 'admin.aws_limits' } satisfies AdminScopeRouteData,
+    loadComponent: () => import('./aws-limits/aws-limits.page').then(m => m.AwsLimitsPage),
   },
   {
     path: 'fine-tuning',

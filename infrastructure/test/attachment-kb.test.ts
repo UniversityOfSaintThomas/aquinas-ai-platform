@@ -1,7 +1,9 @@
 /**
  * The shared `attachments` knowledge base, PR-3 (docs/specs/large-document-attachments.md
- * §4E), folded into the large-document pipeline because PlatformStack sits at
- * 492/500 resources on dev. Pinned:
+ * §4E), folded into the large-document pipeline to spend as few of
+ * PlatformStack's resources as possible (`platform-ceilings.test.ts` carries
+ * the stack's count against CloudFormation's limit; this test pins what
+ * turning the feature on costs). Pinned:
  *   - CDK_ATTACHMENT_KB_ENABLED is opt-in, and refused without large-document attachments;
  *   - on, it costs exactly 2 resources: an S3 Object Deleted rule and a daily
  *     schedule, both targeting the existing prepare queue; the user-files
@@ -198,6 +200,18 @@ describe('the attachments KB in PlatformStack', () => {
       expect(env).toHaveProperty(name);
     }
     expect(prepareFunction(docsOnly).Environment.Variables).not.toHaveProperty('ATTACHMENT_KB_ENABLED');
+  });
+
+  it('gives the prepare Lambda the token profile only while it is on (phase 5 indexing)', () => {
+    expect(prepareFunction(withKb).Environment.Variables).not.toHaveProperty('ATTACHMENT_PLAN_ENABLED');
+    const withPlan = synth({
+      largeDocumentAttachments: { enabled: true },
+      attachmentKb: { enabled: true },
+      attachmentPlan: { enabled: true },
+    });
+    expect(prepareFunction(withPlan).Environment.Variables.ATTACHMENT_PLAN_ENABLED).toBe('true');
+    const planWithoutKb = synth({ largeDocumentAttachments: { enabled: true }, attachmentPlan: { enabled: true } });
+    expect(prepareFunction(planWithoutKb).Environment.Variables).not.toHaveProperty('ATTACHMENT_PLAN_ENABLED');
   });
 
   it('holds the byte accounting to its own partition and the session read to one index', () => {

@@ -31,7 +31,9 @@ import base64
 from dataclasses import dataclass
 
 from apis.shared.aws_clients import get_dynamodb_table
-from typing import Iterable, List, Optional, Tuple, Any, Dict
+from apis.shared.build_info import build_stamp
+from apis.shared.sessions.ledger_rollups import LEDGERED, live_ledger_writes_on
+from typing import Iterable, List, Literal, Optional, Tuple, Any, Dict
 from decimal import Decimal
 
 # Relative imports from shared sessions module
@@ -43,6 +45,7 @@ from .models import ExportReceipt, MessageMetadata, PausedTurnSnapshot, PendingI
 # The headless delivery path (ensure_session_metadata_exists) calls
 # is_preview_session, so a lazy import would only defer the crash.
 from .preview import is_preview_session
+from .rewind import RewindState
 
 # Stdlib-only normalizer for the conversation-search attributes written beside
 # the title (titleLower, firstPrompt).
@@ -119,27 +122,32 @@ def _coerce_cost_total(raw: Any) -> float:
 async def store_message_metadata(
     session_id: str,
     user_id: str,
-    message_id: int,
+    message_id: Optional[int],
     message_metadata: MessageMetadata
-) -> None:
+) -> Dict[str, Any]:
     """
     Store message metadata after streaming completes
 
     Args:
         session_id: Session identifier
         user_id: User identifier
-        message_id: Message number (1, 2, 3, ...)
+        message_id: Message number (1, 2, 3, ...), or None for a call that produced no
+            message (a handoff brief, which carries ``callKind`` instead)
         message_metadata: MessageMetadata object to store
 
     Note:
         This should be called AFTER the session manager flushes messages,
         ensuring the message file exists before we try to update it.
+
+    Returns:
+        The derived prompt-cache observability written on the row (``cacheStatus`` …),
+        or ``{}`` when it was skipped.
     """
     sessions_metadata_table = os.environ.get('DYNAMODB_SESSIONS_METADATA_TABLE_NAME')
     if not sessions_metadata_table:
         raise RuntimeError("DYNAMODB_SESSIONS_METADATA_TABLE_NAME environment variable is required")
 
-    await _store_message_metadata_cloud(
+    return await _store_message_metadata_cloud(
         session_id=session_id,
         user_id=user_id,
         message_id=message_id,
@@ -233,10 +241,10 @@ def get_user_display_text(session_id: str, user_id: str, message_id: int) -> Opt
 async def _store_message_metadata_cloud(
     session_id: str,
     user_id: str,
-    message_id: int,
+    message_id: Optional[int],
     message_metadata: MessageMetadata,
     table_name: str
-) -> None:
+) -> Dict[str, Any]:
     """
     Store message metadata (cost record) in DynamoDB and update cost summary
 
@@ -319,7 +327,6 @@ async def _store_message_metadata_cloud(
 
             # Session reference (for linking back to session)
             "sessionId": session_id,
-            "messageId": message_id,
 
             # Attribution
             "userId": user_id,
@@ -328,6 +335,11 @@ async def _store_message_metadata_cloud(
             # TTL - only cost records have this attribute
             "ttl": ttl,
 
+            # Which build of the service produced this call: `appVersion` and
+            # `build` (docs/specs/release-ledger.md D1). Before the metadata so
+            # a caller that knows better (the backfill) can override them.
+            **build_stamp(),
+
             # Cost and usage metadata
             **metadata_decimal,
 
@@ -335,6 +347,17 @@ async def _store_message_metadata_cloud(
             # wastedUsd) — {} when derivation was skipped or failed
             **_convert_floats_to_decimal(cache_observability),
         }
+
+        # A call that produced no message (a handoff brief, marked by ``callKind``) carries no
+        # messageId: readers join feedback and per-turn views on it, and the source's last
+        # turn's index would hand that answer's thumb to the brief (handoffs spec §4.5.1).
+        if message_id is not None:
+            item["messageId"] = message_id
+
+        # Release ledger: mark a row the live writer will count, on this same put, so the
+        # backfill can skip it whatever range it is given (docs/specs/release-ledger.md §7).
+        if live_ledger_writes_on():
+            item[LEDGERED] = True
 
         # Store in DynamoDB
         table.put_item(Item=item)
@@ -364,7 +387,8 @@ async def _store_message_metadata_cloud(
         await _update_cost_summary_async(
             user_id=user_id,
             timestamp=timestamp,
-            message_metadata=message_metadata
+            message_metadata=message_metadata,
+            ledger_row=item,
         )
 
         # Shared Projects: a call made by a project's harness also counts toward that
@@ -374,6 +398,8 @@ async def _store_message_metadata_cloud(
             timestamp=timestamp,
             message_metadata=message_metadata,
         )
+
+        return cache_observability
 
     except Exception as e:
         logger.error(f"Failed to store message metadata in DynamoDB: {e}", exc_info=True)
@@ -426,7 +452,9 @@ def _derive_cache_observability(
     query) and derives:
 
     - ``cacheStatus``: first_write | hit | partial_miss | miss_ttl_expired |
-      miss_avoidable | uncached (see ``apis.shared.observability.CacheStatus``).
+      miss_avoidable | uncached (see ``apis.shared.observability.CacheStatus``),
+      or ``estimated`` for a row whose usage was never reported — those return
+      early, before the query, and are never classified.
     - ``cacheGapSeconds``: whole seconds since the previous call, when known.
     - ``cachePrefixGapSeconds``: seconds since the last call with the *same*
       prefix, when that is a different (older) call than the previous one.
@@ -437,6 +465,8 @@ def _derive_cache_observability(
       different Agent / model than the previous call — an explained re-write
       (an ``@``-mention, a mid-conversation model switch). The waste stays in
       ``wastedUsd``; the flags let readers subtract it.
+    - ``rewound``: set on the first call after a rewind (its ``rewindEpoch``
+      is newer than the previous call's), the same kind of explanation.
 
     ⚠️ The predecessor that decides ``miss_avoidable`` vs ``miss_ttl_expired``
     is the last call with the **same toolConfig + system-prompt fingerprints**,
@@ -476,6 +506,18 @@ def _derive_cache_observability(
             return {}
 
         cache_read, cache_write = _extract_cache_usage(message_metadata)
+
+        # A call whose usage was never reported (an interrupted turn's cut
+        # generation) carries estimated buckets, so there is nothing here to
+        # classify. Say exactly that instead of deriving a status from the
+        # estimate: `cacheStatus` is where a cache investigation starts, and a
+        # confident-looking `first_write` or `miss_avoidable` on numbers nobody
+        # measured would send it after the wrong call. `wastedUsd` stays zero
+        # for the same reason — it is the metric the AvoidableMiss alarm reads.
+        # The buckets themselves are still the row's best estimate of what was
+        # billed, so the next call's own classification keeps its predecessor.
+        if (message_metadata.model_extra or {}).get("usageEstimated"):
+            return {"cacheStatus": CacheStatus.ESTIMATED.value, "wastedUsd": 0.0}
 
         # Recent cost rows for this session, newest first (GSI_SK = C#<timestamp>
         # sorts chronologically). We need a window rather than just the previous
@@ -627,6 +669,16 @@ def _derive_cache_observability(
         if prev_row is not None and own_agent != prev_agent:
             result["agentSwitched"] = True
 
+        # And for a rewind (rewind spec §6): the first call after one re-sends
+        # a shorter history than the call before it, so past the cache TTL it
+        # re-writes the history while reading tools + system, which classifies
+        # as `partial_miss`. Unavoidable, and the user's choice; the flag says
+        # so. Same discipline again: the spend stays in `wastedUsd`.
+        own_epoch = (message_metadata.model_extra or {}).get("rewindEpoch") or 0
+        prev_epoch = (prev_row or {}).get("rewindEpoch") or 0
+        if prev_row is not None and own_epoch > prev_epoch:
+            result["rewound"] = True
+
         # The same question for the model. Each model has its own cache, so a
         # call on a different model than the one before it re-writes the whole
         # prefix even though the fingerprints match, and the classifier above
@@ -765,7 +817,8 @@ async def _update_project_rollup_async(
 async def _update_cost_summary_async(
     user_id: str,
     timestamp: str,
-    message_metadata: MessageMetadata
+    message_metadata: MessageMetadata,
+    ledger_row: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Update pre-aggregated cost summary (async, non-blocking)
@@ -783,6 +836,8 @@ async def _update_cost_summary_async(
         user_id: User identifier
         timestamp: ISO timestamp of the message
         message_metadata: MessageMetadata containing cost, usage, and model info
+        ledger_row: The ``C#`` item just written, for the release ledger's
+            version-keyed rollups (``ledger_rollups``); None writes none.
     """
     try:
         import asyncio
@@ -896,7 +951,8 @@ async def _update_cost_summary_async(
                 cache_savings=cache_savings,
                 model_id=model_id,
                 model_name=model_name,
-                provider=provider
+                provider=provider,
+                ledger_row=ledger_row,
             )
         )
 
@@ -919,7 +975,8 @@ async def _update_system_rollups_async(
     cache_savings: float,
     model_id: str | None,
     model_name: str | None,
-    provider: str | None
+    provider: str | None,
+    ledger_row: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Update system-wide rollups for admin dashboard (async, fire-and-forget)
@@ -928,6 +985,11 @@ async def _update_system_rollups_async(
     - Daily rollup (ROLLUP#DAILY, SK: YYYY-MM-DD)
     - Monthly rollup (ROLLUP#MONTHLY, SK: YYYY-MM)
     - Per-model rollup (ROLLUP#MODEL, SK: YYYY-MM#model_id)
+    - While ``RELEASE_LEDGER_ENABLED`` is on, the release ledger's
+      ``LEDGER#VERSION`` / ``#MODEL`` / ``#TOOL`` / ``#AGENT`` / ``#PROJECT``
+      rows for ``ledger_row`` (docs/specs/release-ledger.md §5.2), concurrently
+      with the ``ROLLUP#`` writes and with their failure semantics: each side
+      logs and swallows its own errors, so neither can skip the other.
 
     These updates are non-blocking and failures don't affect the main request flow.
     The rollups support the admin cost dashboard with pre-aggregated system-wide metrics.
@@ -942,7 +1004,40 @@ async def _update_system_rollups_async(
         model_id: Model identifier
         model_name: Human-readable model name
         provider: LLM provider
+        ledger_row: The stored ``C#`` item, for the release ledger; None skips it.
     """
+    import asyncio
+
+    from apis.shared.sessions.ledger_rollups import bump_ledger_for_row
+
+    await asyncio.gather(
+        _bump_rollup_rows(
+            user_id=user_id,
+            period=period,
+            date=date,
+            cost=cost,
+            usage_delta=usage_delta,
+            cache_savings=cache_savings,
+            model_id=model_id,
+            model_name=model_name,
+            provider=provider,
+        ),
+        bump_ledger_for_row(ledger_row),
+    )
+
+
+async def _bump_rollup_rows(
+    user_id: str,
+    period: str,
+    date: str,
+    cost: float,
+    usage_delta: dict,
+    cache_savings: float,
+    model_id: str | None,
+    model_name: str | None,
+    provider: str | None,
+) -> None:
+    """The ``ROLLUP#DAILY`` / ``#MONTHLY`` / ``#MODEL`` bumps. Never raises."""
     try:
         # Check if we're using DynamoDB storage (rollups only make sense in cloud mode)
         system_rollup_table = os.environ.get("DYNAMODB_SYSTEM_ROLLUP_TABLE_NAME")
@@ -1082,11 +1177,23 @@ async def _store_session_metadata_cloud(
         # First, check if session exists via GSI to get current SK
         existing_session = await _get_session_by_gsi(session_id, user_id, table)
 
+        # A soft-deleted row is final (#1764). Callers rebuild the row from a
+        # model, and a rebuilt model reads as active, so writing it would put
+        # the recency keys back and return the deleted conversation to the
+        # sidebar. Only SessionService.delete_session writes a tombstone.
+        if existing_session and _row_is_deleted(existing_session):
+            logger.warning(
+                "store_session_metadata: session %s is deleted; write refused", session_id
+            )
+            return
+
         # Prepare item for DynamoDB. A model read back through get_session_metadata
         # carries the row's recency keys as extras; drop them so the keys written
         # below are derived from this write alone.
         item = session_metadata.model_dump(by_alias=True, exclude_none=True)
-        for gsi_key in _RECENCY_KEY_ATTRS:
+        # Pin keys are owned by set_session_pinned alone: a full-row write never
+        # writes them, so a stale model can't resurrect a pin the user removed.
+        for gsi_key in (*_RECENCY_KEY_ATTRS, *_PIN_KEY_ATTRS):
             item.pop(gsi_key, None)
         # The lexical search attribute follows the title on every full-row write
         # (the rename route, the first-turn create), never a stale copy of it.
@@ -1135,6 +1242,10 @@ async def _store_session_metadata_cloud(
                 )
                 merged_item['PK'] = pk
                 merged_item['SK'] = new_sk
+                # Pin keys carry across the move, but a deleted session is never pinned.
+                if not is_active:
+                    for pin_key in _PIN_KEY_ATTRS:
+                        merged_item.pop(pin_key, None)
                 # The merge can surface a project id only the old row had.
                 merged_item.update(_project_gsi_keys(
                     user_id, session_id, last_message_at,
@@ -1173,7 +1284,7 @@ async def _store_session_metadata_cloud(
                     expression_attribute_values[placeholder_value] = value
 
                 remove_parts = []
-                stale_keys = [] if is_active else ['GSI4_PK', 'GSI4_SK']
+                stale_keys = [] if is_active else ['GSI4_PK', 'GSI4_SK', *_PIN_KEY_ATTRS]
                 if not project_keys:
                     stale_keys += ['GSI5_PK', 'GSI5_SK']
                 for gsi_key in stale_keys:
@@ -1248,6 +1359,13 @@ _RECENCY_KEY_ATTRS = ("GSI4_PK", "GSI4_SK", "GSI5_PK", "GSI5_SK")
 
 PROJECT_SESSION_INDEX = "ProjectSessionIndex"
 
+# PinnedSessionIndex (GSI6, issue #711): GSI6_PK = USER#{userId},
+# GSI6_SK = {pinnedAt}#{sessionId}. Present only while pinned. Unlike the recency
+# keys they are not derived from row state on each write: set_session_pinned is
+# their only writer, row moves carry them, and soft-delete removes them.
+PINNED_SESSION_INDEX = "PinnedSessionIndex"
+_PIN_KEY_ATTRS = ("GSI6_PK", "GSI6_SK")
+
 
 def _project_gsi_pk(project_id: str, user_id: str) -> str:
     return f"PROJECT#{project_id}#USER#{user_id}"
@@ -1281,13 +1399,33 @@ def _preferences_project_id(row: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def session_is_incognito(row: Optional[Dict[str, Any]], requested: bool = False) -> bool:
+    """Whether a conversation is incognito (#1738): reads memory, never writes it.
+
+    An existing row decides, whatever the request says: the flag is fixed when
+    the row is created, because facts extracted from earlier turns can't be
+    traced back to the conversation and removed. With no row yet (the first
+    turn), the request's choice applies.
+    """
+    if row is None:
+        return bool(requested)
+    prefs = row.get("preferences")
+    return isinstance(prefs, dict) and prefs.get("incognito") is True
+
+
 async def ensure_session_metadata_exists(
-    session_id: str, user_id: str, snapshot: Optional["SessionMetaSnapshot"] = None
+    session_id: str,
+    user_id: str,
+    snapshot: Optional["SessionMetaSnapshot"] = None,
+    incognito: bool = False,
 ) -> bool:
     """Idempotently create a session metadata row if it doesn't exist yet.
 
     Returns ``True`` when a new row was created (caller can use this as the
     "first turn" signal, e.g. to fire title generation).
+
+    ``incognito`` is stamped on the new row's preferences. It has no effect on
+    a row that already exists: a conversation can't become incognito later.
 
     Existence is gated on a ``SessionLookupIndex`` GSI lookup rather than a
     conditional ``put_item``: the main-table SK encodes ``lastMessageAt``
@@ -1367,6 +1505,8 @@ async def ensure_session_metadata_exists(
             "starred": False,
             "tags": [],
         }
+        if incognito:
+            item["preferences"] = {"incognito": True}
 
         # The SK is now deterministic (S#{session_id}), so attribute_not_exists is a
         # real idempotency guard (issue #175): two concurrent first turns compute the
@@ -1534,6 +1674,91 @@ async def mark_session_unread(session_id: str, user_id: str) -> None:
     await set_session_unread(session_id, user_id, True)
 
 
+PinResult = Literal["ok", "not_found", "project"]
+
+
+async def set_session_pinned(session_id: str, user_id: str, pinned: bool) -> PinResult:
+    """Pin or unpin one of the user's conversations (issue #711).
+
+    Pinning writes the sparse PinnedSessionIndex keys with the pin time as the
+    sort key (most recently pinned lists first); unpinning removes them. A
+    targeted update on the current SK, so it never races the full-row writers.
+
+    Returns ``"not_found"`` for a session the user doesn't own (or that is
+    deleted) and ``"project"`` when pinning a project task: those already sit
+    under their project in the sidebar, so they can't be pinned. Unpinning is
+    always allowed and idempotent.
+    """
+    from datetime import datetime, timezone
+
+    sessions_metadata_table = os.environ.get("DYNAMODB_SESSIONS_METADATA_TABLE_NAME")
+    if not sessions_metadata_table:
+        raise RuntimeError("DYNAMODB_SESSIONS_METADATA_TABLE_NAME environment variable is required")
+    table = get_dynamodb_table(sessions_metadata_table)
+
+    existing = await _get_session_by_gsi(session_id, user_id, table)
+    if not existing or not existing.get("SK") or existing.get("deleted") or existing.get("status") == "deleted":
+        return "not_found"
+    key = {"PK": f"USER#{user_id}", "SK": existing["SK"]}
+
+    if not pinned:
+        table.update_item(Key=key, UpdateExpression="REMOVE GSI6_PK, GSI6_SK")
+        return "ok"
+
+    if _preferences_project_id(existing):
+        return "project"
+    pinned_at = datetime.now(timezone.utc).isoformat()
+    table.update_item(
+        Key=key,
+        UpdateExpression="SET GSI6_PK = :pk, GSI6_SK = :sk",
+        ExpressionAttributeValues={":pk": f"USER#{user_id}", ":sk": f"{pinned_at}#{session_id}"},
+    )
+    return "ok"
+
+
+async def list_pinned_sessions(user_id: str) -> List[Tuple[SessionMetadata, str]]:
+    """The user's pinned conversations as ``(session, pinnedAt)``, most recently pinned first.
+
+    Reads PinnedSessionIndex, which holds only pinned rows, so this is one small
+    query regardless of how many conversations the user has. Empty while the
+    index is absent or still building.
+    """
+    from boto3.dynamodb.conditions import Key
+    from botocore.exceptions import ClientError
+
+    from apis.shared.dynamo_errors import is_missing_index_error, log_missing_index
+
+    table_name = os.environ.get("DYNAMODB_SESSIONS_METADATA_TABLE_NAME")
+    if not table_name:
+        raise RuntimeError("DYNAMODB_SESSIONS_METADATA_TABLE_NAME environment variable is required")
+    table = get_dynamodb_table(table_name)
+
+    params: Dict[str, Any] = {
+        "IndexName": PINNED_SESSION_INDEX,
+        "KeyConditionExpression": Key("GSI6_PK").eq(f"USER#{user_id}"),
+        "ScanIndexForward": False,
+    }
+    pinned: List[Tuple[SessionMetadata, str]] = []
+    try:
+        while True:
+            response = table.query(**params)
+            for item in response["Items"]:
+                pinned_at = str(item.get("GSI6_SK", "")).rsplit("#", 1)[0]
+                metadata = _item_to_session_metadata(item)
+                if metadata is None or metadata.deleted:
+                    continue
+                pinned.append((metadata, pinned_at))
+            lek = response.get("LastEvaluatedKey")
+            if not lek:
+                return pinned
+            params["ExclusiveStartKey"] = lek
+    except ClientError as e:
+        if is_missing_index_error(e):
+            log_missing_index(PINNED_SESSION_INDEX, "pinned conversations")
+            return []
+        raise
+
+
 async def update_session_activity(
     session_id: str,
     user_id: str,
@@ -1585,6 +1810,15 @@ async def update_session_activity(
                     session_id,
                 )
                 return False
+
+        # Deleted mid-turn (#1764): the SET below would restore the recency
+        # keys and bring the conversation back to the sidebar.
+        if _row_is_deleted(existing):
+            logger.warning(
+                "update_session_activity: session %s was deleted; activity not recorded",
+                session_id,
+            )
+            return False
 
         old_sk = existing.get("SK")
         if not old_sk:
@@ -1966,6 +2200,30 @@ async def _get_session_by_gsi(session_id: str, user_id: str, table) -> Optional[
         return None
 
 
+def _row_is_deleted(row: Dict[str, Any]) -> bool:
+    """Whether a raw session row is soft-deleted (either marker counts)."""
+    return row.get('deleted') is True or row.get('status') == 'deleted'
+
+
+async def session_is_deleted(session_id: str, user_id: str) -> bool:
+    """Whether the user's session row exists and is soft-deleted (#1764).
+
+    For writers that run after a turn has started: the user can delete the
+    conversation while it streams, and nothing should be written for it after
+    that. A missing row or a failed lookup reads as not deleted, so callers
+    carry on as they did before this check existed.
+    """
+    table_name = os.environ.get('DYNAMODB_SESSIONS_METADATA_TABLE_NAME')
+    if not table_name:
+        return False
+    try:
+        row = await _get_session_by_gsi(session_id, user_id, get_dynamodb_table(table_name))
+    except Exception:
+        logger.warning("session_is_deleted: lookup failed for %s", session_id, exc_info=True)
+        return False
+    return row is not None and _row_is_deleted(row)
+
+
 
 
 async def _bump_session_aggregates(
@@ -2033,12 +2291,17 @@ async def _bump_session_aggregates(
         if not sk:
             return
 
-        update_parts_set = ["lastContextTokens = :t"]
-        values: Dict[str, Any] = {":c": Decimal(str(cost_value)), ":t": int(input_tokens)}
-
-        if context_window:
-            update_parts_set.append("contextWindow = :w")
-            values[":w"] = int(context_window)
+        values: Dict[str, Any] = {":c": Decimal(str(cost_value))}
+        update_parts_set: List[str] = []
+        # A call that is not a turn (``callKind``, e.g. a handoff brief) reads the history plus
+        # its own instruction, so its input is not the conversation's context size. It adds to
+        # the cost and cache rollups, and leaves the context meter to the turns.
+        if not _call_kind(message_metadata):
+            update_parts_set.append("lastContextTokens = :t")
+            values[":t"] = int(input_tokens)
+            if context_window:
+                update_parts_set.append("contextWindow = :w")
+                values[":w"] = int(context_window)
 
         # Per-session cache-efficiency rollups (next to totalCost). Zero
         # deltas are added unconditionally so the attributes exist (as 0)
@@ -2100,9 +2363,9 @@ async def _bump_session_aggregates(
                 update_parts_add.append(f"{attr} :{attr}")
                 values[f":{attr}"] = value
 
-        update_expression = (
-            "ADD " + ", ".join(update_parts_add) + " SET " + ", ".join(update_parts_set)
-        )
+        update_expression = "ADD " + ", ".join(update_parts_add)
+        if update_parts_set:
+            update_expression += " SET " + ", ".join(update_parts_set)
 
         response = table.update_item(
             Key={"PK": f"USER#{user_id}", "SK": sk},
@@ -2119,6 +2382,12 @@ async def _bump_session_aggregates(
     except Exception as e:
         # Non-fatal — lazy backfill compensates on next read.
         logger.debug("bump_session_aggregates failed (will be backfilled on read): %s", e)
+
+
+def _call_kind(message_metadata: Any) -> Optional[str]:
+    """The ``callKind`` extra on a cost row's metadata: set on a call that is not a turn."""
+    extra = getattr(message_metadata, "model_extra", None)
+    return extra.get("callKind") if isinstance(extra, dict) else None
 
 
 #: Session-row counter per compaction event kind (see
@@ -2288,7 +2557,7 @@ async def _backfill_session_aggregates(
                 # match true context-window occupancy.
                 token_usage = rec_float.get("tokenUsage") or {}
                 ts = rec_float.get("timestamp")
-                if ts and (last_timestamp is None or ts > last_timestamp):
+                if ts and not rec_float.get("callKind") and (last_timestamp is None or ts > last_timestamp):
                     last_timestamp = ts
                     last_context_tokens = int(
                         (token_usage.get("inputTokens") or 0)
@@ -2324,6 +2593,91 @@ async def _backfill_session_aggregates(
         # Non-fatal — frontend just sees the un-aggregated state, badge
         # stays hidden, and we'll try again on the next read.
         logger.warning("backfill_session_aggregates failed for %s: %s", session_id, e)
+
+
+def set_session_spawned_from(session_id: str, user_id: str, source_session_id: str, handoff_id: str) -> bool:
+    """Record on a handoff's target conversation where it came from (handoffs spec §4.2).
+
+    ``spawnedFrom: {sessionId, handoffId}`` on the target's ``META`` row. It is how every later
+    turn of the target finds the source's ``HANDOFF#`` row to keep its status current, from the
+    B1 snapshot, with no extra read. A field-level ``SET`` on the static SK, so the full-row
+    writes elsewhere (which only ``SET`` their own fields) never remove it. Synchronous: callers
+    run it in a worker thread, after the first token. Returns False when the row is missing.
+    """
+    from botocore.exceptions import ClientError
+
+    table_name = os.environ.get('DYNAMODB_SESSIONS_METADATA_TABLE_NAME')
+    if not table_name:
+        return False
+    try:
+        get_dynamodb_table(table_name).update_item(
+            Key={"PK": f"USER#{user_id}", "SK": _static_session_sk(session_id)},
+            UpdateExpression="SET spawnedFrom = :sf",
+            ConditionExpression="attribute_exists(PK)",
+            ExpressionAttributeValues={":sf": {"sessionId": source_session_id, "handoffId": handoff_id}},
+        )
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+def settle_session_spawned_from(session_id: str, user_id: str) -> None:
+    """Mark a target's ``spawnedFrom`` settled: its handoff is done and stops following its turns.
+
+    Without it, every later turn of a finished handoff's target would make a status write that the
+    row refuses (``done`` is frozen). The link itself stays; Phase 2 reads it.
+    """
+    from botocore.exceptions import ClientError
+
+    table_name = os.environ.get('DYNAMODB_SESSIONS_METADATA_TABLE_NAME')
+    if not table_name:
+        return
+    try:
+        get_dynamodb_table(table_name).update_item(
+            Key={"PK": f"USER#{user_id}", "SK": _static_session_sk(session_id)},
+            UpdateExpression="SET spawnedFrom.settled = :t",
+            ConditionExpression="attribute_exists(spawnedFrom)",
+            ExpressionAttributeValues={":t": True},
+        )
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+
+
+async def get_session_compaction(session_id: str, user_id: str) -> Tuple[int, Optional[str]]:
+    """The applied compaction checkpoint and its summary for a session, or ``(0, None)``.
+
+    ``SessionMetadata`` deliberately carries only ``totalSummarizedTurns`` from
+    the nested ``compaction`` map. A handoff's excerpt needs the applied
+    checkpoint (an absolute message index) and the summary that stands in for
+    the messages before it, which is what the conversation's own model sees.
+    A pending, not yet applied, cut is ignored for the same reason.
+    """
+    table_name = os.environ.get('DYNAMODB_SESSIONS_METADATA_TABLE_NAME')
+    if not table_name:
+        return 0, None
+    item = await _get_session_by_gsi(session_id, user_id, get_dynamodb_table(table_name))
+    compaction = (item or {}).get("compaction")
+    if not isinstance(compaction, dict):
+        return 0, None
+    summary = compaction.get("summary")
+    return int(compaction.get("checkpoint") or 0), summary if isinstance(summary, str) else None
+
+
+async def get_session_rewind(session_id: str, user_id: str) -> RewindState:
+    """The session's rewind state, or the never-rewound default.
+
+    Read from the same static row as ``compaction``. Unconfigured tables and
+    read failures return the default, which shows every message: the same view
+    a session had before rewind existed.
+    """
+    table_name = os.environ.get('DYNAMODB_SESSIONS_METADATA_TABLE_NAME')
+    if not table_name:
+        return RewindState()
+    item = await _get_session_by_gsi(session_id, user_id, get_dynamodb_table(table_name))
+    return RewindState.from_row(item)
 
 
 async def get_session_metadata(session_id: str, user_id: str) -> Optional[SessionMetadata]:
@@ -2474,6 +2828,9 @@ async def _get_all_message_metadata_cloud(session_id: str, user_id: str, table_n
             # Extract message_id as integer (DynamoDB returns Decimal, convert to int then str)
             # Must convert to int first to avoid "0.0" -> "0" mismatch
             message_id_raw = item_float.get("messageId")
+            if message_id_raw is None:
+                # A call that produced no message (a handoff brief): nothing to join it to.
+                continue
             message_id = str(int(message_id_raw)) if isinstance(message_id_raw, (int, float)) else str(message_id_raw)
 
             logger.debug(f"Processing cost record for message_id={message_id}, SK={item_float.get('SK')}")
@@ -2591,7 +2948,7 @@ async def _get_session_metadata_cloud(
             )
 
         # Remove DynamoDB keys before validation
-        for key in ('PK', 'SK', 'GSI_PK', 'GSI_SK', *_RECENCY_KEY_ATTRS):
+        for key in ('PK', 'SK', 'GSI_PK', 'GSI_SK', *_RECENCY_KEY_ATTRS, *_PIN_KEY_ATTRS):
             item.pop(key, None)
 
         # Dedupe pending interrupts at the storage boundary so list_append
@@ -2711,7 +3068,7 @@ def _item_to_session_metadata(item: Dict[str, Any]) -> Optional[SessionMetadata]
     """
     try:
         item = _convert_decimal_to_float(item)
-        for key in ('PK', 'SK', 'GSI_PK', 'GSI_SK', *_RECENCY_KEY_ATTRS):
+        for key in ('PK', 'SK', 'GSI_PK', 'GSI_SK', *_RECENCY_KEY_ATTRS, *_PIN_KEY_ATTRS):
             item.pop(key, None)
 
         # Skip preview sessions - they should not appear in user's session list

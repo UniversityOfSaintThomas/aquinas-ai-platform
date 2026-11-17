@@ -53,6 +53,34 @@ SNAPSHOT_FIELDS: Tuple[str, ...] = (
     "starters",
     "model_settings",
     "bindings",
+    "response_strictness",
+    "voice_enabled",
+    "voice_instructions_only",
+)
+
+# Snapshot fields that change what the Agent *does*. The review diff, the listing edit
+# history and the project settings history all flag these as behavior changes (#112).
+BEHAVIOR_SNAPSHOT_FIELDS: Tuple[str, ...] = (
+    "instructions",
+    "bindings",
+    "model_settings",
+    "response_strictness",
+    "voice_enabled",
+    "voice_instructions_only",
+)
+
+# Snapshot fields a version always overlays, even when it predates them. Unlike the
+# fields above, their value before they existed is known: every Agent ran
+# ``balanced`` before #112, so a version approved then was approved as ``balanced``.
+# Leaving the live value in place instead would let an owner change the strictness of a
+# published Agent without review.
+#
+# The voice fields (#625) follow the same rule: voice never ran an Agent before them, so a
+# version approved then was approved with voice off, and turning it on goes through review.
+VERSION_DEFAULTED_FIELDS: Tuple[str, ...] = (
+    "response_strictness",
+    "voice_enabled",
+    "voice_instructions_only",
 )
 
 # Snapshot fields that live on the ``listing`` block rather than on the Agent itself.
@@ -71,6 +99,9 @@ DIFF_FIELD_ORDER: Tuple[str, ...] = (
     "instructions",
     "bindings",
     "model_settings",
+    "response_strictness",
+    "voice_enabled",
+    "voice_instructions_only",
     "name",
     "description",
     "tagline",
@@ -141,6 +172,9 @@ def snapshot_of(
         starters=assistant.starters,
         model_settings=assistant.model_settings,
         bindings=assistant.bindings,
+        response_strictness=assistant.response_strictness,
+        voice_enabled=assistant.voice_enabled,
+        voice_instructions_only=assistant.voice_instructions_only,
         category=listing.category if listing else None,
         publisher_id=listing.publisher_id if listing else None,
     )
@@ -156,6 +190,8 @@ def apply_version(assistant: Assistant, version: AgentVersion) -> Assistant:
     Only fields the version actually **set** are overlaid. An older version item that
     predates a snapshot field carries no value for it, and blanking the live record's value
     would be a silent behavior change on exactly the Agents that have been approved longest.
+    The exception is ``VERSION_DEFAULTED_FIELDS``, whose pre-field value is known and is
+    overlaid from the version's default.
 
     ``category``/``publisherId`` are written back onto a copy of the listing block, so the
     store renders the placement the reviewer approved. ``listing.state`` and everything else
@@ -169,7 +205,7 @@ def apply_version(assistant: Assistant, version: AgentVersion) -> Assistant:
     updated = assistant.model_copy(deep=True)
 
     for field in SNAPSHOT_FIELDS:
-        if field in set_fields:
+        if field in set_fields or field in VERSION_DEFAULTED_FIELDS:
             setattr(updated, field, getattr(version, field))
 
     listing_updates = {

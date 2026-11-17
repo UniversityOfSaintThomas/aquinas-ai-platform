@@ -1,8 +1,9 @@
 // services/stream-parser.service.ts
-import { Injectable, Signal, WritableSignal, signal, computed, inject } from '@angular/core';
+import { Injectable, Injector, Signal, WritableSignal, signal, computed, inject } from '@angular/core';
 import { Message, ContentBlock, Citation } from '../models/message.model';
 import { MetadataEvent } from '../models/content-types';
 import { ChatStateService } from './chat-state.service';
+import { providerOutageFrom } from './provider-outage';
 import { v4 as uuidv4 } from 'uuid';
 import {
   ErrorService,
@@ -14,6 +15,7 @@ import {
   QuotaWarningService,
   QuotaWarning,
   QuotaSessionNotice,
+  QuotaFundingNotice,
   QuotaExceeded,
 } from '../../../services/quota/quota-warning.service';
 import { OAuthConsentService } from '../../../services/oauth-consent/oauth-consent.service';
@@ -30,6 +32,7 @@ import { McpAppStateService } from '../mcp-apps/mcp-app-state.service';
 import { ToolInsightService } from './tool-insight.service';
 import { SessionService } from '../session/session.service';
 import { AgentNoticeService } from '../agent-notice/agent-notice.service';
+import { QuotaStatusService } from '../../../services/quota/quota-status.service';
 import type {
   OAuthRequiredEvent,
   ToolApprovalRequiredEvent,
@@ -194,6 +197,7 @@ export class StreamParserService {
   private sessionService = inject(SessionService);
   private toolInsight = inject(ToolInsightService);
   private agentNotice = inject(AgentNoticeService);
+  private injector = inject(Injector);
 
   // =========================================================================
   // Per-Session State
@@ -391,6 +395,19 @@ export class StreamParserService {
     // Start the elapsed clock here, not at the first runtime event: the wait
     // the user is measuring begins when they hit send.
     this.toolInsight.startTurn(sessionId);
+    // A blocked turn re-sends quota_exceeded, and a turn still charging a fund
+    // or still over the session share re-sends quota_funding_notice and
+    // quota_session_notice, so each turn starts without any of them: the
+    // composer's tab tracks the latest answer, not one from before an approval
+    // or from spend measured against a limit that has since changed.
+    this.quotaWarningService.clearQuotaExceeded();
+    this.quotaWarningService.clearFundingNotice();
+    this.quotaWarningService.forgetSessionNotice();
+    // The previous turn's ending belongs to that turn. A new one that never
+    // reaches `message_start` (refused, dropped before it opened) must not
+    // inherit it — the composer reads it to decide what to do with a queued
+    // follow-up when this turn ends.
+    this.chatStateService.setStopReason(sessionId, null);
     const state = this.createState(sessionId, startingMessageCount || 0);
     this.states.update((map) => {
       const next = new Map(map);
@@ -602,6 +619,17 @@ export class StreamParserService {
       onToolGroupSummary: (data) =>
         this.toolInsight.recordSummary(state.sessionId, data),
 
+      // Source-provenance verdicts for a `verify_sources` call. Scoped to the
+      // streaming session, not the viewed one: a background conversation's
+      // verdicts belong to that conversation.
+      onSourceProvenance: (data) =>
+        this.toolInsight.recordProvenance(state.sessionId, data),
+
+      // One document's structured-extraction rows. Same scoping as the
+      // verdicts above; N documents in one call arrive as N events.
+      onDocumentExtraction: (data) =>
+        this.toolInsight.recordExtraction(state.sessionId, data),
+
       onModelRetry: (data: ModelRetryEvent) => {
         // Not viewed-session-scoped on purpose: this signal is read per
         // session id, so a background conversation's retry stays with that
@@ -620,7 +648,14 @@ export class StreamParserService {
       onQuotaWarning: (data) => this.quotaWarningService.setWarning(data as QuotaWarning),
       onQuotaSessionNotice: (data) =>
         this.quotaWarningService.setSessionNotice(data as QuotaSessionNotice),
-      onQuotaExceeded: (data) => this.quotaWarningService.setQuotaExceeded(data as QuotaExceeded),
+      onQuotaFundingNotice: (data) =>
+        this.quotaWarningService.setFundingNotice(data as QuotaFundingNotice),
+      onQuotaExceeded: (data) => {
+        this.quotaWarningService.setQuotaExceeded(data as QuotaExceeded);
+        // The status was read at page load; the request dialog and the
+        // blocked tab's "Fund cap reached" read the spend that blocked.
+        this.injector.get(QuotaStatusService).reload();
+      },
 
       onOAuthRequired: (data: OAuthRequiredEvent) => {
         // oauth_required arrives after message_stop, so the triggering
@@ -635,6 +670,12 @@ export class StreamParserService {
           lastAssistantId,
           state.sessionId,
         );
+        // Only the interrupt-driven flavor pauses the turn. A pre-flight
+        // prompt (no interruptId) left a finished turn behind, so the
+        // conversation is not waiting on anything.
+        if (data.interruptId) {
+          this.chatStateService.markSessionAwaitingInput(state.sessionId, 'oauth');
+        }
       },
 
       onSteeringApplied: (data: SteeringAppliedEvent) => {
@@ -729,6 +770,7 @@ export class StreamParserService {
           messageId: lastAssistantId,
           sessionId: state.sessionId,
         });
+        this.chatStateService.markSessionAwaitingInput(state.sessionId, 'tool_approval');
       },
 
       onUserQuestionRequired: (data: UserQuestionRequiredEvent) => {
@@ -740,6 +782,7 @@ export class StreamParserService {
           messageId: lastAssistantId,
           sessionId: state.sessionId,
         });
+        this.chatStateService.markSessionAwaitingInput(state.sessionId, 'user_question');
       },
 
       onBrowserLoginRequired: (data: BrowserLoginRequiredEvent) => {
@@ -760,6 +803,7 @@ export class StreamParserService {
           sandboxOrigin: data.sandboxOrigin,
           messageId: lastAssistantId,
         });
+        this.chatStateService.markSessionAwaitingInput(state.sessionId, 'browser_login');
       },
 
       onError: (data) => this.handleError(state, data),
@@ -775,10 +819,30 @@ export class StreamParserService {
         if (isMaxTokens) {
           this.chatStateService.setLastTurnContinuable(state.sessionId, true);
         }
+        const outage = providerOutageFrom(streamError);
+        if (outage) {
+          this.chatStateService.setLastTurnProviderOutage(state.sessionId, outage);
+        }
+        if (streamError.metadata?.['error_kind'] === 'resume_unavailable') {
+          const reason = streamError.metadata?.['reason'];
+          this.chatStateService.markResumeUnavailable(
+            state.sessionId,
+            typeof reason === 'string' ? reason : undefined,
+          );
+        }
       },
 
       onParseError: (message) => this.setError(state, message),
     };
+  }
+
+  /** Whether a message holds anything the user could have seen. */
+  private hasVisibleContent(builder: MessageBuilder): boolean {
+    for (const block of builder.contentBlocks.values()) {
+      if (block.type !== 'text') return true;
+      if (block.textChunks.join('').trim()) return true;
+    }
+    return false;
   }
 
   private findLastAssistantId(state: ParserSessionState): string | undefined {
@@ -805,10 +869,25 @@ export class StreamParserService {
     // Content is arriving, so whatever retry we were explaining is over.
     state.modelRetry.set(null);
 
-    // If there's an existing message, finalize it before starting a new one
+    // If there's an existing message, finalize it before starting a new one —
+    // unless it is a model call that died before it said anything.
+    //
+    // Bedrock opens a call with `messageStart` before any content, so a call
+    // that fails mid-stream (a read timeout while the model thinks silently)
+    // leaves an empty, never-stopped builder behind, and the server's error
+    // reply then arrives as a second `message_start`. The server never stored
+    // that empty call: Strands commits only a completed one. Keeping it showed
+    // an empty bubble above the error, and, worse, numbered every later
+    // message one past the server's index for the rest of the session, so
+    // feedback, rewind and fork on those messages pointed at the wrong one.
+    // A model retry (`model_retry`) leaves the same abandoned attempt behind.
     const currentBuilder = state.currentMessageBuilder();
     if (currentBuilder) {
-      this.finalizeCurrentMessage(state);
+      if (!currentBuilder.isComplete && !this.hasVisibleContent(currentBuilder)) {
+        state.currentMessageBuilder.set(null);
+      } else {
+        this.finalizeCurrentMessage(state);
+      }
     }
 
     // Clear stopReason in ChatStateService
@@ -819,6 +898,7 @@ export class StreamParserService {
     // chip from a previous aborted turn.
     this.chatStateService.setLastTurnContinuable(state.sessionId, false);
     this.chatStateService.setLastTurnInterrupted(state.sessionId, false);
+    this.chatStateService.setLastTurnProviderOutage(state.sessionId, null);
 
     // Compute predictable message ID
     const completedCount = state.completedMessages().length;

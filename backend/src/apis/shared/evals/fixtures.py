@@ -1,0 +1,436 @@
+"""Register a synthetic file as a READY session upload, the way a completed SPA upload is.
+
+Moved here from ``scripts/smoke_turns.py`` because two scripts now need it
+(the smoke matrix's document rows and the eval harness's ``document_qa``
+family). The reason it exists is the smoke script's: the SPA presigns, PUTs to
+S3 and completes the upload, then sends ``file_upload_ids``, never base64
+``files``. That difference decides whether ``document_read`` and
+``verify_sources`` exist on the turn — ``turn_has_document`` is classified from
+the *resolved uploads* only, and inline base64 never produces an upload row for
+a document. So a turn that needs the document path writes what a completed
+upload writes: the S3 object at the conventional key, and a READY row.
+
+Needs AWS credentials and ``S3_USER_FILES_BUCKET_NAME`` /
+``DYNAMODB_USER_FILES_TABLE_NAME``, which the scripts export from the target's
+SSM parameters.
+
+A large (reference-class) document goes one step further, the step app-api's
+``FileUploadService._enqueue_preparation`` takes after a real upload: the row is
+marked ``preparation = pending`` and ``{user_id, upload_id}`` is sent to the
+deployed prepare queue (``LARGE_DOCUMENT_PREPARE_QUEUE_URL``). The deployed
+Lambda then builds the sidecars and, with the attachments KB on, ingests the
+document, exactly as for a user's upload. ``wait_for_documents`` polls the rows
+until each is ready to ask about. Nothing here reimplements preparation.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import mimetypes
+import os
+import time
+import uuid
+from pathlib import Path
+from datetime import datetime
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
+
+#: Extensions the case fixtures use, pinned rather than left to the host's
+#: ``mimetypes`` table, which differs between macOS and the CI image for ``.md``.
+_MIME_BY_SUFFIX = {
+    ".md": "text/markdown",
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+    ".pdf": "application/pdf",
+    ".html": "text/html",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
+
+
+class FixtureError(RuntimeError):
+    """The environment cannot store a fixture upload."""
+
+
+def mime_type_for(filename: str) -> str:
+    suffix = Path(filename).suffix.lower()
+    return _MIME_BY_SUFFIX.get(suffix) or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+
+def load_fixture(fixtures_dir: Path, filename: str) -> Tuple[bytes, str]:
+    path = fixtures_dir / filename
+    if not path.is_file():
+        raise FixtureError(f"fixture {filename} not found in {fixtures_dir}")
+    return path.read_bytes(), mime_type_for(filename)
+
+
+def upload_key(user_id: str, session_id: str, upload_id: str, filename: str) -> str:
+    return f"user-files/{user_id}/{session_id}/{upload_id}/{filename}"
+
+
+async def register_upload(
+    user_id: str,
+    session_id: str,
+    filename: str,
+    mime_type: str,
+    data: bytes,
+    *,
+    delivery: Optional[str] = None,
+) -> str:
+    """Store ``data`` as a READY upload in ``session_id`` and return its ``upload_id``.
+
+    ``delivery`` is an ``attachment_delivery`` arm (``native``, ``text``,
+    ``on_demand`` or ``search``): it is written on the row as the planner's
+    fixture-only override, the one way that value is ever set
+    (``test_delivery_override_is_fixture_only.py``). A document forced
+    ``on_demand`` or ``search`` also gets the digest app-api builds for an
+    upload, so its message carries what an over-budget reference's does rather
+    than a stub. One forced ``search`` is also sent to the deployed prepare
+    queue as ``{"action": "index"}``, the message the pipeline sends itself, so
+    the deployed Lambda ingests it into the attachments KB
+    (``attachment_index.indexed_by_budget`` admits a ``search`` row whatever its
+    size); :func:`wait_for_searchable` waits for that.
+
+    A document also gets the §4.1 facts the prepare Lambda writes for a real
+    upload (``file_facts.compute_document_facts``), so the attachment planner's
+    ``token`` profile costs a fixture the way it costs a user's file. Without
+    them every fixture would plan as ``facts_pending``.
+    """
+    import boto3
+
+    from apis.shared.files.models import FileMetadata, FileStatus
+    from apis.shared.files.repository import get_file_upload_repository
+
+    bucket = os.environ.get("S3_USER_FILES_BUCKET_NAME", "")
+    if not bucket:
+        raise FixtureError("S3_USER_FILES_BUCKET_NAME is not set; needs --prefix (deployed) or a local stack")
+    upload_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
+    key = upload_key(user_id, session_id, upload_id, filename)
+    await asyncio.to_thread(
+        boto3.client("s3").put_object, Bucket=bucket, Key=key, Body=data, ContentType=mime_type
+    )
+    await get_file_upload_repository().create_file(
+        FileMetadata(
+            upload_id=upload_id,
+            user_id=user_id,
+            session_id=session_id,
+            filename=filename,
+            mime_type=mime_type,
+            size_bytes=len(data),
+            s3_key=key,
+            s3_bucket=bucket,
+            status=FileStatus.READY,
+            delivery_override=delivery,
+            facts=await asyncio.to_thread(_document_facts, filename, mime_type, data),
+        )
+    )
+    if delivery in ("on_demand", "search"):
+        await _store_digest(user_id, upload_id, filename, mime_type, data)
+    if delivery == "search":
+        await _enqueue_index(user_id, upload_id)
+    return upload_id
+
+
+async def _enqueue_index(user_id: str, upload_id: str) -> None:
+    import json
+
+    import boto3
+
+    queue_url = os.environ.get("LARGE_DOCUMENT_PREPARE_QUEUE_URL", "")
+    if not queue_url:
+        raise FixtureError("LARGE_DOCUMENT_PREPARE_QUEUE_URL is not set; the search arm needs the deployed prepare queue")
+    body = json.dumps({"action": "index", "user_id": user_id, "upload_id": upload_id})
+    await asyncio.to_thread(boto3.client("sqs").send_message, QueueUrl=queue_url, MessageBody=body)
+
+
+def _document_facts(filename: str, mime_type: str, data: bytes) -> Optional[dict]:
+    """The facts preparation writes for a document; ``None`` for anything else or a file that will not parse."""
+    from apis.shared.files.document_read import document_format_for
+    from apis.shared.files.file_facts import compute_document_facts
+
+    fmt = document_format_for(mime_type, filename)
+    if fmt is None:
+        return None
+    try:
+        return compute_document_facts(fmt, data)
+    except Exception:  # noqa: BLE001 - a fixture without facts plans as facts_pending, like a user's
+        return None
+
+
+async def _store_digest(user_id: str, upload_id: str, filename: str, mime_type: str, data: bytes) -> None:
+    """The digest ``FileUploadService`` builds after a document upload, built and stored the same way."""
+    from apis.shared.files.document_digest import build_digest
+    from apis.shared.files.repository import get_file_upload_repository
+
+    digest = await build_digest(raw=data, mime_type=mime_type, filename=filename, upload_id=upload_id)
+    await get_file_upload_repository().update_file_digest(user_id, upload_id, digest.to_item())
+
+
+class AppApiCaller(Protocol):
+    """What :func:`upload_via_presign` needs from a signed-in app-api client.
+
+    ``smoke_turns.AppApiTransport.call`` is one: a JSON request as the
+    signed-in user, cookie session and CSRF header included.
+    """
+
+    async def call(
+        self, method: str, path: str, *, json_body: Any = None, params: Optional[Dict[str, Any]] = None
+    ) -> Tuple[int, Any]: ...
+
+
+#: ``(url, data, headers) -> status``: the PUT to the presigned URL.
+PutObject = Callable[[str, bytes, Dict[str, str]], Awaitable[int]]
+
+
+async def _httpx_put(url: str, data: bytes, headers: Dict[str, str]) -> int:
+    import httpx
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
+        response = await client.put(url, content=data, headers=headers)
+        return response.status_code
+
+
+def _detail(body: Any) -> str:
+    if isinstance(body, Mapping):
+        return str(body.get("detail") or body)[:300]
+    return str(body)[:300]
+
+
+async def upload_via_presign(
+    app_api: AppApiCaller,
+    session_id: str,
+    filename: str,
+    mime_type: str,
+    data: bytes,
+    *,
+    put: PutObject = _httpx_put,
+) -> str:
+    """Upload ``data`` the way the SPA does and return its ``upload_id``.
+
+    ``POST /files/presign`` → ``PUT`` to the presigned URL → ``POST
+    /files/{id}/complete``, so app-api's admission (type, size, quota) and
+    its post-upload work (a reference document's preparation) run on the
+    fixture exactly as on a user's file (unified-attachment-delivery §8.2).
+    The opt-in alternative to :func:`register_upload`, which writes the row
+    directly and so never meets admission.
+
+    A refusal at any step is a :class:`FixtureError` naming the step and
+    app-api's reason, because a case whose file cannot be attached measures
+    nothing about delivery.
+    """
+    status, body = await app_api.call(
+        "POST", "/files/presign",
+        json_body={"sessionId": session_id, "filename": filename, "mimeType": mime_type, "sizeBytes": len(data)},
+    )
+    if status != 200 or not isinstance(body, Mapping) or not body.get("uploadId") or not body.get("presignedUrl"):
+        raise FixtureError(f"presign refused {filename} ({len(data):,} bytes): HTTP {status}: {_detail(body)}")
+    upload_id = str(body["uploadId"])
+    # The URL is signed over Content-Type, so the PUT must send the same one.
+    put_status = await put(str(body["presignedUrl"]), data, {"Content-Type": mime_type})
+    if put_status not in (200, 204):
+        raise FixtureError(f"PUT of {filename} to the presigned URL -> HTTP {put_status}")
+    status, body = await app_api.call("POST", f"/files/{upload_id}/complete")
+    if status != 200:
+        raise FixtureError(f"complete refused {filename}: HTTP {status}: {_detail(body)}")
+    return upload_id
+
+
+async def register_reference_upload(
+    user_id: str, session_id: str, filename: str, mime_type: str, data: bytes
+) -> str:
+    """Store ``data`` as a READY upload and queue its preparation, as app-api does for a large upload."""
+    import json
+
+    import boto3
+
+    from apis.shared.files.large_document import STATUS_PENDING, preparation_record
+    from apis.shared.files.repository import get_file_upload_repository
+
+    queue_url = os.environ.get("LARGE_DOCUMENT_PREPARE_QUEUE_URL", "").strip()
+    if not queue_url:
+        raise FixtureError("LARGE_DOCUMENT_PREPARE_QUEUE_URL is not set; does the target run large-document attachments?")
+    upload_id = await register_upload(user_id, session_id, filename, mime_type, data)
+    # Pending before the message, so the Lambda's ``ready`` can never be overwritten.
+    await get_file_upload_repository().update_file_preparation(
+        user_id, upload_id, preparation_record(status=STATUS_PENDING)
+    )
+    body = json.dumps({"user_id": user_id, "upload_id": upload_id})
+    await asyncio.to_thread(boto3.client("sqs").send_message, QueueUrl=queue_url, MessageBody=body)
+    return upload_id
+
+
+#: A prepared document with no ``kbIndex`` yet is about to be ingested by the
+#: same Lambda run (``attachment_index.search_status``). One still without it
+#: after this long belongs to a deployment with the attachments KB off.
+KB_GRACE_SECONDS = 60.0
+_KB_TERMINAL = ("indexed", "failed", "skipped_cap", "removed", "evicted")
+
+
+def document_state(meta: Any) -> Dict[str, Any]:
+    """What a waiting run needs from one upload row: preparation, KB status, text-searchable."""
+    from apis.shared.files import large_document
+    from apis.shared.files.attachment_index import is_text_indexed, kb_status
+
+    if meta is None:
+        return {"preparation": "missing", "kbIndex": None, "textIndexed": False}
+    return {
+        "preparation": large_document.preparation_status(meta),
+        "kbIndex": kb_status(meta),
+        "textIndexed": bool(is_text_indexed(meta)),
+    }
+
+
+def document_settled(state: Dict[str, Any], *, seconds_since_prepared: Optional[float]) -> bool:
+    """Ready to ask about: prepared and searchable, or in a state that will not change.
+
+    A failed preparation is settled too: the turn then gets what a user would
+    get, and the sample's answer says whether that was good enough.
+    """
+    if state["preparation"] in ("failed", "missing"):
+        return True
+    if state["preparation"] != "ready":
+        return False
+    if state["kbIndex"] in _KB_TERMINAL or state["textIndexed"]:
+        return True
+    return state["kbIndex"] is None and (seconds_since_prepared or 0.0) >= KB_GRACE_SECONDS
+
+
+async def wait_for_documents(
+    user_id: str,
+    upload_ids: Sequence[str],
+    *,
+    timeout: float,
+    poll: float = 15.0,
+    echo: Optional[Callable[[Dict[str, Dict[str, Any]]], None]] = None,
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> Dict[str, Dict[str, Any]]:
+    """Poll each upload's row until every one is settled or ``timeout`` passes.
+
+    Returns ``{upload_id: state}`` with ``settled`` and ``waitedSeconds`` added.
+    An unsettled document is not an error: the turn goes ahead with whatever
+    the document has by then, which is what a user asking early would get.
+    """
+    from apis.shared.files.repository import get_file_upload_repository
+
+    repository = get_file_upload_repository()
+    start = clock()
+    prepared_at: Dict[str, float] = {}
+    while True:
+        now = clock()
+        states: Dict[str, Dict[str, Any]] = {}
+        for upload_id in upload_ids:
+            state = document_state(await repository.get_file(user_id, upload_id))
+            if state["preparation"] == "ready":
+                prepared_at.setdefault(upload_id, now)
+            since = now - prepared_at[upload_id] if upload_id in prepared_at else None
+            state["settled"] = document_settled(state, seconds_since_prepared=since)
+            state["waitedSeconds"] = round(now - start)
+            states[upload_id] = state
+        if echo is not None:
+            echo(states)
+        if all(s["settled"] for s in states.values()) or now - start >= timeout:
+            return states
+        await sleep(poll)
+
+
+def searchable_settled(state: Dict[str, Any]) -> bool:
+    """Ready for the ``search`` arm: searchable, or in a KB state that will not change."""
+    return state["kbIndex"] in _KB_TERMINAL or state["textIndexed"] or state["preparation"] == "missing"
+
+
+async def wait_for_searchable(
+    user_id: str,
+    upload_ids: Sequence[str],
+    *,
+    timeout: float,
+    poll: float = 15.0,
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> Dict[str, Dict[str, Any]]:
+    """Poll each upload's row until the attachments KB can search it (the ``search`` arm).
+
+    A document under the inline limit has no preparation to wait for, so only
+    its ``kbIndex`` counts. Returns ``{upload_id: state}`` with ``settled`` and
+    ``waitedSeconds``; one still unsettled at ``timeout`` goes ahead as it is,
+    and the planner then sends it ``on_demand``, which the row records.
+    """
+    from apis.shared.files.repository import get_file_upload_repository
+
+    repository = get_file_upload_repository()
+    start = clock()
+    while True:
+        now = clock()
+        states: Dict[str, Dict[str, Any]] = {}
+        for upload_id in upload_ids:
+            state = document_state(await repository.get_file(user_id, upload_id))
+            state["settled"] = searchable_settled(state)
+            state["waitedSeconds"] = round(now - start)
+            states[upload_id] = state
+        if all(s["settled"] for s in states.values()) or now - start >= timeout:
+            return states
+        await sleep(poll)
+
+
+async def delete_upload(user_id: str, upload_id: str) -> bool:
+    """Remove an upload this harness registered: the row, then its S3 objects. ``False`` if it was already gone."""
+    from apis.shared.files.repository import get_file_upload_repository
+
+    meta = await get_file_upload_repository().delete_file(user_id, upload_id)
+    if meta is None:
+        return False
+    if meta.linked_from is not None:
+        # A reference shares its original's objects (handoffs spec §4.9 rule 2): the row only.
+        return True
+    # Everything under the upload's prefix: the original, and for a prepared
+    # document its ``_derived/`` sidecars. The delete events take a document
+    # out of the attachments KB, as for a user's own delete.
+    await delete_objects_under(meta.s3_bucket, meta.s3_key.rsplit("/", 1)[0] + "/")
+    return True
+
+
+async def delete_objects_under(bucket: str, prefix: str) -> int:
+    """Delete every object under ``prefix``; returns how many."""
+    import boto3
+
+    s3 = boto3.client("s3")
+    deleted = 0
+    token: Optional[str] = None
+    while True:
+        kwargs: Dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+        page = await asyncio.to_thread(s3.list_objects_v2, **kwargs)
+        keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+        if keys:
+            await asyncio.to_thread(s3.delete_objects, Bucket=bucket, Delete={"Objects": keys})
+            deleted += len(keys)
+        if not page.get("IsTruncated"):
+            return deleted
+        token = page.get("NextContinuationToken")
+
+
+def stale_uploads(objects: Iterable[Mapping[str, Any]], user_id: str, cutoff: datetime) -> List[Tuple[str, str]]:
+    """``(session_id, upload_id)`` of each upload under ``user_id`` whose newest object predates ``cutoff``.
+
+    ``objects`` is an S3 listing (``Key``, ``LastModified``). Grouping by the
+    upload's prefix and taking the newest object means an upload the prepare
+    Lambda is still writing sidecars for is never stale.
+    """
+    newest: Dict[Tuple[str, str], datetime] = {}
+    root = f"user-files/{user_id}/"
+    for obj in objects:
+        key = str(obj.get("Key") or "")
+        if not key.startswith(root):
+            continue
+        parts = key[len(root):].split("/")
+        if len(parts) < 3:
+            continue
+        upload = (parts[0], parts[1])
+        modified = obj["LastModified"]
+        if upload not in newest or modified > newest[upload]:
+            newest[upload] = modified
+    return sorted(upload for upload, modified in newest.items() if modified < cutoff)

@@ -1,5 +1,39 @@
 import { Injectable, Signal, WritableSignal, computed, signal } from '@angular/core';
 import { ContextBreakdown } from '../models/content-types';
+import { AwaitingInputKind, SessionMetadata } from '../models/session-metadata.model';
+
+/**
+ * How long a live "paused on the user" mark is trusted without the server
+ * agreeing. Matches the interactive `pausedTurn` snapshot TTL the stream
+ * coordinator writes (one hour); past it the resume route refuses the pause,
+ * so a mark older than this would point at a prompt that can no longer resume.
+ */
+const LIVE_AWAITING_INPUT_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * This tab's first-hand knowledge of whether a session's turn is paused on
+ * the user, and when it learned it (epoch ms). `kind: null` records that the
+ * pause was answered, dismissed or superseded.
+ */
+interface AwaitingInputMark {
+    kind: AwaitingInputKind | null;
+    at: number;
+}
+
+/**
+ * The model provider failed this turn on its side (`provider_unavailable`),
+ * and the automatic retries were spent. Drives the outage label and "Try
+ * again" under the reply. Live only: the reply's text explains
+ * the outage after a reload, and an offer to resend is only honest while the
+ * failed turn is still the latest one.
+ */
+export interface ProviderOutage {
+    /** The model that failed, when the server named it. */
+    modelId: string | null;
+    modelName: string | null;
+    /** `ModelProvider` value (`bedrock`, `openai`, …), when known. */
+    provider: string | null;
+}
 
 /**
  * Mutable chat state for one conversation. Every stream-scoped flag lives
@@ -11,6 +45,8 @@ interface SessionChatState {
     loading: WritableSignal<boolean>;
     stopReason: WritableSignal<string | null>;
     lastTurnContinuable: WritableSignal<boolean>;
+    /** Set when the last turn failed on the model provider's side. */
+    lastTurnProviderOutage: WritableSignal<ProviderOutage | null>;
     /** True when the last turn was interrupted before completion (Stop /
      *  refresh / dropped connection). Drives the reload chip. */
     lastTurnInterrupted: WritableSignal<boolean>;
@@ -58,16 +94,35 @@ export class ChatStateService {
     private readonly unreadSessionIds = signal<ReadonlySet<string>>(new Set());
 
     /**
+     * Sessions whose turn this tab saw pause on the user (or saw that pause
+     * end). Overrides the list row's server-derived `awaitingInput` until the
+     * row is newer than the mark, so a background stream that ends on a prompt
+     * shows its dot without a refetch, and an answered prompt's dot goes at
+     * once instead of waiting for the list to catch up.
+     */
+    private readonly awaitingInputMarks = signal<ReadonlyMap<string, AwaitingInputMark>>(new Map());
+
+    /**
      * When each session's most recent turn finished in this tab (epoch ms).
      * The model's last call ends with the turn, so this is when the prompt
      * cache was last refreshed. Read at decision time only, so a plain map.
      */
     private readonly turnEndedAt = new Map<string, number>();
 
+    /**
+     * Sessions whose resume stream was refused because the paused turn could
+     * no longer be picked up (`error_kind: 'resume_unavailable'`). The refusal
+     * is streamed but not persisted, so the post-resume reload must be skipped
+     * or it would erase the only explanation. Read once, then cleared. The
+     * value is the backend's reason (`missing`, `expired`, `unknown_interrupt`).
+     */
+    private readonly resumeUnavailable = new Map<string, string>();
+
     readonly isChatLoading = computed(() => this.viewedState()?.loading() ?? false);
     readonly currentStopReason = computed(() => this.viewedState()?.stopReason() ?? null);
     readonly lastTurnContinuable = computed(() => this.viewedState()?.lastTurnContinuable() ?? false);
     readonly lastTurnInterrupted = computed(() => this.viewedState()?.lastTurnInterrupted() ?? false);
+    readonly lastTurnProviderOutage = computed(() => this.viewedState()?.lastTurnProviderOutage() ?? null);
     readonly lastTurnInterruptReason = computed(() => this.viewedState()?.lastTurnInterruptReason() ?? null);
 
     // ----- Session-level cost / context aggregates ---------------------------
@@ -114,6 +169,12 @@ export class ChatStateService {
         const state = this.stateFor(sessionId);
         const wasLoading = state.loading();
         state.loading.set(loading);
+
+        // Any new turn in the session ends a pause there: a resume is the
+        // user's answer, and a fresh message supersedes the paused turn.
+        if (!wasLoading && loading) {
+            this.clearSessionAwaitingInput(sessionId);
+        }
 
         if (wasLoading && !loading) {
             this.turnEndedAt.set(sessionId, Date.now());
@@ -222,6 +283,51 @@ export class ChatStateService {
     }
 
     /**
+     * Records that a session's turn paused on the user. Set by the stream
+     * parser when a stream ends on `oauth_required` (with an interrupt id),
+     * `tool_approval_required`, `user_question_required` or
+     * `browser_login_required` — viewed or not.
+     */
+    markSessionAwaitingInput(sessionId: string, kind: AwaitingInputKind): void {
+        this.setAwaitingInputMark(sessionId, kind);
+    }
+
+    /**
+     * Records that a session's pause is over: answered (its resume starts a
+     * new stream, see setChatLoading), dismissed, or superseded by a new turn.
+     */
+    clearSessionAwaitingInput(sessionId: string): void {
+        this.setAwaitingInputMark(sessionId, null);
+    }
+
+    /**
+     * What a session-list row's paused turn waits on, or null. The tab's own
+     * mark wins while the server row predates it; a row whose `lastMessageAt`
+     * is newer reflects a later turn (a scheduled run, another tab) and wins.
+     * A live pause mark lapses after the snapshot TTL even if the row never
+     * advances, because the server stops offering that pause then too.
+     */
+    awaitingInputFor(
+        session: Pick<SessionMetadata, 'sessionId' | 'lastMessageAt' | 'awaitingInput'>,
+    ): AwaitingInputKind | null {
+        const serverKind = session.awaitingInput ?? null;
+        const mark = this.awaitingInputMarks().get(session.sessionId);
+        if (!mark) return serverKind;
+        const rowAt = Date.parse(session.lastMessageAt);
+        if (Number.isFinite(rowAt) && rowAt > mark.at) return serverKind;
+        if (mark.kind && Date.now() - mark.at >= LIVE_AWAITING_INPUT_TTL_MS) return null;
+        return mark.kind;
+    }
+
+    private setAwaitingInputMark(sessionId: string, kind: AwaitingInputKind | null): void {
+        this.awaitingInputMarks.update(marks => {
+            const next = new Map(marks);
+            next.set(sessionId, { kind, at: Date.now() });
+            return next;
+        });
+    }
+
+    /**
      * Request that the message list scroll the latest user message to the top
      * of the viewport (e.g. after a programmatic, non-composer user turn such
      * as an MCP App widget relaying a `ui/message`).
@@ -238,11 +344,42 @@ export class ChatStateService {
     }
 
     /**
+     * How a session's last assistant message ended (`end_turn`, `max_tokens`,
+     * `error`, …), or null while one is streaming or none has. `error` means
+     * the turn's reply is the server's error message.
+     */
+    stopReasonFor(sessionId: string): string | null {
+        return this.states().get(sessionId)?.stopReason() ?? null;
+    }
+
+    /**
      * Marks (or clears) whether a session's last turn ended in a recoverable
      * max_tokens truncation that the user can continue from.
      */
     setLastTurnContinuable(sessionId: string, continuable: boolean): void {
         this.stateFor(sessionId).lastTurnContinuable.set(continuable);
+    }
+
+    /** Marks (or clears, with null) a provider outage on the session's last turn. */
+    setLastTurnProviderOutage(sessionId: string, outage: ProviderOutage | null): void {
+        this.stateFor(sessionId).lastTurnProviderOutage.set(outage);
+    }
+
+    /** Records that a session's resume was refused as unresumable, and why. */
+    markResumeUnavailable(sessionId: string, reason = 'unknown'): void {
+        this.resumeUnavailable.set(sessionId, reason);
+    }
+
+    /** Whether the session's last resume was refused; clears the mark. */
+    takeResumeUnavailable(sessionId: string): boolean {
+        return this.takeResumeRefusal(sessionId) !== null;
+    }
+
+    /** Why the session's last resume was refused, or null if it wasn't; clears the mark. */
+    takeResumeRefusal(sessionId: string): string | null {
+        const reason = this.resumeUnavailable.get(sessionId) ?? null;
+        this.resumeUnavailable.delete(sessionId);
+        return reason;
     }
 
     /**
@@ -384,6 +521,7 @@ export class ChatStateService {
             loading: signal(false),
             stopReason: signal<string | null>(null),
             lastTurnContinuable: signal(false),
+            lastTurnProviderOutage: signal<ProviderOutage | null>(null),
             lastTurnInterrupted: signal(false),
             lastTurnInterruptReason: signal<string | null>(null),
             costDollars: signal(0),

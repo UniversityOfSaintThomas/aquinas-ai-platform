@@ -22,5 +22,32 @@ export const environment = {
         attachmentKb: true,
         // The `development` GitHub environment sets CDK_FOLDER_SYNC_ENABLED=true.
         folderSync: true,
+        sourceProvenance: true,
+        // The `development` GitHub environment sets CDK_ATTACHMENT_PLAN_ENABLED=true.
+        attachmentPlan: true,
+        // The `development` GitHub environment sets CDK_DOCUMENT_EXTRACT_ENABLED=true.
+        documentExtract: true,
+        // The `development` GitHub environment sets CDK_FIELD_SET_AUTHORING_ENABLED=true.
+        fieldSetAuthoring: true,
+        // The `development` GitHub environment sets CDK_HANDOFFS_ENABLED=true.
+        handoffs: true,
+        // The `development` GitHub environment sets CDK_HANDOFF_BRIEF_ENABLED=true.
+        handoffBrief: true,
+        // The `development` GitHub environment sets CDK_SESSION_REWIND_ENABLED=true
+        // and CDK_SESSION_FORK_ENABLED=true.
+        sessionRewind: true,
+        sessionFork: true,
+        // The `development` GitHub environment sets CDK_QUOTA_REQUESTS_ENABLED=true.
+        quotaRequests: true,
+        // The `development` GitHub environment sets CDK_PROJECT_FILE_READINESS_ENABLED=true.
+        projectFileReadiness: true,
+        // Needs CDK_AWS_LIMITS_ENABLED=true in the `development` GitHub environment.
+        awsLimits: true,
+        // Reads app-api's knowledge-base mode, which follows the Runtime's
+        // CDK_ASSISTANT_KB_FULL_CONTEXT_* variables in the `development` environment.
+        knowledgeBaseMode: true,
+        // CDK_RELEASE_LEDGER_ENABLED is on in the `development` GitHub environment.
+        releaseLedger: true,
+        attachmentCards: true,
     } satisfies FeatureFlags,
 };
