@@ -322,10 +322,10 @@ export class SubmitListingDialogComponent implements OnInit {
   readonly goingPublicNotice = computed(() =>
     this.reachability() === 'shared_only'
       ? 'Right now only the people it is shared with can open it. The store is public, so ' +
-        'submitting changes its visibility to Public — everyone at Boise State can open ' +
+        'submitting changes its visibility to Public — everyone at St. Thomas can open ' +
         'it, starting now rather than when an admin approves it.'
       : 'Right now only you can open it. The store is public, so submitting changes its ' +
-        'visibility to Public — everyone at Boise State can open it, starting now rather ' +
+        'visibility to Public — everyone at St. Thomas can open it, starting now rather ' +
         'than when an admin approves it.',
   );
 

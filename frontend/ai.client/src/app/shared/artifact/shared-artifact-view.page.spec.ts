@@ -313,6 +313,6 @@ describe('SharedArtifactViewPage', () => {
     // navigate from — without this a recipient is stranded on the page.
     const home = (fixture.nativeElement as HTMLElement).querySelector('a[href="/"]');
     expect(home).not.toBeNull();
-    expect(home!.textContent).toContain('boisestate.ai');
+    expect(home!.textContent).toContain('Aquinas AI');
   });
 });
