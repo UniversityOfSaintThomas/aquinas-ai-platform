@@ -578,7 +578,7 @@ export class ShareAgentDialogComponent {
   });
 
   protected readonly skillAudience = computed(() =>
-    this.visibility() === 'PUBLIC' ? 'Everyone at Boise State who opens it' : 'Everyone on this list',
+    this.visibility() === 'PUBLIC' ? 'Everyone at St. Thomas who opens it' : 'Everyone on this list',
   );
 
   // ---- general access (a read-out; the editor owns the field) -----------
@@ -602,7 +602,7 @@ export class ShareAgentDialogComponent {
   protected readonly accessLabel = computed(() => {
     switch (this.visibility()) {
       case 'PUBLIC':
-        return 'Everyone at Boise State';
+        return 'Everyone at St. Thomas';
       case 'SHARED':
         return 'Only the people listed above';
       default:
