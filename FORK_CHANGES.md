@@ -27,6 +27,7 @@ A promotion is the pull request from `develop` into `production`. Each branch's 
 | 6 | St. Thomas base system prompt | `system_prompt_builder.py` (6 lines) | `develop`, both after promotion | Not applicable; a configurable prompt is an issue candidate | Upstream makes it configurable |
 | 7 | St. Thomas web crawler user agent | `crawler.py` (1 line) | `develop`, both after promotion | Not applicable; a configurable user agent is an issue candidate | Upstream makes it configurable |
 | 8 | System prompt date in Central time | `timezone.py` (2 lines), `test_timezone.py` | `develop`, both after promotion | A configurable timezone is an issue candidate | Upstream makes it configurable |
+| 11 | "Boise State" in three user-facing strings (temporary) | 3 components, 2 specs | `develop`, both after promotion | Issue and pull request to be opened, to make the institution name configurable | Upstream makes the institution name configurable |
 
 ---
 
@@ -104,7 +105,7 @@ The artifacts, MCP sandbox and ALB DNS constructs already look up by `infrastruc
 
 **Currently inert.** It only manifests where domain differs from hosted zone. Development uses `dev.nonprod-ai.stthomas.edu` for both, and production is planned to use `ai.stthomas.edu` for both, so no environment triggers it. The fix stays in place because it is correct in general and because a future flat-zone environment would need it.
 
-The fix is ready to submit upstream; the pull request has not been opened yet (todo item 12).
+The fix is ready to submit upstream; the pull request has not been opened yet.
 
 ---
 
@@ -134,7 +135,7 @@ Source assets, under `frontend/ai.client/`: `public/img/logo-light.png` and `pub
 
 **Generated output is committed.** The following travel with this change: `src/styles/generated/brand-theme.css`, the five `public/favicon/*.png` files, and `site.webmanifest`. Only `brand-theme.css` is pinned by a spec (`brand-theme-golden.spec.ts`). Any future edit to `brand.config.ts` or `favicon-source.png` must be followed by `npm run prestart`, with the regenerated files committed. A colour change left unregenerated fails `brand-theme-golden.spec.ts` in CI; a new source image left unregenerated leaves the old favicon PNGs in place, with no error.
 
-**Not covered by this change.** Upstream hard-codes "Boise State" in user-facing text that `brand.config.ts` does not reach: the home link on the shared artifact page (`shared-artifact-view.page.ts`, `boisestate.ai`), the agent share dialog (`share-agent-dialog.component.ts`, "Everyone at Boise State"), the store submission dialog (`submit-listing-dialog.component.ts`, "everyone at Boise State can open it") and the marketplace publisher hint (`marketplace.model.ts`, "agents that speak for Boise State"). They are left as upstream until a pull request makes them configurable (PR TODO).
+**Not covered by this change.** Upstream hard-codes "Boise State" in user-facing text that `brand.config.ts` does not reach. The home link on the shared artifact page, the agent share dialog and the store submission dialog are changed in entry 11 (temporary). The marketplace publisher hint (`marketplace.model.ts`, "agents that speak for Boise State") and the Admin → Tools domain placeholder (`tool-form.page.ts`, `boisestate.edu`) are seen by admins only and left as upstream until a pull request makes the institution name configurable.
 
 ---
 
@@ -224,6 +225,21 @@ Retires if upstream makes the prompt timezone configurable.
 
 ---
 
+## 11. "Boise State" in three user-facing strings (temporary)
+
+Added 2026-11-23. Upstream hard-codes "Boise State" in three strings users see, which `brand.config.ts` does not reach. Literal text, not wired to `brand.config.ts`, to keep the diff small.
+
+| File | Upstream | Ours |
+|---|---|---|
+| `agents/components/share-agent-dialog.component.ts` (2 lines) | "Everyone at Boise State who opens it", "Everyone at Boise State" | "Everyone at St. Thomas who opens it", "Everyone at St. Thomas" |
+| `agents/components/submit-listing-dialog.component.ts` (2 lines) | "everyone at Boise State can open it" | "everyone at St. Thomas can open it" |
+| `shared/artifact/shared-artifact-view.page.ts` (1 line) | `boisestate.ai` (home link text) | `Aquinas AI` |
+| `share-agent-dialog.component.spec.ts`, `shared-artifact-view.page.spec.ts` (1 line each) | assert the upstream text | assert ours |
+
+Expect a merge conflict on these lines whenever upstream edits them. Retires when upstream adds an institution-name setting: set it in `brand.config.ts` (entry 3) and remove this entry.
+
+---
+
 ## Maintenance
 
 After every *Sync fork* onto `main`:
@@ -240,3 +256,4 @@ After every *Sync fork* onto `main`:
    - entry 6: `grep -ciE "boise" backend/src/agents/main_agent/core/system_prompt_builder.py` → `0`
    - entry 7: `grep -c "AquinasAI-Assistant-Crawler" backend/src/apis/app_api/web_sources/crawler.py` → `1`
    - entry 8: `grep -c "America/Chicago" backend/src/agents/main_agent/utils/timezone.py` → `2`
+   - entry 11: `grep -c "Boise State" frontend/ai.client/src/app/agents/components/share-agent-dialog.component.ts frontend/ai.client/src/app/agents/components/submit-listing-dialog.component.ts` → `0` for each; `grep -c "boisestate.ai" frontend/ai.client/src/app/shared/artifact/shared-artifact-view.page.ts` → `0`

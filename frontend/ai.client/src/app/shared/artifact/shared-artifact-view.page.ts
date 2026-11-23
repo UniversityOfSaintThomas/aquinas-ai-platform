@@ -85,7 +85,7 @@ import { TooltipDirective } from '../../components/tooltip/tooltip.directive';
             routerLink="/"
             class="shrink-0 rounded-md px-2 py-1 text-xs font-semibold text-gray-500 hover:bg-gray-100 hover:text-gray-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-100"
           >
-            boisestate.ai
+            Aquinas AI
           </a>
           <div class="flex flex-1 items-center justify-center gap-2">
             <ng-icon

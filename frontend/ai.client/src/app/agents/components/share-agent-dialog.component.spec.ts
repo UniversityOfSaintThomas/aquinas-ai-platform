@@ -431,7 +431,7 @@ describe('ShareAgentDialogComponent', () => {
 
       const rendered = text(fixture);
       expect(rendered).toContain('Policy Citation Format');
-      expect(rendered).toContain('Everyone at Boise State who opens it');
+      expect(rendered).toContain('Everyone at St. Thomas who opens it');
     });
 
     it('says nothing when the owner bound no skills of their own', async () => {
